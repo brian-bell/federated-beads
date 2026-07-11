@@ -10,6 +10,7 @@ mod helpers;
 use fbd::bd::{BdCli, BdClient};
 use fbd::config::{Config, Paths, RepoEntry};
 use fbd::hub::{ensure_hub, hub_dir, read_hub_roster};
+use fbd::refresh;
 use helpers::{bd_available, build_ready_fixture_repo, build_ready_fixture_repo_with_prefix};
 
 #[test]
@@ -106,5 +107,94 @@ fn ensure_hub_end_to_end() {
         tracked_again.len(),
         tracked.len(),
         "second ensure_hub must not duplicate repos"
+    );
+}
+
+#[test]
+fn refresh_two_repos() {
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Two fixture repos with distinct prefixes.
+    let ra = tmp.path().join("ra");
+    let rb = tmp.path().join("rb");
+    std::fs::create_dir_all(&ra).expect("mkdir ra");
+    std::fs::create_dir_all(&rb).expect("mkdir rb");
+    build_ready_fixture_repo_with_prefix(&ra, "ra");
+    build_ready_fixture_repo_with_prefix(&rb, "rb");
+
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        repos: vec![
+            RepoEntry { path: ra.clone() },
+            RepoEntry { path: rb.clone() },
+        ],
+    };
+
+    // The hub must be registered before a refresh can sync it.
+    ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
+
+    // Create an issue in `ra` AFTER the fixture helper's own export. Only
+    // refresh's export (writing into ra's own .beads) can carry this into the
+    // hub — so its appearance below proves refresh exported to the right repo,
+    // not the caller's cwd (regression guard for the relative-`-o` bug).
+    let marker = "refresh-export-marker";
+    let created = std::process::Command::new("bd")
+        .arg("-C")
+        .arg(&ra)
+        .args(["create", marker, "-p", "1", "--json"])
+        .output()
+        .expect("bd create marker");
+    assert!(
+        created.status.success(),
+        "bd create marker failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let outcome = refresh::run(&BdCli::new(), &roster, &paths).expect("refresh runs");
+    assert!(
+        outcome.errors.is_empty(),
+        "both repos are healthy, so no per-repo errors: {:?}",
+        outcome.errors
+    );
+    assert!(
+        outcome.prefix_map.collisions().is_empty(),
+        "distinct prefixes, so no collisions: {:?}",
+        outcome.prefix_map.collisions()
+    );
+
+    // The hub now hydrates issues from both repos (blocked ones excluded).
+    let hub = hub_dir(&paths);
+    let ready = BdCli::new().ready(&hub).expect("bd ready on hub");
+    assert!(
+        ready.iter().any(|i| i.title == marker),
+        "refresh's export must carry the post-ensure marker into the hub: {:?}",
+        ready.iter().map(|i| &i.title).collect::<Vec<_>>()
+    );
+    let ra_id = ready
+        .iter()
+        .find(|i| i.id.starts_with("ra-"))
+        .map(|i| i.id.clone())
+        .expect("an ra- issue is ready in the hub");
+    let rb_id = ready
+        .iter()
+        .find(|i| i.id.starts_with("rb-"))
+        .map(|i| i.id.clone())
+        .expect("an rb- issue is ready in the hub");
+
+    // The prefix map attributes each hub id back to its source repo.
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+    assert_eq!(
+        outcome.prefix_map.repo_for(&ra_id).map(|r| canon(&r.path)),
+        Some(canon(&ra)),
+        "ra id attributes to the ra repo"
+    );
+    assert_eq!(
+        outcome.prefix_map.repo_for(&rb_id).map(|r| canon(&r.path)),
+        Some(canon(&rb)),
+        "rb id attributes to the rb repo"
     );
 }
