@@ -8,6 +8,7 @@
 mod helpers;
 
 use fbd::bd::{BdCli, BdClient};
+use fbd::cli::run_snapshot;
 use fbd::config::{Config, Paths, RepoEntry};
 use fbd::hub::{ensure_hub, hub_dir, read_hub_roster};
 use fbd::refresh;
@@ -196,5 +197,57 @@ fn refresh_two_repos() {
         outcome.prefix_map.repo_for(&rb_id).map(|r| canon(&r.path)),
         Some(canon(&rb)),
         "rb id attributes to the rb repo"
+    );
+}
+
+#[test]
+fn snapshot_command_end_to_end() {
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Two fixture repos with distinct prefixes and matching directory basenames.
+    let ra = tmp.path().join("ra");
+    let rb = tmp.path().join("rb");
+    std::fs::create_dir_all(&ra).expect("mkdir ra");
+    std::fs::create_dir_all(&rb).expect("mkdir rb");
+    build_ready_fixture_repo_with_prefix(&ra, "ra");
+    build_ready_fixture_repo_with_prefix(&rb, "rb");
+
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        repos: vec![
+            RepoEntry { path: ra.clone() },
+            RepoEntry { path: rb.clone() },
+        ],
+    };
+
+    // Drive the full ensure_hub -> refresh -> fetch -> print path via the real
+    // CLI runner and the real BdCli.
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    run_snapshot(&roster, &BdCli::new(), &paths, false, &mut out, &mut err)
+        .expect("run_snapshot succeeds against real fixture repos");
+
+    let stdout = String::from_utf8(out).expect("utf8 stdout");
+    // Both repos' ready issues appear, attributed by directory basename, with the
+    // shared fixture title.
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("[ra] ") && l.contains("ra-")),
+        "an ra-attributed row is present: {stdout:?}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("[rb] ") && l.contains("rb-")),
+        "an rb-attributed row is present: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Ready task one"),
+        "the fixture's ready title is printed: {stdout:?}"
     );
 }
