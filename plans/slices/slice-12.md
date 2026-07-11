@@ -273,4 +273,15 @@ Round 7 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
     `LICENSE-MIT` and `LICENSE-APACHE` (standard texts, © 2026 Brian Bell) and
     linked them from the README license section.
 
-Round 8: clean (no accepted/actionable findings).
+Round 8 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
+
+12. **[P2] Coalesced copy re-resolved the selection at completion.** The pending
+    copy stored only the format, so a cursor move after the press (or a copy
+    pressed during the no-source search `Loading` phase) could redirect it to the
+    wrong issue — or fire a phantom copy once results arrived. `copy_effect` now
+    resolves and validates the source row *at press time*, storing `(Box<Row>,
+    markdown)` in `copy_pending`, and `launch_copy` fires that captured target.
+    New test `no_pending_copy_from_a_no_source_state`; `copy_coalesces_while_in_flight`
+    extended to move the cursor after the coalesced press.
+
+Round 9: clean (no accepted/actionable findings).

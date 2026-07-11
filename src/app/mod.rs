@@ -443,10 +443,10 @@ pub struct App {
     /// into `copy_pending` while this holds, so a held `y`/`Y` cannot spawn an
     /// unbounded pile of subprocess-backed workers (at most one runs at a time).
     copy_in_flight: bool,
-    /// The format (`markdown`?) of a copy requested while one was already in
-    /// flight; fired for the then-current selection when the flight completes, so
-    /// only the latest coalesced request runs.
-    copy_pending: Option<bool>,
+    /// A copy requested while one was already in flight: the target row (captured
+    /// and validated at press time, so a later cursor move can't redirect it) and
+    /// its format. Only the latest is kept; it fires when the flight completes.
+    copy_pending: Option<(Box<Row>, bool)>,
     /// The user asked to quit; the runtime loop should exit.
     done: bool,
 }
@@ -752,10 +752,11 @@ impl App {
                     self.copy_flash = Some(summary);
                     let mut effects = vec![Effect::WriteClipboard(payload)];
                     // A copy requested while this one was resolving was coalesced;
-                    // fire it now for the current selection so the last `y`/`Y` still
-                    // wins, without ever having spawned a second worker meanwhile.
-                    if let Some(markdown) = self.copy_pending.take() {
-                        effects.extend(self.copy_effect(markdown));
+                    // launch that captured target now (the row was validated and
+                    // snapshotted at press time, so a later cursor move can't
+                    // redirect it), without ever having spawned a second worker.
+                    if let Some((row, markdown)) = self.copy_pending.take() {
+                        effects.push(self.launch_copy(row, markdown));
                     }
                     return effects;
                 }
@@ -771,27 +772,35 @@ impl App {
     /// detail opened from one) else the ready list, so `y`/`Y` copy the issue the
     /// user is actually looking at in List / Search-results / Detail alike.
     fn copy_effect(&mut self, markdown: bool) -> Vec<Effect> {
-        // Coalesce while a copy is resolving: its path resolution runs a `bd`
-        // subprocess per repo on a worker thread, so a held `y`/`Y` (auto-repeat
-        // arrives as a burst of key events) must not pile up workers. Remember only
-        // the latest requested format; it fires when the in-flight copy completes,
-        // against the selection current at that point, so the last press still wins.
-        if self.copy_in_flight {
-            self.copy_pending = Some(markdown);
-            return Vec::new();
-        }
-        // Resolve before bumping the generation so a no-op copy neither advances
-        // the sequence nor marks a flight.
+        // Resolve the target at press time, so a copy always names the row the user
+        // was looking at when they pressed `y`/`Y` — never a row they moved to
+        // later, and never anything when the current mode has no source (e.g. the
+        // search `Loading` phase, where copy is a no-op).
         let Some(row) = self.copy_source_row() else {
             return Vec::new();
         };
+        let row = Box::new(row);
+        // Coalesce while a copy is resolving: its path resolution runs a `bd`
+        // subprocess per repo on a worker thread, so a held `y`/`Y` (auto-repeat
+        // arrives as a burst of key events) must not pile up workers. Capture this
+        // (already-validated) target; only the latest fires when the flight ends.
+        if self.copy_in_flight {
+            self.copy_pending = Some((row, markdown));
+            return Vec::new();
+        }
+        vec![self.launch_copy(row, markdown)]
+    }
+
+    /// Start a copy for an already-resolved `row`: stamp a fresh generation, mark
+    /// the flight in progress, and return the [`Effect::Copy`] the runtime runs.
+    fn launch_copy(&mut self, row: Box<Row>, markdown: bool) -> Effect {
         self.copy_seq += 1;
         self.copy_in_flight = true;
-        vec![Effect::Copy {
-            row: Box::new(row),
+        Effect::Copy {
+            row,
             markdown,
             token: self.copy_seq,
-        }]
+        }
     }
 
     /// The row `y`/`Y` should copy for the current mode, or `None` when there is
@@ -1737,16 +1746,19 @@ mod tests {
         ]);
         let (_, _, first) = copy(&mut app, Msg::CopyContext); // worker for mc-a, in flight
 
-        // A second copy while in flight: no new Copy effect (coalesced).
-        app.reduce(Msg::SelectNext); // now selecting st-b
+        // A second copy while in flight: no new Copy effect (coalesced), and the
+        // target (st-b) is captured now.
+        app.reduce(Msg::SelectNext); // selecting st-b
         assert_eq!(
             app.reduce(Msg::CopyContext),
             Vec::new(),
             "a copy while one is in flight spawns no second worker"
         );
+        // Moving the cursor after the coalesced press must NOT redirect the copy.
+        app.reduce(Msg::SelectPrev); // back to mc-a
 
-        // The first completes: writes its payload AND fires the coalesced copy for
-        // the current selection (st-b) as a fresh generation.
+        // The first completes: writes its payload AND fires the copy captured at
+        // press time (st-b), not the now-current selection (mc-a).
         let effects = app.reduce(Msg::Copied {
             token: first,
             payload: "cd a && bd show mc-a".into(),
@@ -1764,7 +1776,7 @@ mod tests {
                 assert_eq!(p, "cd a && bd show mc-a", "the first copy still writes");
                 assert_eq!(
                     row.issue.id, "st-b",
-                    "the coalesced copy is the latest selection"
+                    "the coalesced copy targets the row selected when it was pressed"
                 );
                 assert_ne!(*token, first, "the coalesced copy is a fresh generation");
                 *token
@@ -1784,6 +1796,47 @@ mod tests {
             "no further coalesced copy remains"
         );
         assert_eq!(app.copy_flash(), Some("copied st-b"));
+    }
+
+    #[test]
+    fn no_pending_copy_from_a_no_source_state() {
+        // A copy is in flight; the user opens search and submits (Loading phase,
+        // where copy is a no-op). Pressing `y` there must not queue a copy that
+        // later fires against an arriving result.
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, first) = copy(&mut app, Msg::CopyContext); // in flight
+
+        let stoken = submit(&mut app, "foo"); // -> Search, Loading
+        assert_eq!(app.search_phase(), Some(&SearchPhase::Loading));
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "copy in the Loading phase is a no-op and queues nothing"
+        );
+
+        // The in-flight copy completes: no pending copy was captured, so only the
+        // write happens (no stray Copy effect).
+        let effects = app.reduce(Msg::Copied {
+            token: first,
+            payload: "cd a && bd show mc-abc".into(),
+            summary: "copied mc-abc".into(),
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::WriteClipboard("cd a && bd show mc-abc".into())],
+            "nothing was queued during the no-source Loading phase"
+        );
+
+        // Results arrive; the earlier `y` must not have copied one.
+        app.reduce(Msg::SearchResults {
+            token: stoken,
+            rows: Ok(vec![row("session-tui", "st-9", 1)]),
+        });
+        assert_eq!(
+            app.copy_flash(),
+            Some("copied mc-abc"),
+            "no phantom copy fired"
+        );
     }
 
     #[test]
