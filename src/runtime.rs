@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, Msg, keys, view};
-use crate::bd::{BdCli, BdClient};
+use crate::bd::{BdCli, BdClient, IssueDetail};
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ensure_hub, hub_dir};
@@ -64,31 +64,32 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     };
 
     let mut app = App::new();
-    // In-flight refresh workers, tracked so shutdown can wait for the running
-    // bd subprocess to finish and release the hub lock — never orphaning a child
-    // that would keep mutating the hub after fbd's lock has dropped. The Slice 8
-    // in-flight guard keeps this to at most one live worker; finished handles are
-    // pruned on each new spawn so the vec cannot grow across a long session.
-    let mut refresh_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    // In-flight background workers (refresh *and* detail), tracked so shutdown can
+    // wait for the running bd subprocess to finish and release the hub lock —
+    // never orphaning a child that would keep mutating the hub after fbd's lock
+    // has dropped. Finished handles are pruned on each new spawn so the vec cannot
+    // grow across a long session (the Slice 8 guard bounds live refresh workers to
+    // one; detail fetches are short and pruned likewise).
+    let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     // The App is born stale; launch immediately kicks off the first refresh.
-    refresh_handles.push(spawn_refresh(&tx, paths, roster));
+    worker_handles.push(spawn_refresh(&tx, paths, roster));
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
     // clean quit and for every error return alike — so a terminal write failure
-    // can never detach the input thread or an in-flight refresh (which would
+    // can never detach the input thread or an in-flight worker (which would
     // orphan its bd subprocess while our process exits and drops the hub lock).
     let result = ui_loop(
         terminal,
         &rx,
         &tx,
         &mut app,
-        &mut refresh_handles,
+        &mut worker_handles,
         paths,
         roster,
     );
     stop.store(true, Ordering::SeqCst);
     let _ = input_handle.join();
-    for handle in refresh_handles {
+    for handle in worker_handles {
         let _ = handle.join();
     }
     result
@@ -101,7 +102,7 @@ fn ui_loop(
     rx: &Receiver<Msg>,
     tx: &Sender<Msg>,
     app: &mut App,
-    refresh_handles: &mut Vec<thread::JoinHandle<()>>,
+    worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
     roster: &Config,
 ) -> Result<(), CliError> {
@@ -113,12 +114,7 @@ fn ui_loop(
         match rx.recv_timeout(TICK) {
             Ok(msg) => {
                 for effect in app.reduce(msg) {
-                    match effect {
-                        Effect::Refresh => {
-                            refresh_handles.retain(|h| !h.is_finished());
-                            refresh_handles.push(spawn_refresh(tx, paths, roster));
-                        }
-                    }
+                    execute_effect(effect, tx, worker_handles, paths, roster);
                 }
                 if app.is_done() {
                     return Ok(());
@@ -129,6 +125,25 @@ fn ui_loop(
         }
         draw(terminal, app)?;
     }
+}
+
+/// Perform one [`Effect`] by spawning the matching background worker, tracking
+/// its handle for shutdown. The single dispatch point for every effect `reduce`
+/// returns — Slice 11's `Effect::Search` slots in as one more arm with no change
+/// to [`ui_loop`]. Finished handles are pruned first so the vec stays bounded.
+fn execute_effect(
+    effect: Effect,
+    tx: &Sender<Msg>,
+    worker_handles: &mut Vec<thread::JoinHandle<()>>,
+    paths: &Paths,
+    roster: &Config,
+) {
+    worker_handles.retain(|h| !h.is_finished());
+    let handle = match effect {
+        Effect::Refresh => spawn_refresh(tx, paths, roster),
+        Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
+    };
+    worker_handles.push(handle);
 }
 
 /// Render the current state with a fresh `now` for the staleness age.
@@ -156,6 +171,43 @@ pub(crate) fn refresh_worker(bd: impl BdClient, roster: Config, paths: Paths, tx
     let _ = tx.send(Msg::RefreshStarted);
     let (snapshot, warnings) = gather_snapshot(&bd, &roster, &paths);
     let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings });
+}
+
+/// Spawn a background detail worker that reports over `tx`, returning its join
+/// handle so the event loop can wait for it on shutdown. Clones the paths into
+/// the thread and builds a fresh [`BdCli`] (stateless).
+fn spawn_detail(tx: &Sender<Msg>, paths: &Paths, id: String, token: u64) -> thread::JoinHandle<()> {
+    let tx = tx.clone();
+    let paths = paths.clone();
+    thread::spawn(move || detail_worker(BdCli::new(), paths, id, token, tx))
+}
+
+/// The detail worker body: fetch one issue's detail and send exactly one
+/// [`Msg::DetailReady`] echoing `token` (so a superseded response can be dropped).
+/// Owned args so it moves cleanly into a thread; unit-tested directly with a
+/// [`crate::bd::FakeBdClient`] and a channel.
+pub(crate) fn detail_worker(
+    bd: impl BdClient,
+    paths: Paths,
+    id: String,
+    token: u64,
+    tx: Sender<Msg>,
+) {
+    let detail = gather_detail(&bd, &paths, &id).map(Box::new);
+    let _ = tx.send(Msg::DetailReady { token, detail });
+}
+
+/// Run `bd show <id> --json` against the hub, mapping a [`BdError`] to a
+/// pre-formatted, [`sanitize`]d message for the pane. No version gate or
+/// `ensure_hub`: the detail pane is reachable only from the list, i.e. after a
+/// snapshot already hydrated the hub.
+pub(crate) fn gather_detail(
+    bd: &impl BdClient,
+    paths: &Paths,
+    id: &str,
+) -> Result<IssueDetail, String> {
+    bd.show(&hub_dir(paths), id)
+        .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
 }
 
 /// Run `ensure_hub → refresh → fetch` and return the fresh snapshot (or `None`
@@ -312,7 +364,7 @@ fn set_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bd::{BdError, BdErrorKind, FakeBdClient, Issue};
+    use crate::bd::{BdError, BdErrorKind, Dependency, FakeBdClient, Issue};
     use crate::config::RepoEntry;
     use crate::refresh::HubLock;
     use std::fs;
@@ -327,6 +379,7 @@ mod tests {
             description: None,
             issue_type: None,
             owner: None,
+            labels: Vec::new(),
             created_at: None,
             created_by: None,
             updated_at: Some("2026-07-11T00:00:00Z".into()),
@@ -438,6 +491,64 @@ mod tests {
             warnings.iter().any(|w| w.contains("refresh failed")),
             "the fatal refresh is surfaced: {warnings:?}"
         );
+    }
+
+    fn detail() -> IssueDetail {
+        IssueDetail {
+            issue: issue("ra-1", 2, "Blocked task"),
+            dependencies: vec![Dependency {
+                id: "ra-z70".into(),
+                title: Some("Blocker task".into()),
+                status: Some("open".into()),
+                dependency_type: Some("blocks".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn detail_worker_sends_ready_for_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let bd = FakeBdClient::new().with_show(detail());
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 7, tx));
+
+        match rx.recv().unwrap() {
+            Msg::DetailReady { token, detail } => {
+                assert_eq!(token, 7, "the request token is echoed back");
+                let d = detail.expect("a detail on success");
+                assert_eq!(d.issue.id, "ra-1");
+                assert_eq!(d.dependencies.len(), 1);
+            }
+            other => panic!("expected DetailReady, got {other:?}"),
+        }
+        // The worker's tx drops on return: exactly one message, then closed.
+        assert!(rx.recv().is_err(), "exactly one DetailReady, then closed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn detail_worker_maps_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let bd = FakeBdClient::new().with_show_err(bd_err());
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 1, tx));
+
+        match rx.recv().unwrap() {
+            Msg::DetailReady { token, detail } => {
+                assert_eq!(token, 1);
+                let msg = detail.expect_err("a message on failure");
+                assert!(
+                    msg.contains("boom") || msg.to_lowercase().contains("fail"),
+                    "the failure is surfaced: {msg}"
+                );
+            }
+            other => panic!("expected DetailReady, got {other:?}"),
+        }
+        handle.join().unwrap();
     }
 
     #[test]
