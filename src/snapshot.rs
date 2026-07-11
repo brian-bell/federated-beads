@@ -5,13 +5,13 @@
 //! Grouping is a view concern (Slice 9): rows merely *carry* `repo_name` so a
 //! view can group by it. See `plans/slices/slice-5.md`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
 use serde::Serialize;
 
 use crate::bd::{BdClient, BdError, Issue};
-use crate::config::RepoEntry;
 use crate::refresh::PrefixMap;
 
 /// The `repo_name` given to a row whose issue id matches no configured prefix
@@ -20,7 +20,8 @@ use crate::refresh::PrefixMap;
 pub const UNKNOWN_REPO: &str = "unknown";
 
 /// One ready issue plus the source repo it was attributed to. `repo_name` is the
-/// repo directory's basename (or [`UNKNOWN_REPO`] when unattributed).
+/// repo directory's basename — made roster-unique so grouping/filtering never
+/// conflates two repos (see [`fetch`]) — or [`UNKNOWN_REPO`] when unattributed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Row {
     pub issue: Issue,
@@ -50,13 +51,34 @@ pub fn fetch(
     fetched_at: SystemTime,
 ) -> Result<Snapshot, BdError> {
     let issues = bd.ready(hub)?;
-    let mut rows: Vec<Row> = issues
+
+    // Attribute every issue to its source repo first, so a repo's display name
+    // can be made unique across the repos that actually appear before it is
+    // stamped onto rows.
+    let attributed: Vec<(Issue, Option<&Path>)> = issues
         .into_iter()
         .map(|issue| {
-            let repo_name = prefix_map
-                .repo_for(&issue.id)
-                .map(repo_name_of)
-                .unwrap_or_else(|| UNKNOWN_REPO.to_string());
+            let repo = prefix_map.repo_for(&issue.id).map(|e| e.path.as_path());
+            (issue, repo)
+        })
+        .collect();
+
+    // basename → the distinct repo paths that share it. A basename claimed by
+    // more than one repo is ambiguous, so those rows fall back to the full path.
+    let mut by_basename: HashMap<String, HashSet<&Path>> = HashMap::new();
+    for (_, repo) in &attributed {
+        if let Some(path) = repo {
+            by_basename.entry(basename(path)).or_default().insert(path);
+        }
+    }
+
+    let mut rows: Vec<Row> = attributed
+        .into_iter()
+        .map(|(issue, repo)| {
+            let repo_name = match repo {
+                Some(path) => display_name(path, &by_basename),
+                None => UNKNOWN_REPO.to_string(),
+            };
             Row { issue, repo_name }
         })
         .collect();
@@ -73,14 +95,24 @@ pub fn fetch(
     Ok(Snapshot { rows, fetched_at })
 }
 
-/// The display name for an attributed repo: its path's final component, falling
-/// back to the full path string for a path with no final component.
-fn repo_name_of(entry: &RepoEntry) -> String {
-    entry
-        .path
-        .file_name()
+/// A path's final component as a string, falling back to the full path string
+/// for a path with no final component (not expected for real repos).
+fn basename(path: &Path) -> String {
+    path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| entry.path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// A roster-unique display label for an attributed repo: its basename when only
+/// one repo carries that basename, else the full path string — so two distinct
+/// repos that happen to share a directory name (e.g. `/work/a/api` and
+/// `/work/b/api`) never collapse into a single group.
+fn display_name(path: &Path, by_basename: &HashMap<String, HashSet<&Path>>) -> String {
+    let bn = basename(path);
+    match by_basename.get(&bn) {
+        Some(paths) if paths.len() > 1 => path.to_string_lossy().into_owned(),
+        _ => bn,
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +120,7 @@ mod tests {
     use super::*;
     use crate::bd::FakeBdClient;
     use crate::bd::{BdError, BdErrorKind};
+    use crate::config::RepoEntry;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
@@ -232,6 +265,32 @@ mod tests {
             .find(|r| r.issue.id == "ra-1")
             .expect("attributed row present");
         assert_eq!(attributed.repo_name, "repo-a", "attributed row unaffected");
+    }
+
+    #[test]
+    fn disambiguates_duplicate_basenames() {
+        // Two distinct repos that share the directory name `api`.
+        let issues = vec![
+            issue("ra-1", 1, Some("2026-07-11T00:00:01Z")),
+            issue("rb-1", 1, Some("2026-07-11T00:00:02Z")),
+        ];
+        let bd = FakeBdClient::new().with_ready(issues);
+        let map = prefix_map(&[("ra", "/work/a/api"), ("rb", "/work/b/api")]);
+
+        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+
+        let name = |id: &str| {
+            snap.rows
+                .iter()
+                .find(|r| r.issue.id == id)
+                .map(|r| r.repo_name.as_str())
+                .expect("row present")
+        };
+        // The shared basename is ambiguous, so each falls back to its full path;
+        // grouping by repo_name keeps the two repos distinct.
+        assert_eq!(name("ra-1"), "/work/a/api");
+        assert_eq!(name("rb-1"), "/work/b/api");
+        assert_ne!(name("ra-1"), name("rb-1"), "distinct repos stay distinct");
     }
 
     #[test]
