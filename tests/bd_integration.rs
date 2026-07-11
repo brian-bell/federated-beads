@@ -8,7 +8,9 @@
 mod helpers;
 
 use fbd::bd::{BdCli, BdClient};
-use helpers::{bd_available, build_ready_fixture_repo};
+use fbd::config::{Config, Paths, RepoEntry};
+use fbd::hub::{ensure_hub, hub_dir, read_hub_roster};
+use helpers::{bd_available, build_ready_fixture_repo, build_ready_fixture_repo_with_prefix};
 
 #[test]
 fn bd_probe_skips_cleanly_when_absent() {
@@ -47,5 +49,62 @@ fn version_and_ready_roundtrip() {
     assert!(
         ready.iter().all(|i| i.id.starts_with("ra-")),
         "ids carry the configured prefix"
+    );
+}
+
+#[test]
+fn ensure_hub_end_to_end() {
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Two fixture repos with distinct prefixes.
+    let ra = tmp.path().join("ra");
+    let rb = tmp.path().join("rb");
+    std::fs::create_dir_all(&ra).expect("mkdir ra");
+    std::fs::create_dir_all(&rb).expect("mkdir rb");
+    build_ready_fixture_repo_with_prefix(&ra, "ra");
+    build_ready_fixture_repo_with_prefix(&rb, "rb");
+
+    // Hub lives under the injected data dir; roster names both repos.
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        repos: vec![
+            RepoEntry { path: ra.clone() },
+            RepoEntry { path: rb.clone() },
+        ],
+    };
+
+    let status = ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
+    assert!(
+        status.warnings.is_empty(),
+        "both repos exist, so no warnings: {:?}",
+        status.warnings
+    );
+
+    // The chosen roster-read path (config.yaml) reflects both repos, canonicalized
+    // as bd stores them.
+    let hub = hub_dir(&paths);
+    let tracked = read_hub_roster(&hub).expect("read hub roster");
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+    assert!(
+        tracked.contains(&canon(&ra)),
+        "hub roster lists ra: {tracked:?}"
+    );
+    assert!(
+        tracked.contains(&canon(&rb)),
+        "hub roster lists rb: {tracked:?}"
+    );
+
+    // Idempotent: a second ensure_hub adds nothing and stays clean.
+    let again = ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub again");
+    assert!(again.warnings.is_empty());
+    let tracked_again = read_hub_roster(&hub).expect("read hub roster again");
+    assert_eq!(
+        tracked_again.len(),
+        tracked.len(),
+        "second ensure_hub must not duplicate repos"
     );
 }

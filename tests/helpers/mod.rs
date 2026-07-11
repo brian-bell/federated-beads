@@ -58,11 +58,18 @@ fn parse_created_id(stdout: &str) -> String {
         .to_string()
 }
 
-/// Build a fixture repo at `dir` with prefix `ra`: three issues where the third
-/// is blocked by the second, then export to `.beads/issues.jsonl`. After this,
-/// `bd -C dir ready` returns 2 of 3 issues (the blocked one excluded).
+/// Build a fixture repo at `dir` with prefix `ra`. See
+/// [`build_ready_fixture_repo_with_prefix`].
 pub fn build_ready_fixture_repo(dir: &Path) {
-    bd_init(dir, "ra");
+    build_ready_fixture_repo_with_prefix(dir, "ra");
+}
+
+/// Build a fixture repo at `dir` with the given `prefix`: three issues where the
+/// third is blocked by the second, then export to `.beads/issues.jsonl`. After
+/// this, `bd -C dir ready` returns 2 of 3 issues (the blocked one excluded), and
+/// every issue id carries `prefix-`.
+pub fn build_ready_fixture_repo_with_prefix(dir: &Path, prefix: &str) {
+    bd_init(dir, prefix);
 
     let ready = parse_created_id(&bd(
         Some(dir),
