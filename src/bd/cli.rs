@@ -1,5 +1,6 @@
 //! `BdCli`: the real [`BdClient`] backed by spawning the `bd` binary.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
@@ -31,18 +32,19 @@ impl BdCli {
         }
     }
 
-    /// Render the command line for display/errors: `bd <args...>`.
-    fn command_line(&self, args: &[String]) -> String {
+    /// Render the command line for display/errors: `bd <args...>`. Lossy on
+    /// non-UTF-8 argument bytes — this string is for humans, never for spawning.
+    fn command_line(&self, args: &[OsString]) -> String {
         let mut s = self.program.clone();
         for a in args {
             s.push(' ');
-            s.push_str(a);
+            s.push_str(&a.to_string_lossy());
         }
         s
     }
 
     /// Spawn `bd <args>`, require exit success, and deserialize stdout as JSON.
-    fn run_json<T: DeserializeOwned>(&self, args: Vec<String>) -> Result<T, BdError> {
+    fn run_json<T: DeserializeOwned>(&self, args: Vec<OsString>) -> Result<T, BdError> {
         let stdout = self.run_capture(&args, None)?;
         serde_json::from_slice::<T>(&stdout).map_err(|_| BdError {
             command: self.command_line(&args),
@@ -53,7 +55,7 @@ impl BdCli {
 
     /// Spawn `bd <args>` and require exit success, discarding stdout. For calls
     /// (repo add/export/repo sync) that print status text, not JSON.
-    fn run_ok(&self, args: Vec<String>) -> Result<(), BdError> {
+    fn run_ok(&self, args: Vec<OsString>) -> Result<(), BdError> {
         self.run_capture(&args, None).map(|_| ())
     }
 
@@ -64,7 +66,7 @@ impl BdCli {
     /// `cwd` exists because `bd init` targets the current directory and rejects
     /// the global `-C` flag (which pre-checks for an existing beads project);
     /// every other call uses `-C` and leaves `cwd` `None`.
-    fn run_capture(&self, args: &[String], cwd: Option<&Path>) -> Result<Vec<u8>, BdError> {
+    fn run_capture(&self, args: &[OsString], cwd: Option<&Path>) -> Result<Vec<u8>, BdError> {
         let mut cmd = Command::new(&self.program);
         cmd.args(args);
         if let Some(dir) = cwd {
@@ -88,23 +90,23 @@ impl BdCli {
     }
 }
 
-/// Render a path as an argv element (lossy for non-UTF-8, which `bd` paths are
-/// not in practice).
-fn arg(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+/// A path as an argv element, preserving the exact bytes (no lossy UTF-8
+/// conversion) so non-UTF-8 paths — valid on Unix — reach `bd` intact.
+fn arg(p: &Path) -> OsString {
+    p.as_os_str().to_os_string()
 }
 
-fn argv_version() -> Vec<String> {
+fn argv_version() -> Vec<OsString> {
     vec!["version".into(), "--json".into()]
 }
 
 /// `init`'s argv carries no `-C`: bd rejects `-C` here (it pre-checks for an
 /// existing project), so [`BdClient::init`] runs `bd` with `dir` as its cwd.
-fn argv_init(prefix: &str) -> Vec<String> {
+fn argv_init(prefix: &str) -> Vec<OsString> {
     vec!["init".into(), "--prefix".into(), prefix.into()]
 }
 
-fn argv_repo_add(hub: &Path, repo_path: &Path) -> Vec<String> {
+fn argv_repo_add(hub: &Path, repo_path: &Path) -> Vec<OsString> {
     vec![
         "-C".into(),
         arg(hub),
@@ -114,7 +116,7 @@ fn argv_repo_add(hub: &Path, repo_path: &Path) -> Vec<String> {
     ]
 }
 
-fn argv_repo_list(hub: &Path) -> Vec<String> {
+fn argv_repo_list(hub: &Path) -> Vec<OsString> {
     vec![
         "-C".into(),
         arg(hub),
@@ -124,7 +126,7 @@ fn argv_repo_list(hub: &Path) -> Vec<String> {
     ]
 }
 
-fn argv_export(repo: &Path) -> Vec<String> {
+fn argv_export(repo: &Path) -> Vec<OsString> {
     vec![
         "-C".into(),
         arg(repo),
@@ -134,15 +136,15 @@ fn argv_export(repo: &Path) -> Vec<String> {
     ]
 }
 
-fn argv_repo_sync(hub: &Path) -> Vec<String> {
+fn argv_repo_sync(hub: &Path) -> Vec<OsString> {
     vec!["-C".into(), arg(hub), "repo".into(), "sync".into()]
 }
 
-fn argv_ready(hub: &Path) -> Vec<String> {
+fn argv_ready(hub: &Path) -> Vec<OsString> {
     vec!["-C".into(), arg(hub), "ready".into(), "--json".into()]
 }
 
-fn argv_show(hub: &Path, id: &str) -> Vec<String> {
+fn argv_show(hub: &Path, id: &str) -> Vec<OsString> {
     vec![
         "-C".into(),
         arg(hub),
@@ -152,7 +154,7 @@ fn argv_show(hub: &Path, id: &str) -> Vec<String> {
     ]
 }
 
-fn argv_search(hub: &Path, query: &str) -> Vec<String> {
+fn argv_search(hub: &Path, query: &str) -> Vec<OsString> {
     vec![
         "-C".into(),
         arg(hub),
@@ -210,53 +212,58 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Lift a `&str` argv literal to the `OsString` vectors the builders return.
+    fn os(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
     #[test]
     fn builds_correct_argv() {
-        assert_eq!(argv_version(), vec!["version", "--json"]);
+        assert_eq!(argv_version(), os(&["version", "--json"]));
 
         // `init` carries no `-C`; it runs with the target dir as cwd because bd
         // rejects `-C` before an existing project is created.
-        assert_eq!(argv_init("ra"), vec!["init", "--prefix", "ra"]);
+        assert_eq!(argv_init("ra"), os(&["init", "--prefix", "ra"]));
 
         assert_eq!(
             argv_repo_add(Path::new("/tmp/hub"), Path::new("/tmp/ra")),
-            vec!["-C", "/tmp/hub", "repo", "add", "/tmp/ra"]
+            os(&["-C", "/tmp/hub", "repo", "add", "/tmp/ra"])
         );
 
         assert_eq!(
             argv_repo_list(Path::new("/tmp/hub")),
-            vec!["-C", "/tmp/hub", "repo", "list", "--json"]
+            os(&["-C", "/tmp/hub", "repo", "list", "--json"])
         );
 
         assert_eq!(
             argv_export(Path::new("/tmp/ra")),
-            vec![
+            os(&[
                 "-C",
                 "/tmp/ra",
                 "export",
                 "-o",
                 "/tmp/ra/.beads/issues.jsonl"
-            ]
+            ])
         );
 
         assert_eq!(
             argv_repo_sync(Path::new("/tmp/hub")),
-            vec!["-C", "/tmp/hub", "repo", "sync"]
+            os(&["-C", "/tmp/hub", "repo", "sync"])
         );
 
         assert_eq!(
             argv_ready(Path::new("/tmp/hub")),
-            vec!["-C", "/tmp/hub", "ready", "--json"]
+            os(&["-C", "/tmp/hub", "ready", "--json"])
         );
 
         assert_eq!(
             argv_show(Path::new("/tmp/hub"), "ra-2hc"),
-            vec!["-C", "/tmp/hub", "show", "ra-2hc", "--json"]
+            os(&["-C", "/tmp/hub", "show", "ra-2hc", "--json"])
         );
 
         assert_eq!(
             argv_search(Path::new("/tmp/hub"), "needle"),
-            vec!["-C", "/tmp/hub", "search", "needle", "--json"]
+            os(&["-C", "/tmp/hub", "search", "needle", "--json"])
         );
     }
 
@@ -266,8 +273,20 @@ mod tests {
         let dir = Path::new("/tmp/my repos/rä");
         assert_eq!(
             argv_ready(dir),
-            vec!["-C", "/tmp/my repos/rä", "ready", "--json"]
+            os(&["-C", "/tmp/my repos/rä", "ready", "--json"])
         );
+    }
+
+    /// Non-UTF-8 paths are valid on Unix; the argv must carry their exact bytes
+    /// rather than the `to_string_lossy` replacement character.
+    #[cfg(unix)]
+    #[test]
+    fn argv_preserves_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        // 0x80 is a lone continuation byte: valid in a path, invalid UTF-8.
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/ra\x80");
+        let argv = argv_ready(Path::new(raw));
+        assert_eq!(argv[1].as_bytes(), b"/tmp/ra\x80");
     }
 
     #[test]
