@@ -22,13 +22,19 @@ pub enum Msg {
     // ---- Refresh lifecycle (runtime worker → app) ----
     /// A refresh began. Current rows stay visible and are marked [`App::is_stale`].
     RefreshStarted,
-    /// Fresh data arrived: replace rows, recompute the filter, clamp selection.
-    SnapshotReady(Snapshot),
-    /// The refresh cycle's warnings/errors to surface (per-repo export failures,
-    /// prefix collisions, missing roster paths, or a fatal sync error the runtime
-    /// chose to show rather than abort on). Pre-formatted so this core stays free
-    /// of `refresh`/`hub` error types.
-    RefreshWarnings(Vec<String>),
+    /// A refresh cycle concluded, atomically: the fresh snapshot (`Some` on
+    /// success, `None` when the refresh failed and the stale view is kept) plus
+    /// the warnings/errors to surface (per-repo export failures, prefix
+    /// collisions, missing roster paths, or a fatal sync error the runtime chose
+    /// to show rather than abort on). One terminal message per cycle — the single
+    /// point that clears [`App::is_stale`] — so a success-with-warnings cannot
+    /// split into two `stale`-clearing messages and let an overlapping refresh
+    /// slip through the dedup guard. Warnings are pre-formatted so this core
+    /// stays free of `refresh`/`hub` error types.
+    RefreshCompleted {
+        snapshot: Option<Snapshot>,
+        warnings: Vec<String>,
+    },
 
     // ---- Navigation ----
     /// Move the selection one row down (`j` / `Down`). Clamps at the last row.
@@ -193,18 +199,19 @@ impl App {
                 // refresh runs. First load (no rows) stays in `Loading`.
                 self.stale = true;
             }
-            Msg::SnapshotReady(snapshot) => {
-                self.rows = snapshot.rows;
-                self.fetched_at = Some(snapshot.fetched_at);
-                self.stale = false;
-                self.view_mode = ViewMode::List;
-                // The active filter persists across refreshes; recompute it
-                // against the new rows and re-clamp the selection.
-                self.recompute();
-            }
-            Msg::RefreshWarnings(warnings) => {
+            Msg::RefreshCompleted { snapshot, warnings } => {
+                if let Some(snapshot) = snapshot {
+                    self.rows = snapshot.rows;
+                    self.fetched_at = Some(snapshot.fetched_at);
+                    self.view_mode = ViewMode::List;
+                    // The active filter persists across refreshes; recompute it
+                    // against the new rows and re-clamp the selection. (`None`
+                    // keeps the last-good rows, so no recompute is needed.)
+                    self.recompute();
+                }
                 // The runtime sends the full warning set per cycle, so replace.
                 self.status_warnings = warnings;
+                // The single, atomic point that ends the in-flight cycle.
                 self.stale = false;
             }
             Msg::SelectNext => {
@@ -233,8 +240,9 @@ impl App {
                 // out-of-order completion could clobber a newer snapshot. Mark
                 // in-flight synchronously here — before any `RefreshStarted`
                 // arrives — so a mashed or key-repeated `r` yields one effect.
-                // The guard clears when the cycle concludes (SnapshotReady /
-                // RefreshWarnings), which the runtime always sends.
+                // The guard clears only when the single terminal
+                // `RefreshCompleted` arrives, so there is no window between two
+                // completion messages for an overlapping request to slip through.
                 if self.stale {
                     return Vec::new();
                 }
@@ -380,10 +388,18 @@ mod tests {
         }
     }
 
-    /// An app advanced to `List` with the given rows via `SnapshotReady`.
+    /// A successful refresh completion carrying `rows` and no warnings.
+    fn completed(rows: Vec<Row>) -> Msg {
+        Msg::RefreshCompleted {
+            snapshot: Some(snapshot(rows)),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// An app advanced to `List` with the given rows via a `RefreshCompleted`.
     fn app_with(rows: Vec<Row>) -> App {
         let mut app = App::new();
-        app.reduce(Msg::SnapshotReady(snapshot(rows)));
+        app.reduce(completed(rows));
         app
     }
 
@@ -404,10 +420,7 @@ mod tests {
         assert_eq!(app.view_mode(), ViewMode::Loading, "no rows yet -> Loading");
 
         // First snapshot: rows appear, list shown, selection at the top.
-        app.reduce(Msg::SnapshotReady(snapshot(vec![
-            row("ra", "ra-1", 1),
-            row("ra", "ra-2", 2),
-        ])));
+        app.reduce(completed(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]));
         assert_eq!(app.view_mode(), ViewMode::List);
         assert_eq!(app.rows().len(), 2);
         assert_eq!(app.selection(), Some(0));
@@ -512,10 +525,15 @@ mod tests {
         app.reduce(Msg::RefreshStarted);
         assert!(app.is_stale());
 
-        app.reduce(Msg::RefreshWarnings(vec![
-            "export failed for repo-b".into(),
-            "id prefix `dup` claimed by 2 repos".into(),
-        ]));
+        // A refresh that succeeded but had per-repo trouble: the snapshot and its
+        // warnings arrive together in one completion message.
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(snapshot(vec![row("ra", "ra-1", 1)])),
+            warnings: vec![
+                "export failed for repo-b".into(),
+                "id prefix `dup` claimed by 2 repos".into(),
+            ],
+        });
         assert!(
             app.status_warnings()
                 .iter()
@@ -524,6 +542,26 @@ mod tests {
             app.status_warnings()
         );
         assert!(!app.is_stale(), "the refresh cycle concluded");
+    }
+
+    #[test]
+    fn fatal_refresh_keeps_rows_and_surfaces_warning() {
+        // A refresh that failed outright: no snapshot, but the stale view is kept
+        // and the error is surfaced.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
+        app.reduce(Msg::RefreshStarted);
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: None,
+            warnings: vec!["hub sync failed".into()],
+        });
+        assert_eq!(
+            app.rows().len(),
+            2,
+            "last-good rows kept on a failed refresh"
+        );
+        assert_eq!(app.view_mode(), ViewMode::List);
+        assert!(!app.is_stale(), "the failed cycle still concludes");
+        assert!(app.status_warnings().iter().any(|w| w.contains("hub sync")));
     }
 
     #[test]
@@ -557,9 +595,40 @@ mod tests {
         );
 
         // Once the cycle concludes, a fresh request is honored again.
-        app.reduce(Msg::SnapshotReady(snapshot(vec![row("ra", "ra-1", 1)])));
+        app.reduce(completed(vec![row("ra", "ra-1", 1)]));
         assert!(!app.is_stale());
         assert_eq!(app.reduce(Msg::Refresh), vec![Effect::Refresh]);
+    }
+
+    #[test]
+    fn success_with_warnings_completes_atomically() {
+        // Regression: a successful-with-warnings refresh must conclude in ONE
+        // message. If it split into snapshot-then-warnings, an `r` in the gap
+        // would slip past the dedup guard and the trailing warnings message would
+        // then clear the *new* refresh's in-flight flag. Here the single
+        // completion clears `stale` exactly once, and the interleaved second
+        // refresh is a distinct, still-guarded cycle.
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+
+        assert_eq!(app.reduce(Msg::Refresh), vec![Effect::Refresh]);
+        assert!(app.is_stale());
+        // First cycle concludes atomically with a snapshot and warnings.
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(snapshot(vec![row("ra", "ra-2", 1)])),
+            warnings: vec!["export failed for repo-b".into()],
+        });
+        assert!(!app.is_stale());
+        assert_eq!(app.status_warnings().len(), 1);
+
+        // A new refresh starts its own guarded cycle; no leftover completion
+        // message from the first cycle exists to clear it.
+        assert_eq!(app.reduce(Msg::Refresh), vec![Effect::Refresh]);
+        assert!(app.is_stale());
+        assert_eq!(
+            app.reduce(Msg::Refresh),
+            Vec::new(),
+            "the second cycle is still deduped"
+        );
     }
 
     #[test]
@@ -577,11 +646,11 @@ mod tests {
         assert_eq!(app.filter().repo(), &RepoFilter::Only("repo-a".into()));
 
         // A new snapshot (different rows, still has repo-a) keeps the filter.
-        app.reduce(Msg::SnapshotReady(snapshot(vec![
+        app.reduce(completed(vec![
             row("repo-a", "ra-9", 1),
             row("repo-a", "ra-8", 2),
             row("repo-b", "rb-9", 1),
-        ])));
+        ]));
         assert_eq!(
             app.filter().repo(),
             &RepoFilter::Only("repo-a".into()),
@@ -625,7 +694,7 @@ mod tests {
                 4 => Msg::RefreshStarted,
                 _ => {
                     let set = &sample_sets[(next() as usize) % sample_sets.len()];
-                    Msg::SnapshotReady(snapshot(set.clone()))
+                    completed(set.clone())
                 }
             };
             app.reduce(msg);

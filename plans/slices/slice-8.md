@@ -44,25 +44,43 @@ them.
    `Effect::FetchDetail(String)`, Slice 11 `Effect::Search(String)` — additive,
    no change to `reduce`'s signature or the runtime's call site.
 
-3. **`Msg` names follow the Slice 8 test vocabulary.** Refresh lifecycle is three
-   messages the Slice 9 runtime feeds from its worker thread:
+3. **Refresh lifecycle is two messages, with an *atomic* completion.** The Slice
+   9 runtime feeds these from its worker thread:
    - `RefreshStarted` — a refresh began; keep current rows visible, set `stale`.
-   - `SnapshotReady(Snapshot)` — fresh data; replace rows, recompute the filter,
-     clamp selection, clear `stale`, record `fetched_at`, enter `List`.
-   - `RefreshWarnings(Vec<String>)` — the refresh cycle's warnings/errors to
-     surface (per-repo export failures, prefix collisions, `ensure_hub` missing
-     paths, or a fatal sync error mapped by the runtime to a status line rather
-     than aborting the whole TUI). Sets `status_warnings`, clears `stale`. A
-     clean refresh with per-repo warnings sends `SnapshotReady` **and**
-     `RefreshWarnings`; a fatal refresh sends only `RefreshWarnings` (stale view
-     stays browsable). The pre-formatted `String`s keep `reduce` free of
-     `refresh`/`hub` error types (the runtime owns formatting + sanitization).
+   - `RefreshCompleted { snapshot: Option<Snapshot>, warnings: Vec<String> }` —
+     the cycle concluded. `Some(snapshot)` on success (replace rows, recompute
+     the filter, clamp selection, record `fetched_at`, enter `List`); `None` when
+     the refresh failed (keep the last-good rows browsable). Either way it sets
+     `status_warnings` and clears `stale`. Warnings cover per-repo export
+     failures, prefix collisions, `ensure_hub` missing paths, or a fatal sync
+     error the runtime chose to surface rather than abort on; the pre-formatted
+     `String`s keep `reduce` free of `refresh`/`hub` error types (the runtime
+     owns formatting + sanitization).
+   - *(Revised after autoreview — see Autoreview outcomes.)* An earlier draft used
+     separate `SnapshotReady(Snapshot)` + `RefreshWarnings(Vec<String>)`
+     messages, so a success-with-warnings refresh sent **two** messages that each
+     cleared `stale`. That opened a window between them where an `r` keypress
+     could slip past the in-flight dedup guard and the trailing message would then
+     clear the *new* refresh's flag — permitting overlapping workers and
+     out-of-order snapshots. Folding completion into one terminal message makes
+     "clear `stale`" happen exactly once per cycle, closing the window. This is
+     the deviation from the master plan's `SnapshotReady` shorthand (permitted by
+     its "or equivalent").
 
 4. **`stale` = "a refresh is in flight over the shown rows."** Set by
-   `RefreshStarted`, cleared by whichever message concludes the cycle
-   (`SnapshotReady` or `RefreshWarnings`). Distinct from *age* (Slice 9 computes
-   "refreshed 3m ago" from `fetched_at` and an injected `now`); this flag is the
-   "refreshing…" indicator and the reason old rows are kept on screen.
+   `RefreshStarted` and, synchronously, by an accepted `Msg::Refresh` (decision
+   2a below); cleared only by the single terminal `RefreshCompleted`. Distinct
+   from *age* (Slice 9 computes "refreshed 3m ago" from `fetched_at` and an
+   injected `now`); this flag is the "refreshing…" indicator, the reason old rows
+   are kept on screen, and the in-flight guard that dedups refresh requests.
+
+   2a. **Refresh requests are deduplicated in `reduce`.** `Msg::Refresh` emits
+   `Effect::Refresh` and sets `stale` **only when not already in flight**;
+   otherwise it is a no-op. `map_key` maps key *repeats* (holding `j`/`k`
+   scrolls), so without this guard holding `r` — or mashing it before
+   `RefreshStarted` lands — would spawn overlapping workers whose out-of-order
+   completion could clobber a newer snapshot. Setting `stale` synchronously at
+   request time (before any async `RefreshStarted`) makes the guard race-free.
 
 5. **`selection` indexes `filtered_ix`, not `rows`.** `filtered_ix: Vec<usize>`
    holds the indices of rows passing the current `FilterSet`, in display order.
@@ -149,27 +167,35 @@ them.
 
 6. **`refresh_error_surfaces_in_status`**
    - Red: warnings not stored.
-   - Green: `reduce(RefreshWarnings(vec!["export failed for repo-b".into()]))`
-     ⇒ `status_warnings()` contains that string; `!is_stale()`.
+   - Green: a success-with-warnings `RefreshCompleted { snapshot: Some(..),
+     warnings: vec!["export failed for repo-b".into(), ..] }` ⇒ `status_warnings()`
+     contains that string; `!is_stale()`. Companion `fatal_refresh_keeps_rows_
+     and_surfaces_warning`: `RefreshCompleted { snapshot: None, warnings }` keeps
+     the last-good rows, stays `List`, clears `stale`, surfaces the error.
 
-7. **`refresh_key_requests_refresh_effect`**
-   - Red: `Effect`/effect return absent.
-   - Green: `reduce(Refresh)` returns `vec![Effect::Refresh]` and changes no
-     observable state (the runtime spawns the worker).
+7. **`refresh_key_requests_refresh_effect`** + **`refresh_is_deduped_while_in_
+   flight`** + **`success_with_warnings_completes_atomically`**
+   - Red: `Effect`/effect return + dedup guard absent.
+   - Green: `reduce(Refresh)` on an idle app returns `vec![Effect::Refresh]` and
+     sets `is_stale()`, touching nothing else. A second `Refresh` while in flight
+     returns `[]` (no overlapping worker). After the single `RefreshCompleted`,
+     `Refresh` is honored again. The atomic-completion test proves a
+     success-with-warnings cycle clears `stale` exactly once, so a later refresh
+     is a distinct, still-guarded cycle (regression for the autoreview finding).
 
 8. **`quit_msg_sets_done`**
    - Red: `done`/`is_done` absent.
    - Green: `reduce(Quit)` ⇒ `is_done()`.
 
 9. **`filters_persist_and_recompute_across_refresh`** (guards decision 6)
-   - Green: with `Only("repo-a")` active, a new `SnapshotReady` (different row
+   - Green: with `Only("repo-a")` active, a new `RefreshCompleted` (different row
      set still containing `repo-a`) keeps the filter and shows only `repo-a`
      rows, selection valid.
 
 10. **`selection_invariant_holds_under_random_messages`** (refactor / property)
     - Green: a deterministic LCG (no `rand` dep) generates a long sequence of
       messages drawn from {`SelectNext`, `SelectPrev`, `CycleRepoFilter`,
-      `TogglePriorityFilter`, `SnapshotReady(varied row sets incl. empty)`,
+      `TogglePriorityFilter`, `RefreshCompleted(varied row sets incl. empty)`,
       `RefreshStarted`}. After **every** step assert the invariant: either
       `filtered_ix` empty with `selection() == None` and `selected_row() ==
       None`, or `selection()` is `Some(i)` with `i < filtered_rows().len()` and
@@ -193,7 +219,7 @@ them.
   view (valid), and `f` cycles it back toward `All` (decision 6).
 - **Repeat vs Press key kinds**: `Release` is ignored; `Press`/`Repeat` map
   (holding `j` repeats). Handled in `keys.rs` (test 14).
-- **Warnings replace, not append**: each `RefreshWarnings` sets the current
+- **Warnings replace, not append**: each `RefreshCompleted` sets the current
   status list (the runtime sends the full set per cycle), so a healed repo's
   warning disappears on the next clean refresh.
 
@@ -215,3 +241,29 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --test bd_integration
 ```
+
+## Autoreview outcomes (codex gpt-5.6-sol, high; branch vs main)
+
+Ran to convergence over three rounds. Both accepted findings were about the same
+bug class — overlapping refresh workers — fixed at the pure-state layer where the
+hazard originates:
+
+1. **Overlapping refresh effects (round 1).** `reduce(Msg::Refresh)` emitted
+   `Effect::Refresh` unconditionally, and `map_key` maps key *repeats*, so
+   holding `r` could spawn many concurrent refresh workers; a slower older worker
+   could then overwrite a newer snapshot. **Fixed:** an in-flight guard —
+   `Msg::Refresh` sets `stale` synchronously and emits the effect only when not
+   already refreshing (decision 2a). Regression test `refresh_is_deduped_while_
+   in_flight`.
+2. **Dedup window between two completion messages (round 2).** The original
+   two-message completion (`SnapshotReady` then `RefreshWarnings`) had **both**
+   clear `stale`, so a success-with-warnings refresh left a gap in which an `r`
+   could slip past the guard, after which the trailing message cleared the *new*
+   refresh's flag — re-opening the exact race the guard closes. **Fixed:** folded
+   completion into one atomic `RefreshCompleted { snapshot: Option<Snapshot>,
+   warnings }` (decision 3), so `stale` clears exactly once per cycle. Regression
+   tests `success_with_warnings_completes_atomically` and
+   `fatal_refresh_keeps_rows_and_surfaces_warning`.
+3. **Round 3: clean** — helper exited 0 with no accepted/actionable findings.
+
+No findings were rejected.
