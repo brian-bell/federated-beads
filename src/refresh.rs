@@ -98,7 +98,11 @@ impl PrefixMap {
     /// Build the map from `(prefix, repo)` pairs. A prefix claimed by more than
     /// one repo becomes a [`Collision`] and a `None` entry; a unique prefix maps
     /// to its repo. First-seen order is preserved for deterministic reporting.
-    fn build(pairs: Vec<(String, RepoEntry)>) -> PrefixMap {
+    ///
+    /// Public so consumers (e.g. `snapshot`'s tests) can construct a populated
+    /// map without running a whole refresh; `run` builds it from the prefixes it
+    /// reads from each repo's metadata.
+    pub fn from_pairs(pairs: Vec<(String, RepoEntry)>) -> PrefixMap {
         let mut order: Vec<String> = Vec::new();
         let mut grouped: HashMap<String, Vec<RepoEntry>> = HashMap::new();
         for (prefix, repo) in pairs {
@@ -241,7 +245,7 @@ pub fn run(
     bd.repo_sync(&hub).map_err(RefreshError::Sync)?;
 
     Ok(RefreshOutcome {
-        prefix_map: PrefixMap::build(pairs),
+        prefix_map: PrefixMap::from_pairs(pairs),
         errors,
         synced_at: SystemTime::now(),
     })
