@@ -109,19 +109,11 @@ fn run() -> Result<(), CliError> {
                 cli::run_repos_discover(&paths, &root, add, &mut stdout)
             }
         },
-        // Bare `fbd` is reserved for launching the TUI (Slice 9). Until then,
-        // orient the user toward the working subcommands rather than erroring.
+        // Bare `fbd` launches the interactive TUI: ensure_hub warnings flow to
+        // the status bar and the initial refresh is spawned at launch.
         None => {
-            writeln!(
-                stdout,
-                "fbd {} — the interactive TUI arrives in a later slice.",
-                env!("CARGO_PKG_VERSION"),
-            )?;
-            writeln!(
-                stdout,
-                "For now: `fbd snapshot` (merged ready list), `fbd doctor` (diagnostics), `fbd reset`.",
-            )?;
-            Ok(())
+            let roster = cli::load_roster(&paths)?;
+            fbd::runtime::run(&paths, roster)
         }
     }
 }

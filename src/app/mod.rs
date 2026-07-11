@@ -9,6 +9,7 @@
 //! See `plans/slices/slice-8.md`.
 
 pub mod keys;
+pub mod view;
 
 use std::time::SystemTime;
 
