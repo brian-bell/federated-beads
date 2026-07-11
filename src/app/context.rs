@@ -21,41 +21,98 @@ use crate::cli::sanitize;
 /// configured prefix, or a collided/ambiguous one): `bd -C <hub> show <id>`,
 /// which is always correct because the hub holds every hydrated issue.
 ///
-/// Every interpolated argument is [`shell_quote`]d so the command stays runnable
-/// and safe when pasted: a repo path containing a space would otherwise break
-/// `cd`, and a shell metacharacter (`;`, `$()`, quotes) in a path or id would
-/// otherwise execute. The id is additionally [`sanitize`]d (it is bd-sourced).
-///
-/// A repo path that is not valid UTF-8 (Unix paths may hold arbitrary bytes)
-/// cannot be represented in the command string without a lossy substitution that
-/// would `cd` to the wrong directory, so it falls back to the always-runnable hub
-/// form rather than emit a subtly-wrong command.
+/// Every interpolated argument is shell-quoted so the command stays runnable and
+/// safe when pasted: a repo path containing a space would otherwise break `cd`, a
+/// shell metacharacter (`;`, `$()`, quotes) would otherwise execute, and a raw
+/// control byte placed on the clipboard would be interpreted by the terminal on
+/// paste (before any shell parsing). Paths are quoted byte-faithfully (Unix paths
+/// may hold arbitrary, even non-UTF-8, bytes — see [`quote_path`]); the id is
+/// additionally [`sanitize`]d (it is bd-sourced) and quoted.
 pub fn shell_command(repo: Option<&Path>, hub: &Path, id: &str) -> String {
     let id = shell_quote(&sanitize(id));
-    match repo.and_then(Path::to_str) {
-        Some(repo) => format!("cd {} && bd show {}", shell_quote(repo), id),
-        // No repo (unattributed) or a non-UTF-8 repo path: the hub form. The hub
-        // path is fbd-owned under the XDG data dir; `to_string_lossy` is the last
-        // resort if even it is non-UTF-8, where no faithful representation exists.
-        None => format!("bd -C {} show {}", shell_quote(&hub.to_string_lossy()), id),
+    match repo {
+        Some(repo) => format!("cd {} && bd show {}", quote_path(repo), id),
+        None => format!("bd -C {} show {}", quote_path(hub), id),
     }
 }
 
-/// POSIX shell-quote `s` so it interpolates as a single, literal argument. A word
-/// made only of unambiguous, metacharacter-free characters is returned bare (so
-/// the common `cd /Users/me/dev/repo && bd show mc-abc` reads cleanly); anything
-/// else is wrapped in single quotes, with any embedded `'` closed-escaped-reopened
-/// (`'\''`), which makes every other byte — spaces, `;`, `$`, `` ` ``, newlines —
-/// literal.
+/// Whether `c` is safe to leave bare in a shell word: no quoting, no expansion,
+/// no terminal meaning.
+fn is_shell_safe(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '.' | '_' | '-' | '/' | '@' | '%' | '+' | ',' | ':' | '=')
+}
+
+/// Shell-quote a UTF-8, control-free string (an id after [`sanitize`]): bare when
+/// it is a safe word, else single-quoted with any `'` closed-escaped-reopened.
 fn shell_quote(s: &str) -> String {
-    fn is_safe(c: char) -> bool {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '.' | '_' | '-' | '/' | '@' | '%' | '+' | ',' | ':' | '=')
-    }
-    if !s.is_empty() && s.chars().all(is_safe) {
+    if !s.is_empty() && s.chars().all(is_shell_safe) {
         return s.to_string();
     }
+    single_quote(s)
+}
+
+/// POSIX single-quote: everything inside `'…'` is literal except `'` itself,
+/// which is closed, backslash-escaped, and reopened (`'\''`).
+fn single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Shell-quote a filesystem path byte-faithfully, so the pasted command targets
+/// the *exact* directory and can never carry a raw control byte onto the terminal:
+///
+/// - a safe word (`/Users/me/dev/repo`) is left bare;
+/// - printable UTF-8 with spaces/metacharacters is POSIX single-quoted;
+/// - anything with a control byte or invalid UTF-8 uses shell ANSI-C `$'…'`
+///   quoting, hex-escaping each non-printable byte (`\xNN`) so the real bytes
+///   reach `cd`/`bd -C` while nothing raw reaches the terminal on paste.
+///
+/// (ANSI-C `$'…'` is a bash/zsh/ksh extension, not POSIX `sh`; it is used only for
+/// paths that cannot be represented otherwise, and every ordinary path stays
+/// POSIX-portable.)
+fn quote_path(p: &Path) -> String {
+    let bytes = os_bytes(p);
+    if !bytes.is_empty() && bytes.iter().all(|&b| b < 0x80 && is_shell_safe(b as char)) {
+        // All safe ASCII ⇒ valid UTF-8, leave bare.
+        return String::from_utf8(bytes).expect("safe ASCII is valid UTF-8");
+    }
+    match std::str::from_utf8(&bytes) {
+        // Printable UTF-8 (accents, spaces, metacharacters): POSIX single-quote.
+        Ok(s) if !s.chars().any(|c| c.is_control()) => single_quote(s),
+        // Control bytes or non-UTF-8: ANSI-C quote, escaping the raw bytes.
+        _ => ansi_c_quote(&bytes),
+    }
+}
+
+/// The raw bytes of a path. On Unix these are the exact `OsStr` bytes (which may
+/// be non-UTF-8); elsewhere a lossy UTF-8 rendering (Windows is not a v1 target).
+#[cfg(unix)]
+fn os_bytes(p: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_bytes(p: &Path) -> Vec<u8> {
+    p.to_string_lossy().into_owned().into_bytes()
+}
+
+/// ANSI-C (`$'…'`) quote raw bytes: printable ASCII stays literal, `'`/`\` are
+/// backslash-escaped, and every other byte (controls, high/non-UTF-8 bytes) is
+/// written as `\xNN`. The result contains only printable ASCII, so nothing raw is
+/// ever placed on the clipboard, while the shell reconstructs the exact bytes.
+fn ansi_c_quote(bytes: &[u8]) -> String {
+    let mut out = String::from("$'");
+    for &b in bytes {
+        match b {
+            b'\'' => out.push_str("\\'"),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Build a shareable markdown block for the issue: a title heading, an id/repo
@@ -220,17 +277,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_utf8_repo_path_falls_back_to_hub() {
+    fn non_utf8_repo_path_is_ansi_c_quoted() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
-        // A repo path with invalid UTF-8 bytes cannot be a faithful command
-        // string; the hub form is emitted instead of a lossy, wrong `cd`.
+        // A repo path with invalid UTF-8 bytes is faithfully ANSI-C quoted, so the
+        // `cd` targets the real directory and nothing raw reaches the terminal.
         let bad = std::path::PathBuf::from(OsStr::from_bytes(b"/tmp/\xff\xferepo"));
         let cmd = shell_command(Some(&bad), Path::new("/data/hub"), "mc-1");
-        assert_eq!(
-            cmd, "bd -C /data/hub show mc-1",
-            "a non-UTF-8 repo path degrades to the always-runnable hub form"
+        assert_eq!(cmd, r"cd $'/tmp/\xff\xferepo' && bd show mc-1");
+    }
+
+    #[test]
+    fn control_bytes_in_path_are_escaped_not_raw() {
+        // A path with an ESC byte must not place that raw byte on the clipboard;
+        // it is hex-escaped inside ANSI-C quoting.
+        let cmd = shell_command(Some(Path::new("/tmp/a\u{1b}b")), Path::new("/h"), "mc-1");
+        assert!(
+            !cmd.contains('\u{1b}'),
+            "no raw ESC in the copied command: {cmd:?}"
         );
+        assert_eq!(cmd, r"cd $'/tmp/a\x1bb' && bd show mc-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_hub_path_is_quoted_faithfully() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // The unattributed hub fallback must not lossily corrupt a non-UTF-8 hub
+        // path either — it is ANSI-C quoted like any other path.
+        let hub = std::path::PathBuf::from(OsStr::from_bytes(b"/data/\xffhub"));
+        let cmd = shell_command(None, &hub, "mc-1");
+        assert_eq!(cmd, r"bd -C $'/data/\xffhub' show mc-1");
+    }
+
+    #[test]
+    fn accented_path_with_space_stays_single_quoted() {
+        // A legitimate UTF-8 path with an accent and a space is single-quoted
+        // (POSIX-portable), not ANSI-C hex-escaped into unreadability.
+        let cmd = shell_command(
+            Some(Path::new("/Users/josé/my repo")),
+            Path::new("/h"),
+            "mc-1",
+        );
+        assert_eq!(cmd, "cd '/Users/josé/my repo' && bd show mc-1");
     }
 
     #[test]

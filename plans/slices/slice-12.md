@@ -233,4 +233,24 @@ Round 4 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
    `Path::to_str` and falls back to the always-runnable hub form for a non-UTF-8
    repo path. New test `non_utf8_repo_path_falls_back_to_hub`.
 
-Round 5: clean (no accepted/actionable findings).
+Round 5 (codex, gpt-5.6-sol) — two findings, both accepted; fixed together by
+reworking path quoting to be byte-faithful:
+
+8. **[P1] Control bytes in a repo path.** `shell_quote` left control bytes (ESC/
+   BEL/bracketed-paste terminators) in a valid-UTF-8 path unchanged, so OSC 52
+   put them on the clipboard raw and a paste would drive the terminal.
+9. **[P2] Lossy non-UTF-8 hub path.** The unattributed fallback `to_string_lossy`'d
+   the hub path, so a non-UTF-8 `XDG_DATA_HOME` produced a `bd -C` targeting the
+   wrong directory.
+
+Fix: `quote_path` now quotes paths from their raw bytes — bare for a safe word,
+POSIX single-quote for printable UTF-8 (accents/spaces/metacharacters), and shell
+ANSI-C `$'…'` (hex-escaping every non-printable byte) for control bytes or
+non-UTF-8. This supersedes round 4's non-UTF-8 hub fallback (now faithfully
+quoted, not degraded) and applies to both the repo and hub paths, so the copied
+command targets the exact directory and never carries a raw byte to the terminal.
+New tests: `non_utf8_repo_path_is_ansi_c_quoted`,
+`control_bytes_in_path_are_escaped_not_raw`, `non_utf8_hub_path_is_quoted_faithfully`,
+`accented_path_with_space_stays_single_quoted`.
+
+Round 6: clean (no accepted/actionable findings).
