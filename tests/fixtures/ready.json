@@ -1,0 +1,31 @@
+[
+  {
+    "id": "ra-z70",
+    "title": "Blocker task",
+    "status": "open",
+    "priority": 0,
+    "issue_type": "task",
+    "owner": "bellbm@gmail.com",
+    "created_at": "2026-07-11T12:41:26Z",
+    "created_by": "Brian Bell",
+    "updated_at": "2026-07-11T12:41:26Z",
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "comment_count": 0
+  },
+  {
+    "id": "ra-shr",
+    "title": "Ready task one",
+    "description": "First ready task with a description",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "bellbm@gmail.com",
+    "created_at": "2026-07-11T12:41:25Z",
+    "created_by": "Brian Bell",
+    "updated_at": "2026-07-11T12:41:25Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  }
+]

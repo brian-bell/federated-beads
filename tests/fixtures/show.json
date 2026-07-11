@@ -1,0 +1,31 @@
+[
+  {
+    "id": "ra-4zf",
+    "title": "Blocked task",
+    "description": "This one is blocked by the blocker",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "bellbm@gmail.com",
+    "created_at": "2026-07-11T12:41:26Z",
+    "created_by": "Brian Bell",
+    "updated_at": "2026-07-11T12:41:26Z",
+    "dependencies": [
+      {
+        "id": "ra-z70",
+        "title": "Blocker task",
+        "status": "open",
+        "priority": 0,
+        "issue_type": "task",
+        "owner": "bellbm@gmail.com",
+        "created_at": "2026-07-11T12:41:26Z",
+        "created_by": "Brian Bell",
+        "updated_at": "2026-07-11T12:41:26Z",
+        "dependency_type": "blocks"
+      }
+    ],
+    "dependent_count": 0,
+    "dependency_count": 1,
+    "comment_count": 0
+  }
+]
