@@ -8,7 +8,7 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -72,11 +72,43 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     let mut refresh_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     // The App is born stale; launch immediately kicks off the first refresh.
     refresh_handles.push(spawn_refresh(&tx, paths, roster));
-    draw(terminal, &app)?;
 
+    // Run the render/reduce loop, then join threads *unconditionally* — for a
+    // clean quit and for every error return alike — so a terminal write failure
+    // can never detach the input thread or an in-flight refresh (which would
+    // orphan its bd subprocess while our process exits and drops the hub lock).
+    let result = ui_loop(
+        terminal,
+        &rx,
+        &tx,
+        &mut app,
+        &mut refresh_handles,
+        paths,
+        roster,
+    );
+    stop.store(true, Ordering::SeqCst);
+    let _ = input_handle.join();
+    for handle in refresh_handles {
+        let _ = handle.join();
+    }
+    result
+}
+
+/// The render/reduce loop, factored out so [`event_loop`] can join its threads
+/// whether this returns `Ok` (a `q` quit) or `Err` (a terminal draw failure).
+fn ui_loop(
+    terminal: &mut Tui,
+    rx: &Receiver<Msg>,
+    tx: &Sender<Msg>,
+    app: &mut App,
+    refresh_handles: &mut Vec<thread::JoinHandle<()>>,
+    paths: &Paths,
+    roster: &Config,
+) -> Result<(), CliError> {
+    draw(terminal, app)?;
     // Redraw on every message and on every idle tick, so the staleness age keeps
     // advancing even while no messages arrive. `Disconnected` cannot occur while
-    // this thread still holds `tx`, but is handled defensively as a clean exit.
+    // the caller still holds `tx`, but is handled defensively as a clean exit.
     loop {
         match rx.recv_timeout(TICK) {
             Ok(msg) => {
@@ -84,29 +116,19 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
                     match effect {
                         Effect::Refresh => {
                             refresh_handles.retain(|h| !h.is_finished());
-                            refresh_handles.push(spawn_refresh(&tx, paths, roster));
+                            refresh_handles.push(spawn_refresh(tx, paths, roster));
                         }
                     }
                 }
                 if app.is_done() {
-                    break;
+                    return Ok(());
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        draw(terminal, &app)?;
+        draw(terminal, app)?;
     }
-
-    // Stop the input thread, then wait for any in-flight refresh to finish so its
-    // bd subprocess completes and the hub lock releases cleanly before we exit
-    // (a quit mid-refresh must not leave an orphaned child mutating the hub).
-    stop.store(true, Ordering::SeqCst);
-    let _ = input_handle.join();
-    for handle in refresh_handles {
-        let _ = handle.join();
-    }
-    Ok(())
 }
 
 /// Render the current state with a fresh `now` for the staleness age.

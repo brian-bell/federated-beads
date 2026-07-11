@@ -200,6 +200,17 @@ Helper: `app_with(rows)` builds an `App` advanced to `List` via
 - **Narrow/short terminal**: layout uses `Min(0)` for the list and fixed-height
   title/status; rows longer than the width are truncated by ratatui, never wrap
   into forged rows (bd text is `sanitize`d of control chars regardless).
+- **List taller than the viewport**: the list scrolls to keep the selected row
+  visible; when scrolled, the governing `▸ <repo>` header is frozen on the top
+  row (a sticky header) so no visible row loses its attribution (rows omit the
+  repo by design).
+- **Terminal draw failure mid-loop**: the render/reduce loop is factored into
+  `ui_loop`; `event_loop` joins the input + refresh threads unconditionally after
+  it returns, so an `Err` return path cleans up exactly like a clean quit and
+  never orphans an in-flight `bd` subprocess.
+- **Inert keys**: only keys that act this slice are advertised in the title hint;
+  `/` (search, Slice 11) and Enter (detail, Slice 10) are omitted until they do
+  something.
 - **Refresh in flight**: `is_stale()` shows `refreshing…`; old rows stay drawn
   (Slice 8 keeps them). A second `r` is deduped by the Slice 8 guard, so at most
   one worker thread exists per cycle.

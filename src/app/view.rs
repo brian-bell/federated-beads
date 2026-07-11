@@ -29,8 +29,10 @@ const EMPTY_HINT: &str = "no repos configured — run: fbd repos discover ~/dev"
 /// is not misdirected to reconfigure the roster.
 const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p to change";
 
-/// One-line key hints shown along the top.
-const KEY_HINTS: &str = "fbd · q quit · r refresh · / search · f repo · p prio · j/k move";
+/// One-line key hints shown along the top. Only keys that act in this slice are
+/// advertised; `/` search (Slice 11) and Enter detail (Slice 10) are omitted
+/// until they do something, so the UI never promises an inert command.
+const KEY_HINTS: &str = "fbd · q quit · r refresh · f repo · p prio · j/k move";
 
 /// Render the whole ready screen for the current [`App`] state and clock `now`.
 pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
@@ -87,13 +89,16 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     // The rendered line index (headers included) of the selected row, so the
     // list can be scrolled to keep it on screen once it exceeds the area height.
     let mut selected_line: Option<usize> = None;
+    // The header text governing each rendered line, so a scrolled viewport can
+    // re-show the repo of its topmost line (rows omit the repo by design).
+    let mut line_header: Vec<String> = Vec::new();
     let mut current_repo: Option<&str> = None;
+    let mut header_text = String::new();
     for (i, row) in rows.iter().enumerate() {
         if current_repo != Some(row.repo_name.as_str()) {
-            lines.push(Line::styled(
-                format!("▸ {}", sanitize(&row.repo_name)),
-                header_style,
-            ));
+            header_text = format!("▸ {}", sanitize(&row.repo_name));
+            lines.push(Line::styled(header_text.clone(), header_style));
+            line_header.push(header_text.clone());
             current_repo = Some(row.repo_name.as_str());
         }
         let text = format!("  {}", format_row_body(row));
@@ -105,13 +110,38 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             lines.push(Line::from(text));
         }
+        line_header.push(header_text.clone());
     }
 
     // Scroll just enough to keep the selected line inside the viewport: nothing
     // until it would fall off the bottom, then anchor it to the last visible
     // row. Stateless (recomputed each draw), so no cross-frame offset to track.
     let offset = scroll_offset(selected_line, area.height as usize, lines.len());
-    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), area);
+    if offset == 0 {
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    // Scrolled: the governing header may have scrolled off the top. Freeze it on
+    // the first row and scroll the rest beneath (reserving that one row), so no
+    // visible row is left without its repo attribution.
+    let body_height = area.height.saturating_sub(1);
+    let body_offset = scroll_offset(selected_line, body_height as usize, lines.len());
+    let sticky = line_header
+        .get(body_offset as usize)
+        .cloned()
+        .unwrap_or_default();
+    let header_area = Rect { height: 1, ..area };
+    let body_area = Rect {
+        y: area.y + 1,
+        height: body_height,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(sticky, header_style)),
+        header_area,
+    );
+    frame.render_widget(Paragraph::new(lines).scroll((body_offset, 0)), body_area);
 }
 
 /// The vertical scroll offset that keeps `selected` visible within `height`
@@ -442,6 +472,11 @@ mod tests {
         assert!(
             find_line(&buf, "ra-00").is_none(),
             "the first row has scrolled off the top"
+        );
+        // The repo header scrolled off, but a sticky header keeps attribution.
+        assert!(
+            find_line(&buf, "▸ session-tui").is_some(),
+            "a scrolled viewport still shows the governing repo header"
         );
     }
 
