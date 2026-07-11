@@ -83,12 +83,17 @@ exist in the Slice 8 core and this slice does not implement them.
    crossterm **event thread** polls `event::read()`, maps each `KeyEvent` via
    `keys::map_key`, and sends the `Msg`; it exits when a shared `AtomicBool` stop
    flag is set (checked around a short `event::poll` timeout) so shutdown is
-   clean. A **refresh worker thread** sends `RefreshStarted`, runs
-   `ensure_hub → refresh::run → snapshot::fetch`, then sends exactly one
-   `RefreshCompleted { snapshot, warnings }`. The UI thread `recv()`s a `Msg`,
-   calls `app.reduce`, executes returned `Effect`s (`Effect::Refresh` spawns a new
-   worker — the Slice 8 in-flight guard prevents overlap), redraws, and breaks
-   when `app.is_done()`.
+   clean, and it sends `Quit` on a terminal read/poll error so the UI can never
+   block forever with no producer. A **refresh worker thread** sends
+   `RefreshStarted`, runs `ensure_hub → refresh::run → snapshot::fetch`, then
+   sends exactly one `RefreshCompleted { snapshot, warnings }`. The UI thread
+   `recv_timeout`s a `Msg` (a tick cadence so the age advances while idle), calls
+   `app.reduce`, executes returned `Effect`s (`Effect::Refresh` spawns a new
+   worker — the Slice 8 in-flight guard keeps at most one live), redraws, and
+   breaks when `app.is_done()`. **Shutdown joins the in-flight refresh worker**
+   (its join handle is tracked) so a quit mid-refresh waits for the bd subprocess
+   to finish and the hub lock to release, never orphaning a child that would keep
+   mutating the hub after fbd's lock has dropped.
 
 6. **The refresh worker is fatal-tolerant (the TUI degrades, never aborts).** A
    separate `gather_snapshot(bd, roster, paths) -> (Option<Snapshot>,

@@ -64,8 +64,14 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     };
 
     let mut app = App::new();
+    // In-flight refresh workers, tracked so shutdown can wait for the running
+    // bd subprocess to finish and release the hub lock — never orphaning a child
+    // that would keep mutating the hub after fbd's lock has dropped. The Slice 8
+    // in-flight guard keeps this to at most one live worker; finished handles are
+    // pruned on each new spawn so the vec cannot grow across a long session.
+    let mut refresh_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     // The App is born stale; launch immediately kicks off the first refresh.
-    spawn_refresh(&tx, paths, roster);
+    refresh_handles.push(spawn_refresh(&tx, paths, roster));
     draw(terminal, &app)?;
 
     // Redraw on every message and on every idle tick, so the staleness age keeps
@@ -76,7 +82,10 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
             Ok(msg) => {
                 for effect in app.reduce(msg) {
                     match effect {
-                        Effect::Refresh => spawn_refresh(&tx, paths, roster),
+                        Effect::Refresh => {
+                            refresh_handles.retain(|h| !h.is_finished());
+                            refresh_handles.push(spawn_refresh(&tx, paths, roster));
+                        }
                     }
                 }
                 if app.is_done() {
@@ -89,11 +98,14 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         draw(terminal, &app)?;
     }
 
-    // Stop the input thread and join it; detached refresh workers (if any are
-    // still running a bd subprocess) are harmless — their sends fail once `rx`
-    // drops, and the process exits after this returns.
+    // Stop the input thread, then wait for any in-flight refresh to finish so its
+    // bd subprocess completes and the hub lock releases cleanly before we exit
+    // (a quit mid-refresh must not leave an orphaned child mutating the hub).
     stop.store(true, Ordering::SeqCst);
     let _ = input_handle.join();
+    for handle in refresh_handles {
+        let _ = handle.join();
+    }
     Ok(())
 }
 
@@ -105,13 +117,14 @@ fn draw(terminal: &mut Tui, app: &App) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Spawn a background refresh worker that reports over `tx`. Clones the roster
-/// and paths into the thread and builds a fresh [`BdCli`] (stateless).
-fn spawn_refresh(tx: &Sender<Msg>, paths: &Paths, roster: &Config) {
+/// Spawn a background refresh worker that reports over `tx`, returning its join
+/// handle so the event loop can wait for it on shutdown. Clones the roster and
+/// paths into the thread and builds a fresh [`BdCli`] (stateless).
+fn spawn_refresh(tx: &Sender<Msg>, paths: &Paths, roster: &Config) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
-    thread::spawn(move || refresh_worker(BdCli::new(), roster, paths, tx));
+    thread::spawn(move || refresh_worker(BdCli::new(), roster, paths, tx))
 }
 
 /// The refresh worker body: announce the start, run the pipeline, then send
