@@ -195,3 +195,31 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --test bd_integration
 ```
+
+## Autoreview outcomes (post-implementation)
+
+Fixed (in-scope, single-process correctness), each with a regression test:
+
+1. Within-run dedupe: duplicate/aliased roster entries add exactly once (mutable
+   tracked set, insert canonical after add).
+2. Hub-relative stored entries: resolve non-absolute `config.yaml` entries
+   against the hub dir before canonicalizing, so bd-stored relative paths match.
+3. `reset` clears a **dangling symlink** at the hub path (`symlink_metadata`,
+   no-follow), so recovery isn't a silent no-op.
+4. `is_initialized` keys on the embedded Dolt db (`.beads/embeddeddolt`), not a
+   bare `.beads/`, matching bd's own "already initialized" criterion — an
+   interrupted init re-inits instead of masking a broken hub.
+5. Genuine `bd init` failures propagate (no swallowing).
+
+Deferred (out of scope for Slice 3; follow-up beads filed):
+
+- **Cross-process concurrency** of `ensure_hub` (init check-then-act race;
+  unlocked roster read/modify/write). Master plan line 81 assigns process-level
+  hub locking to Slice 4's refresh path; `ensure_hub` is deliberately
+  single-process here. An interim init-race re-check was reverted because it can
+  mask a partial-init failure. See `federated-beads-dxh.5` comment.
+- **Stale-entry pruning**: reconciliation is additive-only (the plan's
+  `adds_missing_repos_only`); removing hub entries dropped from the roster needs
+  a new `BdClient::repo_remove` capability or a reset-rebuild, best designed with
+  Slice 7's roster CLI. `fbd reset` rebuilds from the current roster meanwhile.
+  See `federated-beads-dxh.15`.
