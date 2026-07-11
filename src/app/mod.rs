@@ -741,9 +741,9 @@ impl App {
     /// detail opened from one) else the ready list, so `y`/`Y` copy the issue the
     /// user is actually looking at in List / Search-results / Detail alike.
     fn copy_effect(&mut self, markdown: bool) -> Vec<Effect> {
-        // Clone before bumping the generation so a no-selection copy neither
-        // advances the sequence nor emits an effect.
-        let Some(row) = self.active().selected_row().cloned() else {
+        // Resolve before bumping the generation so a no-op copy neither advances
+        // the sequence nor emits an effect.
+        let Some(row) = self.copy_source_row() else {
             return Vec::new();
         };
         self.copy_seq += 1;
@@ -752,6 +752,40 @@ impl App {
             markdown,
             token: self.copy_seq,
         }]
+    }
+
+    /// The row `y`/`Y` should copy for the current mode, or `None` when there is
+    /// nothing to copy.
+    ///
+    /// In `Detail` this is the issue the pane *pins*, resolved by the detail's id —
+    /// **not** the underlying list selection, which a refresh can re-clamp to a
+    /// different row while the pane stays open. If that pinned issue has left the
+    /// list, the loaded detail's own issue is used so `y` still copies what is on
+    /// screen. Otherwise only a browsable list copies (the ready list, or *settled*
+    /// search results): the search editor and its `Loading` phase have no visible
+    /// selection, so `y` there must not copy a retained, invisible result.
+    fn copy_source_row(&self) -> Option<Row> {
+        if self.view_mode == ViewMode::Detail {
+            let detail = self.detail.as_ref()?;
+            let id = detail.id();
+            if let Some(row) = self.active().rows.iter().find(|r| r.issue.id == id) {
+                return Some(row.clone());
+            }
+            // The pinned issue was dropped from the list by a refresh; fall back to
+            // the loaded detail itself (repo attribution is unavailable here, so the
+            // command form still resolves the path from the id at copy time).
+            return match detail {
+                DetailState::Loaded(d) => Some(Row {
+                    issue: d.issue.clone(),
+                    repo_name: crate::snapshot::UNKNOWN_REPO.to_string(),
+                }),
+                _ => None,
+            };
+        }
+        if self.is_browsing() {
+            return self.active().selected_row().cloned();
+        }
+        None
     }
 
     /// The list the read accessors and the view reflect: the search results while
@@ -1544,6 +1578,49 @@ mod tests {
         assert_eq!(app.view_mode(), ViewMode::Detail);
         let (r, _, _) = copy(&mut app, Msg::CopyContext);
         assert_eq!(r.issue.id, "mc-abc", "copies the opened issue from Detail");
+    }
+
+    #[test]
+    fn copy_in_detail_uses_pinned_issue_after_refresh() {
+        // Open detail on ra-1, then a refresh removes ra-1 and the ready selection
+        // clamps to ra-2. `y` must still copy the pinned ra-1 (what the pane
+        // shows), not the re-clamped selection.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]);
+        let token = open(&mut app);
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+        app.reduce(completed(vec![row("ra", "ra-2", 2), row("ra", "ra-3", 2)]));
+        assert_eq!(app.view_mode(), ViewMode::Detail, "pane stays open");
+
+        let (r, _, _) = copy(&mut app, Msg::CopyContext);
+        assert_eq!(
+            r.issue.id, "ra-1",
+            "copies the pinned detail issue, not the re-clamped list selection"
+        );
+    }
+
+    #[test]
+    fn copy_noop_while_search_loading() {
+        // A resubmitted query is Loading with the previous results still retained
+        // (but invisible). `y` must not copy that stale, hidden result.
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = submit(&mut app, "foo");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![row("megaclock", "mc-1", 0)]),
+        });
+        app.reduce(Msg::Back); // Results -> Editing (results retained internally)
+        app.reduce(Msg::SearchInput('b'));
+        app.reduce(Msg::SubmitSearch); // -> Loading
+        assert_eq!(app.search_phase(), Some(&SearchPhase::Loading));
+
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "no copy of a retained, invisible result while a new search loads"
+        );
     }
 
     #[test]

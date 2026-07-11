@@ -193,5 +193,20 @@ Round 1 (codex, gpt-5.6-sol) — two findings, both accepted and fixed:
    `reduce(Copied)`, mirroring `detail_seq`/`search_seq`; new
    `stale_copy_result_dropped` test.
 
-Both design points were also folded into decisions 5 (quoting) and a new copy
-generation invariant above. Re-review after the fixes: clean.
+Round 2 (codex, gpt-5.6-sol) — two findings, both accepted and fixed:
+
+3. **[P2] Copy the pinned detail issue.** In `Detail` mode `copy_effect` used the
+   active *list* selection, which a refresh can re-clamp to a different row while
+   the pane stays open (the opened issue was dropped). `y` then copied the wrong
+   issue. Added `copy_source_row`: in `Detail` it resolves the row by the detail's
+   id (falling back to the loaded detail's own issue if the row is gone), so the
+   copy always matches what the pane shows.
+4. **[P2] No copy of retained results while a search is loading.** Resubmitting a
+   query enters `Loading` with the previous results still populated but invisible;
+   `y` (not text there, since editing is false) copied a hidden result. Copying is
+   now gated to a browsable list (ready or *settled* results) or the detail pane.
+
+New tests: `copy_in_detail_uses_pinned_issue_after_refresh`,
+`copy_noop_while_search_loading`.
+
+Round 3: clean (no accepted/actionable findings).
