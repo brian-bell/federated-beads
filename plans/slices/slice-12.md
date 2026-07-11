@@ -266,4 +266,11 @@ Round 6 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
     defense. New tests `copy_coalesces_while_in_flight`, `stale_copy_token_dropped`
     (replacing the concurrent-worker `stale_copy_result_dropped`).
 
-Round 7: clean (no accepted/actionable findings).
+Round 7 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
+
+11. **[P2] Missing license files.** The release metadata declared
+    `MIT OR Apache-2.0` but the repo shipped neither license text. Added
+    `LICENSE-MIT` and `LICENSE-APACHE` (standard texts, © 2026 Brian Bell) and
+    linked them from the README license section.
+
+Round 8: clean (no accepted/actionable findings).
