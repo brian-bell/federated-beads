@@ -22,6 +22,10 @@ pub struct Issue {
     pub issue_type: Option<String>,
     #[serde(default)]
     pub owner: Option<String>,
+    /// The issue's labels. `bd show`/`ready --json` omit the key entirely when an
+    /// issue has none, so `#[serde(default)]` yields an empty vec then.
+    #[serde(default)]
+    pub labels: Vec<String>,
     #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
@@ -145,6 +149,22 @@ mod tests {
         let issues: Vec<Issue> = serde_json::from_str(SEARCH).expect("search.json parses");
         assert!(!issues.is_empty());
         assert!(issues.iter().all(|i| !i.id.is_empty()));
+    }
+
+    #[test]
+    fn parses_labels_and_defaults_when_absent() {
+        // bd emits `labels` only when an issue has some; absent ⇒ empty vec.
+        let labeled: Issue = serde_json::from_str(
+            r#"{"id":"ra-1","title":"t","status":"open","priority":1,
+                "labels":["urgent","backend"]}"#,
+        )
+        .expect("labeled issue parses");
+        assert_eq!(labeled.labels, vec!["urgent", "backend"]);
+
+        let unlabeled: Issue =
+            serde_json::from_str(r#"{"id":"ra-2","title":"t","status":"open","priority":1}"#)
+                .expect("unlabeled issue parses");
+        assert!(unlabeled.labels.is_empty(), "omitted labels -> empty");
     }
 
     #[test]

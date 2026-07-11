@@ -271,25 +271,37 @@ impl App {
                 // The single, atomic point that ends the in-flight cycle.
                 self.stale = false;
             }
+            // Navigation and filters act only on the list. Gating them to `List`
+            // keeps the detail pane modal: while it is open, `j`/`k`/`f`/`p` must
+            // not silently move the underlying selection, or `Esc` would return to
+            // a different row than the one the pane was opened from (breaking the
+            // selection-preservation promise). (In `Loading` they were already
+            // no-ops over the empty list.)
             Msg::SelectNext => {
-                if !self.filtered_ix.is_empty() {
+                if self.view_mode == ViewMode::List && !self.filtered_ix.is_empty() {
                     self.selection = (self.selection + 1).min(self.filtered_ix.len() - 1);
                 }
             }
             Msg::SelectPrev => {
                 // Saturating: safe when already at 0 or the list is empty.
-                self.selection = self.selection.saturating_sub(1);
+                if self.view_mode == ViewMode::List {
+                    self.selection = self.selection.saturating_sub(1);
+                }
             }
             Msg::CycleRepoFilter => {
-                self.filter.repo = self.next_repo_filter();
-                self.recompute();
+                if self.view_mode == ViewMode::List {
+                    self.filter.repo = self.next_repo_filter();
+                    self.recompute();
+                }
             }
             Msg::TogglePriorityFilter => {
-                self.filter.priority = match self.filter.priority {
-                    PriorityFilter::All => PriorityFilter::HighOnly,
-                    PriorityFilter::HighOnly => PriorityFilter::All,
-                };
-                self.recompute();
+                if self.view_mode == ViewMode::List {
+                    self.filter.priority = match self.filter.priority {
+                        PriorityFilter::All => PriorityFilter::HighOnly,
+                        PriorityFilter::HighOnly => PriorityFilter::All,
+                    };
+                    self.recompute();
+                }
             }
             Msg::Refresh => {
                 // Dedup: a refresh is already pending/in-flight (`stale`), so
@@ -463,6 +475,7 @@ mod tests {
                 description: None,
                 issue_type: None,
                 owner: None,
+                labels: Vec::new(),
                 created_at: None,
                 created_by: None,
                 updated_at: None,
@@ -512,6 +525,7 @@ mod tests {
                 description: Some("a description".into()),
                 issue_type: Some("task".into()),
                 owner: None,
+                labels: Vec::new(),
                 created_at: None,
                 created_by: None,
                 updated_at: None,
@@ -655,6 +669,23 @@ mod tests {
             Some(1),
             "selection preserved across detail"
         );
+    }
+
+    #[test]
+    fn navigation_inert_while_detail_open() {
+        // With the pane open, j/k/f/p must not move the underlying selection —
+        // otherwise Esc would return to a different row than it was opened from.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
+        app.reduce(Msg::OpenDetail); // Detail, bound to ra-1, selection 0
+
+        app.reduce(Msg::SelectNext);
+        app.reduce(Msg::CycleRepoFilter);
+        app.reduce(Msg::TogglePriorityFilter);
+        assert_eq!(app.selection(), Some(0), "selection frozen under the pane");
+        assert_eq!(app.filter().repo(), &RepoFilter::All, "filters frozen too");
+
+        app.reduce(Msg::Back);
+        assert_eq!(app.selection(), Some(0), "returns to the original row");
     }
 
     #[test]

@@ -126,6 +126,11 @@ fn detail_lines(detail: &IssueDetail) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(meta));
 
+    if !issue.labels.is_empty() {
+        let labels: Vec<String> = issue.labels.iter().map(|l| sanitize(l)).collect();
+        lines.push(Line::from(format!("labels: {}", labels.join(", "))));
+    }
+
     if let Some(desc) = &issue.description {
         lines.push(Line::from(""));
         lines.push(Line::from(sanitize(desc)));
@@ -336,6 +341,7 @@ mod tests {
                 description: None,
                 issue_type: None,
                 owner: None,
+                labels: Vec::new(),
                 created_at: None,
                 created_by: None,
                 updated_at: None,
@@ -647,6 +653,7 @@ mod tests {
                 description: Some(desc.into()),
                 issue_type: Some("task".into()),
                 owner: None,
+                labels: Vec::new(),
                 created_at: None,
                 created_by: None,
                 updated_at: None,
@@ -788,6 +795,21 @@ mod tests {
             find_at(&buf, "ra-4zf", w, h).is_some(),
             "list row still rendered"
         );
+    }
+
+    #[test]
+    fn renders_detail_labels() {
+        // `bd show` reports labels; the detail pane must surface them.
+        let mut d = issue_detail("ra-4zf", "Blocked task", "desc", vec![]);
+        d.issue.labels = vec!["urgent".into(), "backend".into()];
+        let app = app_in_detail("ra-4zf", Some(Ok(d)));
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        let (y, _) = find_at(&buf, "labels:", w, h).expect("labels line present");
+        let line: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
+        assert!(line.contains("urgent"), "first label shown: {line:?}");
+        assert!(line.contains("backend"), "second label shown: {line:?}");
     }
 
     #[test]

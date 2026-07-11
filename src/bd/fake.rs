@@ -262,6 +262,7 @@ mod tests {
             description: None,
             issue_type: None,
             owner: None,
+            labels: Vec::new(),
             created_at: None,
             created_by: None,
             updated_at: None,

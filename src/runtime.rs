@@ -373,6 +373,7 @@ mod tests {
             description: None,
             issue_type: None,
             owner: None,
+            labels: Vec::new(),
             created_at: None,
             created_by: None,
             updated_at: Some("2026-07-11T00:00:00Z".into()),
