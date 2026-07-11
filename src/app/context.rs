@@ -56,8 +56,11 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Build a shareable markdown block for the issue: a title heading, an id/repo
-/// meta list, and the description when present. All bd-sourced fields are
-/// [`sanitize`]d (the block may be pasted into a terminal or an editor).
+/// meta list, and the description when present. The single-line fields (title,
+/// id, repo) are [`sanitize`]d; the description keeps its paragraph/list/code
+/// line breaks via [`sanitize_multiline`] so a multi-line description pastes as
+/// real markdown, not one mangled line. Either way terminal escape controls are
+/// stripped (the block may be pasted into a terminal).
 pub fn markdown_block(issue: &Issue, repo_name: &str) -> String {
     let mut block = format!(
         "## {}\n\n- **id:** {}\n- **repo:** {}\n",
@@ -67,10 +70,30 @@ pub fn markdown_block(issue: &Issue, repo_name: &str) -> String {
     );
     if let Some(desc) = &issue.description {
         block.push('\n');
-        block.push_str(&sanitize(desc));
+        block.push_str(&sanitize_multiline(desc));
         block.push('\n');
     }
     block
+}
+
+/// Like [`sanitize`] but for multi-line text: keep `\n`/`\t` (normalizing `\r\n`
+/// and lone `\r` to `\n`) so markdown structure survives, while still replacing
+/// every other control character — ESC, BEL, C0/C1, DEL — with U+FFFD so a pasted
+/// description cannot drive the terminal.
+fn sanitize_multiline(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' {
+                c
+            } else if c.is_control() {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// A one-line, length-capped summary of a copied payload for the status bar: the
@@ -214,6 +237,26 @@ mod tests {
         assert!(md.contains("Title only") && md.contains("mc-abc") && md.contains("megaclock"));
         // No stray empty description section beyond the meta list.
         assert!(md.trim_end().ends_with("megaclock"), "ends at meta: {md:?}");
+    }
+
+    #[test]
+    fn markdown_preserves_multiline_description() {
+        // A multi-paragraph / list description must keep its line breaks (and
+        // tabs) so it pastes as real markdown, not one mangled line.
+        let md = markdown_block(
+            &issue("mc-1", "T", Some("first para\n\n- item one\n- item two")),
+            "megaclock",
+        );
+        assert!(
+            md.contains("first para\n\n- item one\n- item two"),
+            "line breaks are preserved in the description: {md:?}"
+        );
+        // But an escape control inside the description is still neutralized.
+        let evil = markdown_block(&issue("mc-1", "T", Some("ok\u{1b}]52;c;x\u{07}line2")), "r");
+        assert!(
+            !evil.contains('\u{1b}') && !evil.contains('\u{07}'),
+            "escape controls stripped from a multi-line description: {evil:?}"
+        );
     }
 
     #[test]

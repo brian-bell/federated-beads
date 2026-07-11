@@ -418,6 +418,11 @@ pub struct App {
     fetched_at: Option<SystemTime>,
     /// The detail pane, `Some` exactly when `view_mode == Detail`.
     detail: Option<DetailState>,
+    /// The row the detail pane was opened from, kept for the whole pane lifetime
+    /// (`Some` exactly with `detail`). A copy from the pane uses this row's repo
+    /// attribution, so it survives a refresh that drops the issue from the ready
+    /// list; the fetched detail supplies the richer issue body.
+    detail_row: Option<Row>,
     /// A monotonic generation stamped on each detail request. The current pane's
     /// token is this value; a `DetailReady` is accepted only when its token still
     /// matches, so a superseded fetch (including a reopen of the same issue) is
@@ -462,6 +467,7 @@ impl App {
             status_warnings: Vec::new(),
             fetched_at: None,
             detail: None,
+            detail_row: None,
             detail_seq: 0,
             detail_scroll: 0,
             copy_flash: None,
@@ -578,11 +584,16 @@ impl App {
                 if self.is_browsing()
                     && let Some(row) = self.active().selected_row()
                 {
+                    // Remember the opened row so a copy from the pane keeps its
+                    // exact issue and repo attribution even if a later refresh
+                    // drops it from the list (the pane pins one issue).
+                    let row = row.clone();
                     let id = row.issue.id.clone();
                     self.detail_seq += 1;
                     let token = self.detail_seq;
                     self.view_mode = ViewMode::Detail;
                     self.detail = Some(DetailState::Loading { id: id.clone() });
+                    self.detail_row = Some(row);
                     self.detail_scroll = 0;
                     return vec![Effect::FetchDetail { id, token }];
                 }
@@ -619,6 +630,7 @@ impl App {
                         ViewMode::List
                     };
                     self.detail = None;
+                    self.detail_row = None;
                     self.detail_scroll = 0;
                 }
                 // From the query editor, `Esc` exits search and restores the ready
@@ -757,30 +769,27 @@ impl App {
     /// The row `y`/`Y` should copy for the current mode, or `None` when there is
     /// nothing to copy.
     ///
-    /// In `Detail` this is the issue the pane *pins*, resolved by the detail's id —
-    /// **not** the underlying list selection, which a refresh can re-clamp to a
-    /// different row while the pane stays open. If that pinned issue has left the
-    /// list, the loaded detail's own issue is used so `y` still copies what is on
-    /// screen. Otherwise only a browsable list copies (the ready list, or *settled*
-    /// search results): the search editor and its `Loading` phase have no visible
+    /// In `Detail` this is the issue the pane *pins* — the row it was opened from
+    /// (`detail_row`), **not** the underlying list selection, which a refresh can
+    /// re-clamp to a different row while the pane stays open. Its repo attribution
+    /// is preserved even if the issue has since left the ready list; the fetched
+    /// detail, when loaded, supplies the richer issue body (its full description).
+    /// Otherwise only a browsable list copies (the ready list, or *settled* search
+    /// results): the search editor and its `Loading` phase have no visible
     /// selection, so `y` there must not copy a retained, invisible result.
     fn copy_source_row(&self) -> Option<Row> {
         if self.view_mode == ViewMode::Detail {
-            let detail = self.detail.as_ref()?;
-            let id = detail.id();
-            if let Some(row) = self.active().rows.iter().find(|r| r.issue.id == id) {
-                return Some(row.clone());
-            }
-            // The pinned issue was dropped from the list by a refresh; fall back to
-            // the loaded detail itself (repo attribution is unavailable here, so the
-            // command form still resolves the path from the id at copy time).
-            return match detail {
-                DetailState::Loaded(d) => Some(Row {
-                    issue: d.issue.clone(),
-                    repo_name: crate::snapshot::UNKNOWN_REPO.to_string(),
-                }),
-                _ => None,
+            let opened = self.detail_row.as_ref()?;
+            // Prefer the fetched detail's issue (it carries the description) while
+            // keeping the opened row's repo attribution.
+            let issue = match &self.detail {
+                Some(DetailState::Loaded(d)) if d.issue.id == opened.issue.id => d.issue.clone(),
+                _ => opened.issue.clone(),
             };
+            return Some(Row {
+                issue,
+                repo_name: opened.repo_name.clone(),
+            });
         }
         if self.is_browsing() {
             return self.active().selected_row().cloned();
@@ -1598,6 +1607,10 @@ mod tests {
         assert_eq!(
             r.issue.id, "ra-1",
             "copies the pinned detail issue, not the re-clamped list selection"
+        );
+        assert_eq!(
+            r.repo_name, "ra",
+            "the opened row's repo attribution survives the refresh, not 'unknown'"
         );
     }
 

@@ -209,4 +209,20 @@ Round 2 (codex, gpt-5.6-sol) — two findings, both accepted and fixed:
 New tests: `copy_in_detail_uses_pinned_issue_after_refresh`,
 `copy_noop_while_search_loading`.
 
-Round 3: clean (no accepted/actionable findings).
+Round 3 (codex, gpt-5.6-sol) — two findings, both accepted and fixed:
+
+5. **[P2] Preserve line breaks in copied markdown descriptions.** `sanitize`
+   replaced `\n`/`\t` with U+FFFD, mangling a multi-paragraph/list description
+   into one line. `markdown_block` now sanitizes the description with a new
+   `sanitize_multiline` (keeps `\n`/`\t`, normalizes `\r\n`→`\n`, still strips
+   ESC/BEL/other controls); single-line fields keep plain `sanitize`.
+6. **[P2] Retain repo attribution for a refreshed-away detail.** The round-2
+   fallback fabricated `repo_name = "unknown"` when the pinned issue left the
+   list. The pane now keeps the opened row (`detail_row`), so a copy from `Detail`
+   uses that row's real attribution while taking the fetched detail's richer issue
+   body. This also simplifies `copy_source_row` (no list re-scan).
+
+New tests: `markdown_preserves_multiline_description`, and
+`copy_in_detail_uses_pinned_issue_after_refresh` extended to assert attribution.
+
+Round 4: clean (no accepted/actionable findings).
