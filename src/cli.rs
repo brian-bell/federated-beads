@@ -301,6 +301,11 @@ fn expand_tilde(p: &Path) -> PathBuf {
 /// the parent's symlinks are resolved the same way the original store did. Only when
 /// even the parent is unresolvable does it fall back to a plain cwd-absolutized (then
 /// expanded) path.
+///
+/// Limitation: a repo added *through a symlink* is stored under the symlink's
+/// target; if that symlink later dangles, this fallback resolves to the link path,
+/// not the stored target, so `remove` by the original link spelling no longer
+/// matches. Removing it by the canonical path shown in `fbd repos list` still works.
 fn store_path(p: &Path) -> PathBuf {
     let expanded = expand_tilde(p);
     if let Ok(canonical) = std::fs::canonicalize(&expanded) {
@@ -373,10 +378,11 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
 /// friendly no-op (idempotent), not an error.
 ///
 /// Matching normalizes both the input and each stored entry through `store_path`, so
-/// a repo added by one spelling is removed by another (relative, aliased, `~`), and
-/// a repo already gone from disk still matches via the parent-canonicalize fallback.
-/// A raw path-string equality is kept as a last resort for the pathological case
-/// where neither side can be resolved at all.
+/// a repo added by one spelling is removed by another (relative or `~`), and a repo
+/// directly added and since deleted still matches via the parent-canonicalize
+/// fallback. A raw path-string equality is kept as a last resort. The one gap is a
+/// repo added via a now-dangling symlink (see `store_path`); remove it by the
+/// canonical path from `fbd repos list`.
 pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Result<(), CliError> {
     let canonical = store_path(path);
     let expanded = expand_tilde(path);

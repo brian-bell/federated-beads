@@ -190,6 +190,35 @@ cargo test --test bd_integration
 cargo run -- repos list        # manual smoke (scratch base)
 ```
 
-## Autoreview outcomes
+## Autoreview outcomes (codex gpt-5.6-sol, branch vs main)
 
-_(recorded after Step 3)_
+**Round 1 — accepted and fixed** (path normalization was inconsistent):
+
+- **Stale-repo removal.** `store_path` returned a relative input unchanged when
+  `canonicalize` failed, so `fbd repos remove ./repo` could not remove a deleted repo
+  (stored canonical) by its original relative spelling. Fallback now canonicalizes the
+  *parent* and rejoins the leaf (resolving the parent's symlinks the way the original
+  store did), then `std::path::absolute`. Regression test
+  `remove_after_repo_deleted_still_matches`.
+- **Dedupe against hand-edited entries.** `add`/`discover` compared the new canonical
+  path against raw stored entries, so a hand-edited `config.toml` with relative/aliased
+  entries would duplicate on add and re-offer on discover. Both now normalize each
+  stored entry through `store_path` before comparing (mirroring `ensure_hub`'s
+  both-sides normalization). Regression tests `add_dedupes_against_relative_hand_edited_entry`,
+  `discover_skips_relative_hand_edited_entry`.
+
+**Round 2 — consciously rejected** (recorded on `federated-beads-dxh.8`):
+
+- **Serialize roster read-modify-write.** A lost-update race exists if two
+  `fbd repos add/remove/discover --add` run simultaneously. Rejected for v1: this is a
+  human-driven personal roster CLI (not a server); `Config::save` is already atomic so
+  no corruption is possible, and the worst case is a visibly-missing entry the user
+  re-runs. Widening file locking to the roster mirrors the same speculative-concurrency
+  call slice-6 deferred for the hub lock (`federated-beads-dxh.16`). Filed as
+  `federated-beads-yvp`.
+- **Remove by a since-dangling symlink alias.** A repo added *through* a symlink is
+  stored under its target; once the link dangles, `remove` by the original link spelling
+  can't resolve to the target. Genuinely unresolvable by path without the link. Instead
+  of over-engineering, the `store_path`/`remove` docstrings now state the limitation and
+  point at removing via the canonical path shown by `fbd repos list` (which always
+  matches). No logic change.
