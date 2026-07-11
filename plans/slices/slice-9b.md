@@ -44,129 +44,121 @@ Findings:
    `Foo.Bar-baz` → id prefix `Foo_Bar-baz`, db `Foo_Bar_baz`). So the *only*
    character that differs between id prefix and `dolt_database` is `-`↔`_`.
    Uppercase is preserved in both.
-3. **`bd init` does NOT write `issue-prefix` into `.beads/config.yaml`** — it
-   stays commented out (auto-detected from the dir name at init). So config.yaml
-   is not a reliable prefix source.
+3. **`bd init` does NOT write `issue-prefix` into `.beads/config.yaml`** — the
+   file key stays commented out. But **bd still reports the effective prefix**:
+   `bd -C <repo> config get issue_prefix --json` returns
+   `{"key":"issue_prefix","schema_version":1,"value":"<prefix>"}` with hyphens
+   intact, even when auto-detected and not written to config.yaml. Verified
+   against every real repo: `agent-skills`→`as`, `approach`→`approach`,
+   `federated-beads`→`federated-beads`, `reading-lite`→`reading-lite`,
+   `session-tui`→`session-tui`, `megaclock`→`megaclock`. A no-project dir
+   (`~/dev/beads`) errors (`no beads project found`). This is the **authoritative,
+   loss-free** prefix — no sanitization, no id parsing, no ownership guessing.
 4. **fbd's `argv_export` writes `<repo>/.beads/issues.jsonl`** with an explicit
-   `-o` (the slice-4 P1 fix). So after `refresh::run` exports a repo, its
-   `issues.jsonl` exists and its first records are `{"_type":"issue","id":"…"}`
-   lines (the real repo has only `_type":"issue"` records). Bare `bd export`
-   with no `-o` prints to stdout and writes no file — so we rely on fbd's own
-   `-o` export, which always ran before `read_prefix` in `run`.
+   `-o` (the slice-4 P1 fix), but the prefix no longer needs the export: it comes
+   straight from `bd config get issue_prefix`.
 
 ## Approach evaluation
 
-The task listed four candidate approaches. Evidence rules out all but one:
+The task listed four candidate approaches. Evidence rules out all four in favor
+of a fifth — **bd's own effective `issue_prefix`** — which autoreview surfaced
+as the only non-lossy option:
 
 - **(a) un-sanitize `_`→`-` from `dolt_database`.** WRONG. `dolt_database`
   `a_b_c` could come from real prefix `a-b-c`, `a_b-c`, `a-b_c`, or `a_b_c`
-  (2^n ambiguity). Verified: `a_b-c` is a real prefix whose `dolt_database` is
-  `a_b_c`; blind `_`→`-` yields `a-b-c` ≠ real. Fails on any underscore-bearing
-  or mixed prefix.
-- **(b) read `issue-prefix` from `.beads/config.yaml`.** Dead: bd doesn't write
-  it on init (probe finding 3).
-- **(d) candidate-set (both sanitized and unsanitized forms).** Only correct
-  when the real prefix has no underscores; fails on mixed prefixes like
-  `foo_bar-baz` (would need 2^n candidates) and risks false collisions between
-  a hypothetical `a-b` and `a_b`.
-- **(c) derive the prefix from the repo's own issue ids** — CHOSEN. The id
-  prefix is the ground truth (finding 1). fbd's export already wrote
-  `issues.jsonl` (finding 4), so the ids are on disk for free — no extra bd
-  invocation. Correct for hyphens, underscores, mixed, dots, uppercase, and any
-  custom `--prefix` (attribution never depends on the dir name).
+  (2^n ambiguity). Fails on any underscore-bearing or mixed prefix.
+- **(b) read `issue-prefix` from `.beads/config.yaml`.** The file key is unset on
+  init — but **bd's effective config is authoritative** (probe finding 3):
+  `bd config get issue_prefix --json` returns the exact prefix. This is (b) done
+  via the bd CLI instead of the raw file. **CHOSEN.**
+- **(c) derive the prefix from the repo's own issue ids.** Was the initial choice
+  and works for the common case, but matching an id against `dolt_database` is
+  *lossy* (`-`→`_` is many-to-one): a same-sanitizing foreign hydrated id can
+  validate, and a repo could be misattributed. Rejected after autoreview
+  (P1/P2 findings) — ownership can't be proven from a lossy match.
+- **(d) candidate-set (both sanitized and unsanitized forms).** Same lossiness
+  as (c); fails on mixed prefixes and risks false collisions.
 
-### Chosen design: derive-and-validate
+### Chosen design: authoritative `bd config get issue_prefix`
 
-Extend `read_prefix(repo)` to prefer the id-derived prefix, using
-`metadata.json` `dolt_database` as both the fallback and a **validation anchor**:
+Attribution asks bd for each repo's effective, hyphen-preserving prefix rather
+than reconstructing it from lossy metadata or ids:
 
-1. Read `dolt_database` from `metadata.json` (unchanged: missing/unparseable
-   metadata is still a `RepoError::Metadata`, preserving the existing contract
-   and the `metadata_read_failure_is_a_repo_error` test).
-2. Scan `<repo>/.beads/issues.jsonl` line by line. For each `_type == "issue"`
-   record, derive a candidate prefix from its id via `rsplit_once('-')` (the id
-   is `<prefix>-<hash>`; the prefix itself may contain `-`, so split on the
-   *last* `-`). Accept the first candidate whose `candidate.replace('-', '_')`
-   equals `dolt_database`. Return it.
-3. If no id validates (empty repo, no `issues.jsonl`, or only foreign hydrated
-   ids), fall back to `dolt_database` unchanged.
+1. Add `BdClient::issue_prefix(repo) -> Result<String, BdError>`, backed by
+   `bd -C <repo> config get issue_prefix --json` (`{"value":"<prefix>"}`). This
+   is bd's effective value — reported even when auto-detected and not written to
+   `config.yaml` — with hyphens intact and no sanitization.
+2. `refresh::run` builds the `PrefixMap` from `bd.issue_prefix(&entry.path)` for
+   each roster repo. A failure (e.g. a non-project dir) becomes
+   `RepoError::Metadata` — the repo is unattributed but the refresh still
+   succeeds, preserving the existing contract.
+3. `run_doctor` displays the same authoritative prefix.
 
-Why validate against `dolt_database` (finding 2's invariant):
-- It guarantees we only ever return the repo's *own* prefix, never a foreign
-  hydrated id's prefix that happens to lead the file.
-- It is provably correct: for any of the repo's own ids the invariant holds by
-  construction, so genuine ids always validate; anything that fails validation
-  is not this repo's prefix and is correctly skipped.
-- The fallback is harmless: a repo with no validating id has no ids of its own
-  in the hub, so its prefix is never queried for attribution anyway.
+Why this is correct where (a)/(c)/(d) are not:
+- bd is the single source of truth for the prefix it stamps onto ids; there is no
+  reconstruction, no lossy `-`↔`_` guessing, and no id-ownership inference.
+- Correct for hyphens, underscores, mixed, dots, uppercase, and any custom
+  `--prefix` — verified against all seven real repos.
 
-`rsplit_once('-')` correctly handles child/hierarchical ids too:
-`federated-beads-dxh.17`.rsplit_once('-') → prefix `federated-beads`,
-rest `dxh.17`; validates (`federated_beads == dolt_database`). ✓
-
-Streaming with `BufReader::lines()` and stopping at the first validating id
-keeps large `issues.jsonl` (real ones are tens of KB) cheap.
+`read_prefix` (the old `metadata.json` → `dolt_database` reader) is retained only
+as the `FakeBdClient`'s default `issue_prefix` (mirroring a real no-hyphen repo
+where prefix == `dolt_database`), so metadata-seeded fixtures keep working
+without explicitly programming a prefix.
 
 ## Scope
 
 **In:**
-- `src/refresh.rs` — extend `read_prefix` with the derive-and-validate step and
-  a small private `derive_prefix_from_issues` / sanitization helper; new unit
-  tests. No change to `PrefixMap`, `run`'s order of operations, error types, or
-  the `RepoError::Metadata` contract.
-- `tests/helpers/mod.rs` — already parameterized on `prefix`; used as-is for a
-  hyphenated fixture (no change expected).
-- `tests/bd_integration.rs` — new gated `refresh_attributes_hyphenated_repo`.
+- `src/bd/mod.rs` — new `BdClient::issue_prefix` trait method.
+- `src/bd/cli.rs` — `BdCli::issue_prefix` (+ `argv_issue_prefix`, `ConfigValue`,
+  argv test).
+- `src/bd/fake.rs` — `Call::IssuePrefix`, `with_issue_prefix`, default that reads
+  the seeded `metadata.json` via `read_prefix`.
+- `src/refresh.rs` — `run` uses `bd.issue_prefix`; `read_prefix` reverts to the
+  trivial `dolt_database` reader (fake default only); new attribution tests.
+- `src/cli.rs` — `run_doctor` uses `bd.issue_prefix`.
+- `tests/bd_integration.rs` — new gated `refresh_attributes_hyphenated_repo`
+  (real `bd init --prefix ready-fix`).
 
-**Out:** no change to attribution/collision semantics, snapshot rendering, CLI,
-or TUI. No new dependencies (reuse `serde_json`, `std::io::BufRead`).
+**Out:** no change to `PrefixMap`/collision semantics, snapshot rendering, or TUI.
+No new dependencies.
 
 ## Ordered TDD test list (red → green)
 
-Unit tests in `src/refresh.rs` `#[cfg(test)]`. A new helper seeds
-`issues.jsonl` alongside the existing `seed_repo` (which seeds only
-`metadata.json`); existing seed-only tests keep passing via the fallback (step
-3), which is itself a regression guard that the fix doesn't disturb the
-no-jsonl path.
+Unit tests in `src/refresh.rs` `#[cfg(test)]` drive `FakeBdClient`, programming
+`with_issue_prefix` for the authoritative prefix; the fake's default (seeded
+`metadata.json`) keeps the slice-4 tests green unchanged.
 
-1. **`read_prefix_derives_hyphenated_prefix_from_ids`** (the bug, unit level)
-   - Red: `read_prefix` returns `reading_lite` (sanitized).
-   - Green: seed `dolt_database:"reading_lite"` + `issues.jsonl` with id
-     `reading-lite-hck.1` ⇒ `read_prefix` returns `"reading-lite"`.
+1. **`attributes_hyphenated_repo_from_bd_prefix`** (the bug)
+   - Red (pre-fix): `repo_for("reading-lite-hck.1")` is `None` (unknown bucket).
+   - Green: repo seeded `dolt_database:"reading_lite"`, fake programmed
+     `issue_prefix = "reading-lite"` ⇒ `repo_for("reading-lite-hck.1")` is the
+     repo; `repo_for("reading_lite-hck.1")` (sanitized form) is `None`.
 
-2. **`read_prefix_falls_back_to_dolt_database_without_jsonl`**
-   - Green: seed only `metadata.json` (`ra`), no `issues.jsonl` ⇒ returns `"ra"`.
-     Locks the fallback that keeps the existing seed-only tests valid.
+2. **`underscore_prefix_is_not_remapped`**
+   - Green: `issue_prefix = "foo_bar"` ⇒ `foo_bar-abc` attributes, `foo-bar-abc`
+     does not. No `_`↔`-` guessing.
 
-3. **`read_prefix_does_not_remap_a_genuine_underscore_prefix`** (no false remap)
-   - Green: `dolt_database:"foo_bar"` + id `foo_bar-abc` ⇒ returns `"foo_bar"`,
-     not `"foo-bar"`. (`foo_bar`.replace('-','_') == `foo_bar` validates the id
-     as-is.)
+3. **`custom_prefix_unrelated_to_dir_name_attributes`**
+   - Green: dir `whatever`, `issue_prefix = "ready-fix"` ⇒ `ready-fix-1`
+     attributes. Prefix-driven, not dir-name-driven.
 
-4. **`read_prefix_skips_foreign_ids_that_fail_validation`**
-   - Green: `dolt_database:"reading_lite"` + `issues.jsonl` whose first line is a
-     foreign id `other-thing-xyz` (sanitizes to `other_thing` ≠ `reading_lite`)
-     followed by `reading-lite-hck.1` ⇒ returns `"reading-lite"`. And a file of
-     *only* foreign ids ⇒ falls back to `"reading_lite"`.
+4. **`two_hyphenated_repos_attribute_independently`**
+   - Green: `reading-lite` and `session-tui` each attribute their own ids, no
+     collision.
 
-5. **`attributes_hyphenated_repo_end_to_end`** (through `run` + `PrefixMap`)
-   - Red: `repo_for("reading-lite-hck.1")` is `None` (unknown bucket).
-   - Green: a seeded repo (`dolt_database:"reading_lite"` + hyphenated
-     `issues.jsonl` ids) run through `refresh::run` (FakeBdClient) ⇒
-     `repo_for("reading-lite-hck.1")` is the repo; `repo_for("reading-lite-x1u")`
-     too; `repo_for("reading_lite-hck.1")` (underscored form) is `None`.
+5. **`read_prefix_returns_sanitized_dolt_database`**
+   - Green: the `metadata.json` helper (fake default) returns the sanitized DB
+     name verbatim (`reading_lite`), documenting why the fake needs an explicit
+     prefix for hyphenated repos.
 
-6. **`custom_prefix_unrelated_to_dir_name_attributes`**
-   - Green: repo dir `whatever` with `dolt_database:"ready_fix"` + ids
-     `ready-fix-1` ⇒ `repo_for("ready-fix-1")` is the repo. Proves attribution
-     is prefix-driven, not dir-name-driven.
+6. **`exports_all_then_syncs_once`** (updated) — asserts the per-repo call order
+   is now `Export`, `IssuePrefix`, … then one `RepoSync`.
 
-7. **Collision behavior unchanged** — the existing `flags_prefix_collisions`,
-   `longest_prefix_wins`, `collided_longer_prefix_is_not_masked_by_shorter`, and
-   `duplicate_roster_entry_is_not_a_collision` tests must stay green unmodified.
-   Add `two_hyphenated_repos_attribute_independently`: repos `reading-lite` and
-   `session-tui` (both hyphenated, distinct) ⇒ each id attributes to its own
-   repo, no collision.
+7. **Collision / lock / error behavior unchanged** — `flags_prefix_collisions`,
+   `longest_prefix_wins`, `collided_longer_prefix_is_not_masked_by_shorter`,
+   `duplicate_roster_entry_is_not_a_collision`, `metadata_read_failure_is_a_repo_error`
+   (now exercises the fake's default `issue_prefix` failure), and the lock tests
+   stay green.
 
 ### Integration (gated, `tests/bd_integration.rs`)
 
@@ -195,10 +187,11 @@ found" — is a genuine unrelated roster issue, not this bug, and will remain.)
 
 ## Edge cases
 
-- **Empty repo / no `issues.jsonl`** → fall back to `dolt_database`; harmless
-  (no own ids to attribute). (#2)
-- **Genuine underscore prefix** → id validates as-is; no false `_`→`-` remap. (#3)
-- **Foreign hydrated id leads the file** → fails validation, skipped. (#4)
-- **Mixed prefix (`foo_bar-baz`)** → derived from id, exact; (a)/(d) can't. (implicit)
-- **Missing/unparseable `metadata.json`** → still `RepoError::Metadata`
-  (unchanged). (existing test)
+- **Hyphenated prefix** → bd reports it with hyphens intact; attributes. (#1)
+- **Genuine underscore prefix** → bd reports the underscore; no `_`↔`-`
+  guessing. (#2)
+- **Mixed/dotted/uppercase/custom prefix** → whatever bd stamps is what bd
+  reports; correct by construction. (#3)
+- **Non-project or unreadable repo** → `bd config get issue_prefix` fails →
+  `RepoError::Metadata`; repo unattributed, refresh still `Ok`. (existing
+  `metadata_read_failure_is_a_repo_error`)

@@ -240,8 +240,9 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
                 // same control-char sanitizer format_row uses.
                 let shown = sanitize(&entry.path.display().to_string());
                 if entry.path.exists() {
-                    let prefix =
-                        refresh::read_prefix(&entry.path).unwrap_or_else(|_| "?".to_string());
+                    let prefix = bd
+                        .issue_prefix(&entry.path)
+                        .unwrap_or_else(|_| "?".to_string());
                     writeln!(out, "  {}  OK  [prefix: {}]", shown, sanitize(&prefix))?;
                 } else {
                     writeln!(out, "  {}  MISSING", shown)?;

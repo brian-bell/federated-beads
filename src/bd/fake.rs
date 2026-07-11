@@ -21,6 +21,7 @@ pub enum Call {
     RepoAdd(PathBuf, PathBuf),
     RepoList(PathBuf),
     Export(PathBuf),
+    IssuePrefix(PathBuf),
     RepoSync(PathBuf),
     Ready(PathBuf),
     Show(PathBuf, String),
@@ -52,6 +53,7 @@ pub struct FakeBdClient {
     show: Option<Result<IssueDetail, BdError>>,
     search: Option<Result<Vec<Issue>, BdError>>,
     export_errs: HashMap<PathBuf, BdError>,
+    issue_prefixes: HashMap<PathBuf, String>,
 }
 
 impl FakeBdClient {
@@ -131,6 +133,19 @@ impl FakeBdClient {
         self
     }
 
+    /// Program `issue_prefix(repo)` to return this exact (possibly hyphenated)
+    /// prefix, overriding the default (which reads the repo's seeded
+    /// `metadata.json` `dolt_database`). Lets attribution tests declare a real
+    /// prefix that differs from the underscore-sanitized DB name.
+    pub fn with_issue_prefix(
+        mut self,
+        repo: impl Into<PathBuf>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        self.issue_prefixes.insert(repo.into(), prefix.into());
+        self
+    }
+
     /// The invocations recorded so far, in order.
     pub fn calls(&self) -> Vec<Call> {
         self.calls.borrow().clone()
@@ -185,6 +200,22 @@ impl BdClient for FakeBdClient {
             Some(err) => Err(err.clone()),
             None => Ok(()),
         }
+    }
+
+    fn issue_prefix(&self, repo: &Path) -> Result<String, BdError> {
+        self.record(Call::IssuePrefix(repo.to_path_buf()));
+        if let Some(prefix) = self.issue_prefixes.get(repo) {
+            return Ok(prefix.clone());
+        }
+        // Default: mirror a real repo whose prefix has no hyphens (prefix ==
+        // dolt_database) by reading the seeded metadata.json. A missing/unreadable
+        // metadata surfaces as a BdError, so `run` records it as a Metadata error
+        // just as a real `bd config get` failure on a non-project dir would.
+        crate::refresh::read_prefix(repo).map_err(|detail| BdError {
+            command: format!("bd -C {} config get issue_prefix --json", repo.display()),
+            stderr: detail,
+            kind: super::BdErrorKind::NonZeroExit { code: Some(1) },
+        })
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError> {

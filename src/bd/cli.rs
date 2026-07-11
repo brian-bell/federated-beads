@@ -148,6 +148,17 @@ fn argv_repo_sync(hub: &Path) -> Vec<OsString> {
     vec!["-C".into(), arg(hub), "repo".into(), "sync".into()]
 }
 
+fn argv_issue_prefix(repo: &Path) -> Vec<OsString> {
+    vec![
+        "-C".into(),
+        arg(repo),
+        "config".into(),
+        "get".into(),
+        "issue_prefix".into(),
+        "--json".into(),
+    ]
+}
+
 fn argv_ready(hub: &Path) -> Vec<OsString> {
     // `--limit 0` = unlimited; bd's `ready` otherwise caps output at 100, which
     // would silently truncate a large cross-repo hub.
@@ -185,6 +196,12 @@ fn argv_search(hub: &Path, query: &str) -> Vec<OsString> {
     ]
 }
 
+/// `bd config get <key> --json` payload; fbd reads only `value`.
+#[derive(Debug, serde::Deserialize)]
+struct ConfigValue {
+    value: String,
+}
+
 impl BdClient for BdCli {
     fn version(&self) -> Result<BdVersion, BdError> {
         self.run_json(argv_version())
@@ -204,6 +221,11 @@ impl BdClient for BdCli {
 
     fn export(&self, repo: &Path) -> Result<(), BdError> {
         self.run_ok(argv_export(repo))
+    }
+
+    fn issue_prefix(&self, repo: &Path) -> Result<String, BdError> {
+        let config: ConfigValue = self.run_json(argv_issue_prefix(repo))?;
+        Ok(config.value)
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError> {
@@ -272,6 +294,11 @@ mod tests {
         assert_eq!(
             argv_repo_sync(Path::new("/tmp/hub")),
             os(&["-C", "/tmp/hub", "repo", "sync"])
+        );
+
+        assert_eq!(
+            argv_issue_prefix(Path::new("/tmp/ra")),
+            os(&["-C", "/tmp/ra", "config", "get", "issue_prefix", "--json"])
         );
 
         // `--limit 0` (unlimited) defeats bd's default 100-result cap.
