@@ -439,12 +439,21 @@ impl App {
             }
             Msg::RefreshCompleted { snapshot, warnings } => {
                 if let Some(snapshot) = snapshot {
-                    // With the pane open, remember the opened issue so the refresh's
-                    // re-sort does not move the selection to a *different* row: the
-                    // pane pins one issue, and `Esc` must return to it. (Slice 8
-                    // decision 5 otherwise preserves only the selection index; this
-                    // narrower rule applies just while a detail is open.)
-                    let opened_id = self.detail.as_ref().map(|d| d.id().to_string());
+                    // With a detail opened *from the ready list*, remember the
+                    // opened issue so the refresh's re-sort does not move the
+                    // selection to a *different* row: the pane pins one issue, and
+                    // `Esc` must return to it. (Slice 8 decision 5 otherwise
+                    // preserves only the selection index; this narrower rule applies
+                    // just while a ready-list detail is open.) A detail opened from
+                    // a *search* result must NOT relocate the hidden ready selection
+                    // — its id may also be a ready row, and moving to it would
+                    // corrupt the ready selection `Esc` restores. So relocate only
+                    // when no search is active (`search.is_none()`).
+                    let opened_id = if self.search.is_none() {
+                        self.detail.as_ref().map(|d| d.id().to_string())
+                    } else {
+                        None
+                    };
                     // A refresh always updates the ready list, even under a search
                     // or detail overlay; `set_rows` keeps the active filter and
                     // re-clamps the selection. (`None` keeps the last-good rows.)
@@ -456,10 +465,8 @@ impl App {
                     if self.view_mode == ViewMode::Loading {
                         self.view_mode = ViewMode::List;
                     }
-                    // Relocate the ready selection onto the opened issue if it
-                    // survived the refresh; otherwise the clamped index stands
-                    // (fallback). A detail opened from a search row won't be in
-                    // `ready`, so this is a no-op there — harmless.
+                    // Relocate the ready selection onto the opened ready issue if it
+                    // survived the refresh; otherwise the clamped index stands.
                     if let Some(id) = opened_id {
                         self.ready.select_id(&id);
                     }
@@ -1412,6 +1419,52 @@ mod tests {
             ids(&app.filtered_rows()),
             vec!["ra-1", "ra-9"],
             "the ready list reflects the refresh that landed during search"
+        );
+    }
+
+    #[test]
+    fn refresh_under_search_detail_preserves_ready_selection() {
+        // A detail opened from a search result must not hijack the hidden ready
+        // selection when a refresh lands — even when the searched id is ALSO a
+        // ready row. Otherwise backing all the way out lands on the searched
+        // issue instead of the ready row selected before search.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
+        assert_eq!(
+            app.selected_row().map(|r| r.issue.id.as_str()),
+            Some("ra-1"),
+            "ready starts selected on ra-1"
+        );
+
+        // Search returns ra-2 (which is also a ready row); open its detail.
+        let token = submit(&mut app, "foo");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![row("ra", "ra-2", 1)]),
+        });
+        let dtoken = match app.reduce(Msg::OpenDetail).as_slice() {
+            [Effect::FetchDetail { id, token }] => {
+                assert_eq!(id, "ra-2");
+                *token
+            }
+            other => panic!("expected one FetchDetail, got {other:?}"),
+        };
+        app.reduce(Msg::DetailReady {
+            token: dtoken,
+            detail: Ok(detail("ra-2", vec![])),
+        });
+
+        // A refresh lands under the search-opened detail (same ready rows).
+        app.reduce(completed(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]));
+
+        // Back out fully: detail -> results -> editing -> list.
+        app.reduce(Msg::Back);
+        app.reduce(Msg::Back);
+        app.reduce(Msg::Back);
+        assert_eq!(app.view_mode(), ViewMode::List);
+        assert_eq!(
+            app.selected_row().map(|r| r.issue.id.as_str()),
+            Some("ra-1"),
+            "the ready selection is untouched by the search-opened detail"
         );
     }
 
