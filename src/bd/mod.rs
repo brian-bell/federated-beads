@@ -31,6 +31,12 @@ pub trait BdClient {
     /// `bd -C <repo> export -o <repo>/.beads/issues.jsonl` — refresh a repo's
     /// passive JSONL export (the only write fbd makes to a source repo).
     fn export(&self, repo: &Path) -> Result<(), BdError>;
+    /// `bd -C <repo> config get issue_prefix --json` — the repo's authoritative
+    /// id prefix (hyphens intact), used to attribute hub ids back to their source
+    /// repo. This is bd's *effective* prefix, which it reports even when
+    /// auto-detected and not written to `.beads/config.yaml`; unlike
+    /// `metadata.json`'s `dolt_database`, it is not underscore-sanitized.
+    fn issue_prefix(&self, repo: &Path) -> Result<String, BdError>;
     /// `bd -C <hub> repo sync` — hydrate the hub from registered repos' exports.
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.

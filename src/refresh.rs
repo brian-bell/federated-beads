@@ -239,12 +239,14 @@ pub fn run(
             });
         }
         // Attribution needs the prefix regardless of export success (already-
-        // synced ids stay attributable even if this refresh's export failed).
-        match read_prefix(&entry.path) {
+        // synced ids stay attributable even if this refresh's export failed). bd
+        // reports the authoritative, hyphen-preserving prefix; a failure to read
+        // it means the repo cannot be attributed, but never aborts the refresh.
+        match bd.issue_prefix(&entry.path) {
             Ok(prefix) => pairs.push((prefix, entry.clone())),
-            Err(detail) => errors.push(RepoError::Metadata {
+            Err(source) => errors.push(RepoError::Metadata {
                 repo: entry.path.clone(),
-                detail,
+                detail: source.to_string(),
             }),
         }
     }
@@ -274,10 +276,17 @@ fn normalize(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Read a repo's id prefix from `<repo>/.beads/metadata.json`.
+/// Read a repo's underscore-sanitized Dolt database name from
+/// `<repo>/.beads/metadata.json`'s `dolt_database`.
 ///
-/// Public so `doctor` can report each roster repo's prefix without re-running a
-/// whole refresh; `run` uses it to build the attribution map.
+/// This is **not** the attribution prefix: bd sanitizes `-`→`_` for the Dolt DB
+/// name while issue ids keep their hyphens, so a hyphenated repo's
+/// `dolt_database` (`reading_lite`) does not match its ids (`reading-lite-…`).
+/// Attribution instead uses `BdClient::issue_prefix`, which reports bd's
+/// authoritative, hyphen-preserving prefix. This helper backs only the
+/// [`FakeBdClient`](crate::bd::FakeBdClient)'s default `issue_prefix` (mirroring a
+/// real repo whose prefix has no hyphens, where prefix == `dolt_database`), so
+/// metadata-seeded test fixtures keep working without programming a prefix.
 pub fn read_prefix(repo: &Path) -> Result<String, String> {
     let path = repo.join(".beads").join("metadata.json");
     let text = fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -339,10 +348,12 @@ mod tests {
             calls,
             vec![
                 Call::Export(a.clone()),
+                Call::IssuePrefix(a.clone()),
                 Call::Export(b.clone()),
+                Call::IssuePrefix(b.clone()),
                 Call::RepoSync(hub_dir(&paths)),
             ],
-            "exports run in order, then exactly one sync"
+            "each repo exports then yields its prefix, in order, then one sync"
         );
     }
 
@@ -558,6 +569,99 @@ mod tests {
             "a declined refresh performs no exports or sync: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    fn attributes_hyphenated_repo_from_bd_prefix() {
+        // The bug: metadata.json's dolt_database is underscore-sanitized
+        // (`reading_lite`) while ids keep the hyphen (`reading-lite-…`), so the
+        // repo landed in the unknown bucket. Attribution now uses bd's
+        // authoritative, hyphen-preserving prefix instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // dolt_database is the sanitized `reading_lite`; bd reports `reading-lite`.
+        let repo = seed_repo(tmp.path(), "reading-lite", "reading_lite");
+        let fake = FakeBdClient::new().with_issue_prefix(repo.clone(), "reading-lite");
+
+        let outcome = run(&fake, &roster(&[&repo]), &paths).unwrap();
+        let map = outcome.prefix_map;
+
+        assert_eq!(
+            map.repo_for("reading-lite-hck.1").map(|r| &r.path),
+            Some(&repo),
+            "a hyphenated id attributes to its repo, not the unknown bucket"
+        );
+        assert!(
+            map.repo_for("reading_lite-hck.1").is_none(),
+            "the underscored (dolt_database) form must not attribute"
+        );
+    }
+
+    #[test]
+    fn underscore_prefix_is_not_remapped() {
+        // A repo whose prefix genuinely contains an underscore keeps it: bd
+        // reports the exact prefix, so there is no `_`→`-` guessing either way.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "r", "foo_bar");
+        let fake = FakeBdClient::new().with_issue_prefix(repo.clone(), "foo_bar");
+
+        let outcome = run(&fake, &roster(&[&repo]), &paths).unwrap();
+        let map = outcome.prefix_map;
+
+        assert_eq!(map.repo_for("foo_bar-abc").map(|r| &r.path), Some(&repo));
+        assert!(
+            map.repo_for("foo-bar-abc").is_none(),
+            "the hyphen form must not attribute to an underscore-prefixed repo"
+        );
+    }
+
+    #[test]
+    fn custom_prefix_unrelated_to_dir_name_attributes() {
+        // Attribution is prefix-driven, never dir-name-driven: a repo dir named
+        // `whatever` whose prefix is `ready-fix` still attributes correctly.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "whatever", "ready_fix");
+        let fake = FakeBdClient::new().with_issue_prefix(repo.clone(), "ready-fix");
+
+        let outcome = run(&fake, &roster(&[&repo]), &paths).unwrap();
+
+        assert_eq!(
+            outcome.prefix_map.repo_for("ready-fix-1").map(|r| &r.path),
+            Some(&repo)
+        );
+    }
+
+    #[test]
+    fn two_hyphenated_repos_attribute_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let a = seed_repo(tmp.path(), "reading-lite", "reading_lite");
+        let b = seed_repo(tmp.path(), "session-tui", "session_tui");
+        let fake = FakeBdClient::new()
+            .with_issue_prefix(a.clone(), "reading-lite")
+            .with_issue_prefix(b.clone(), "session-tui");
+
+        let outcome = run(&fake, &roster(&[&a, &b]), &paths).unwrap();
+        let map = outcome.prefix_map;
+
+        assert!(
+            map.collisions().is_empty(),
+            "distinct prefixes don't collide"
+        );
+        assert_eq!(map.repo_for("reading-lite-1").map(|r| &r.path), Some(&a));
+        assert_eq!(map.repo_for("session-tui-9").map(|r| &r.path), Some(&b));
+    }
+
+    #[test]
+    fn read_prefix_returns_sanitized_dolt_database() {
+        // The metadata helper (the fake's default prefix source) returns the
+        // underscore-sanitized DB name verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo(tmp.path(), "a", "reading_lite");
+
+        assert_eq!(read_prefix(&repo).unwrap(), "reading_lite");
     }
 
     #[test]
