@@ -227,7 +227,20 @@ impl App {
                 };
                 self.recompute();
             }
-            Msg::Refresh => return vec![Effect::Refresh],
+            Msg::Refresh => {
+                // Dedup: a refresh is already pending/in-flight (`stale`), so
+                // requesting another would spawn an overlapping worker whose
+                // out-of-order completion could clobber a newer snapshot. Mark
+                // in-flight synchronously here — before any `RefreshStarted`
+                // arrives — so a mashed or key-repeated `r` yields one effect.
+                // The guard clears when the cycle concludes (SnapshotReady /
+                // RefreshWarnings), which the runtime always sends.
+                if self.stale {
+                    return Vec::new();
+                }
+                self.stale = true;
+                return vec![Effect::Refresh];
+            }
             // Placeholders: the pipeline accepts these now; the slice that owns
             // each (10 detail, 11 search, 12 copy) gives it behavior. `Back` is a
             // no-op in `List` (nothing to return from yet).
@@ -520,11 +533,33 @@ mod tests {
 
         let effects = app.reduce(Msg::Refresh);
         assert_eq!(effects, vec![Effect::Refresh]);
-        // The runtime spawns the worker; reduce changed no observable state.
+        // Marks the shown rows stale/in-flight, but touches nothing else: the
+        // runtime spawns the worker.
+        assert!(app.is_stale());
         assert_eq!(app.rows().len(), before.rows().len());
         assert_eq!(app.selection(), before.selection());
         assert_eq!(app.view_mode(), before.view_mode());
         assert!(!app.is_done());
+    }
+
+    #[test]
+    fn refresh_is_deduped_while_in_flight() {
+        // A second `r` (or a key-repeat) while a refresh is pending must not spawn
+        // an overlapping worker whose out-of-order completion could clobber a
+        // newer snapshot.
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+
+        assert_eq!(app.reduce(Msg::Refresh), vec![Effect::Refresh]);
+        assert_eq!(
+            app.reduce(Msg::Refresh),
+            Vec::new(),
+            "no second effect while a refresh is in flight"
+        );
+
+        // Once the cycle concludes, a fresh request is honored again.
+        app.reduce(Msg::SnapshotReady(snapshot(vec![row("ra", "ra-1", 1)])));
+        assert!(!app.is_stale());
+        assert_eq!(app.reduce(Msg::Refresh), vec![Effect::Refresh]);
     }
 
     #[test]
