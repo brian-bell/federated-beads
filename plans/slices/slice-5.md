@@ -161,4 +161,27 @@ cargo test --test bd_integration
 
 ## Autoreview outcomes (post-implementation)
 
-_(filled in after Step 3)_
+Codex (gpt-5.6-sol, high) review of the branch vs main, three passes; final
+pass clean ("patch is correct", 0.93).
+
+1. **P2 — duplicate directory basenames collapse distinct repos.** Two roster
+   repos sharing a basename (`/work/a/api`, `/work/b/api`) both produced
+   `repo_name == "api"`, conflating them in downstream grouping/filtering. Fixed:
+   `fetch` makes `repo_name` roster-unique.
+2. **P2 — full filesystem paths leaked into the serialized `repo_name`.** The
+   first fix disambiguated by falling back to the full path, which the serialized
+   snapshot would leak (local usernames/layout) and which violated the
+   basename-only display contract. Fixed properly: added `PrefixMap::attribution`
+   to expose the matched id-prefix (a unique, short, non-sensitive repo id) and
+   disambiguate a collided basename as `basename (prefix)` — e.g. `api (ra)` /
+   `api (rb)` — never a path. Regression test:
+   `disambiguates_duplicate_basenames`.
+3. **P2 — lexical `updated_at` sort not universally chronological (RFC3339).**
+   *Rejected as speculative for bd's contract.* bd 1.1.0 emits homogeneous
+   whole-second UTC-`Z` timestamps, and every row in one `bd ready` call shares
+   that format, so a lexical compare is chronological; the final `id`-ascending
+   tiebreak keeps the order total and deterministic regardless. Adding a datetime
+   crate is a deliberate project-wide dependency decision, out of scope for this
+   read-model slice. The assumption is documented inline at the comparator; the
+   contingency is tracked in `federated-beads-23v` (parse timestamps if a future
+   bd emits fractional seconds/offsets).
