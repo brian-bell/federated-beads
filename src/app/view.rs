@@ -42,8 +42,10 @@ const DETAIL_HINTS: &str = "fbd · esc back · q quit";
 /// One-line key hints while editing the search query: the keys that act there.
 const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc cancel";
 
-/// One-line key hints while browsing search results: the keys that act there.
-const SEARCH_RESULTS_HINTS: &str = "fbd search · j/k move · enter open · esc edit · q quit";
+/// One-line key hints while browsing search results: the keys that act there
+/// (`f`/`p` filter the results the same as the ready list).
+const SEARCH_RESULTS_HINTS: &str =
+    "fbd search · j/k move · f repo · p prio · enter open · esc edit · q quit";
 
 /// One-line key hints while a search is pending or failed: only these act there
 /// (navigation and detail-open are inert until results arrive).
@@ -267,7 +269,12 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
         let rows = app.filtered_rows();
         if !rows.is_empty() {
             draw_rows(frame, &rows, app.selection(), parts[2]);
+        } else if app.search_result_count() > 0 {
+            // Results exist but the active repo/priority filter hides them all —
+            // explain the filter (and how to clear it) instead of a blank pane.
+            frame.render_widget(Paragraph::new(NO_MATCH_HINT), parts[2]);
         }
+        // else: the query genuinely returned nothing; the count line says so.
     }
 }
 
@@ -1063,6 +1070,25 @@ mod tests {
         assert!(
             find_at(&buf, EMPTY_HINT, w, h).is_none(),
             "the ready-list discover hint must not appear for an empty search"
+        );
+    }
+
+    #[test]
+    fn filtered_empty_search_shows_filter_hint() {
+        // A filter that hides every result must explain itself, not blank out.
+        let (w, h) = (80, 24);
+        let mut app = app_in_search("foo", vec![row("ra", "ra-1", 2, "low prio hit")]);
+        app.reduce(Msg::TogglePriorityFilter); // HighOnly hides the P2 result
+        let buf = render_sized(&app, at(1000), w, h);
+        assert!(
+            find_at(&buf, NO_MATCH_HINT, w, h).is_some(),
+            "filtered-empty search shows the filter hint, not a blank pane"
+        );
+        // The results-phase hint advertises the live filter keys.
+        let title = line_text(&buf, 0);
+        assert!(
+            title.contains("f repo"),
+            "results hint advertises f/p: {title:?}"
         );
     }
 
