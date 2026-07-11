@@ -218,12 +218,16 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
         Ok(roster) => {
             writeln!(out, "roster ({} repos):", roster.repos.len())?;
             for entry in &roster.repos {
+                // Both the path (from config) and the prefix (from repo metadata)
+                // are repo/config-influenceable and go to a terminal, so apply the
+                // same control-char sanitizer format_row uses.
+                let shown = sanitize(&entry.path.display().to_string());
                 if entry.path.exists() {
                     let prefix =
                         refresh::read_prefix(&entry.path).unwrap_or_else(|_| "?".to_string());
-                    writeln!(out, "  {}  OK  [prefix: {}]", entry.path.display(), prefix)?;
+                    writeln!(out, "  {}  OK  [prefix: {}]", shown, sanitize(&prefix))?;
                 } else {
-                    writeln!(out, "  {}  MISSING", entry.path.display())?;
+                    writeln!(out, "  {}  MISSING", shown)?;
                 }
             }
         }
@@ -238,10 +242,14 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
 /// `run_doctor` (where it is reported, not fatal).
 pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
     let config_file = paths.config_file();
-    if config_file.exists() {
-        Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e)))
-    } else {
-        Ok(Config::default())
+    // `Path::exists` collapses "absent" and "present but unreadable" (permission
+    // error, dangling symlink) into the same `false`, which would silently
+    // downgrade a broken config to an empty first-run roster. Distinguish with
+    // `symlink_metadata`: only a genuine `NotFound` is first-run; anything else is
+    // attempted so a real error surfaces per this function's contract.
+    match std::fs::symlink_metadata(config_file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        _ => Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e))),
     }
 }
 
@@ -597,6 +605,38 @@ mod tests {
         assert!(
             stdout.contains("roster: ERROR"),
             "malformed config surfaced as a reported line: {stdout}"
+        );
+    }
+
+    #[test]
+    fn load_roster_absent_is_empty_but_invalid_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // No config file: a genuine first run yields an empty roster.
+        assert_eq!(load_roster(&paths).unwrap(), Config::default());
+
+        // Present but malformed: surfaced as an error, never silently empty.
+        let config_file = paths.config_file();
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        fs::write(config_file, "not = [valid").unwrap();
+        assert!(load_roster(&paths).is_err(), "invalid config must error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_roster_dangling_symlink_errors_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let config_file = paths.config_file();
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        // A config symlink to a nonexistent target: `Path::exists()` is false, but
+        // it is not a first run — the misconfiguration must surface, not be masked.
+        std::os::unix::fs::symlink(tmp.path().join("nowhere.toml"), config_file).unwrap();
+        assert!(!config_file.exists(), "precondition: dangling symlink");
+
+        assert!(
+            load_roster(&paths).is_err(),
+            "a dangling config symlink must error, not read as empty"
         );
     }
 
