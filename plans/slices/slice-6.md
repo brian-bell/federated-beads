@@ -237,3 +237,34 @@ cargo test
 cargo test --test bd_integration
 cargo run -- doctor        # manual smoke
 ```
+
+## Autoreview outcomes (codex gpt-5.6-sol, branch vs main)
+
+Ran to convergence over several rounds. Accepted and fixed:
+
+- **Per-command roster load.** Unconditional load broke `fbd reset` and stopped
+  doctor from diagnosing a bad config. `main` now loads the roster only for
+  `snapshot` (fatal on error); `reset` needs none; `doctor` loads it itself and
+  reports parse errors inline.
+- **Fail-closed version gate.** `parse_version` now requires all three numeric
+  `major.minor.patch` components, so `1.1`/`2` no longer slip past.
+- **Terminal-control injection (bug class swept everywhere untrusted text hits
+  the terminal).** `format_row`, doctor's roster output, and the snapshot warning
+  loops all sanitize bd/config-derived fields (control chars → U+FFFD); JSON is
+  untouched (serde escapes). Prevents forged rows / ANSI/OSC (incl. OSC 52
+  clipboard) sequences from an issue title in a repo you don't control.
+- **Fail-loud config load.** `load_roster` uses `symlink_metadata`, not
+  `Path::exists`, so an unreadable or dangling config surfaces as an error
+  instead of a silent empty roster.
+- **Accurate reset report.** `run_reset` uses `symlink_metadata` too, so a
+  removed dangling hub symlink reports "removed", not "nothing to remove".
+
+Consciously rejected (filed as follow-up `federated-beads-dxh.16`):
+
+- **Widening the advisory lock over `ensure_hub` reconciliation and `reset`.**
+  The `<hub>/.fbd.lock` lock is deliberately scoped to `repo sync` (Slices 3–4,
+  master plan) on a disposable, derived hub. Covering ensure/reset requires
+  refactoring `refresh::run`'s lock API to accept an externally-held lock (a
+  single process re-acquiring `HubLock` would self-deadlock via `flock`), a
+  cross-cutting change spanning merged slices and beyond Slice 6's scope. Left
+  as a designed follow-up rather than a reflexive patch.
