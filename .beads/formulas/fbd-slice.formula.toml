@@ -1,0 +1,58 @@
+formula = "fbd-slice"
+description = "Per-slice implementation workflow for the federated-beads epic: plan, TDD implementation, autoreview, local merge."
+version = 1
+type = "workflow"
+
+[vars.slice_id]
+description = "Bead id of the slice task this molecule implements (e.g. federated-beads-dxh.1)"
+required = true
+
+[vars.slice_num]
+description = "Slice number (e.g. 0)"
+required = true
+
+[vars.slice_title]
+description = "Short title of the slice"
+required = true
+
+[[steps]]
+id = "plan"
+title = "Plan slice {{slice_num}}: {{slice_title}}"
+description = """Write a detailed implementation plan for slice {{slice_num}} ({{slice_title}}, bead {{slice_id}}).
+
+- Read the slice bead ({{slice_id}}) and its parent epic for requirements and acceptance criteria.
+- Write the plan to plans/slices/slice-{{slice_num}}.md.
+- The plan must cover: scope, files to create/change, test list (which tests to write first, in TDD order), edge cases, and out-of-scope items.
+- Do not write any implementation code in this step."""
+
+[[steps]]
+id = "implement-tdd"
+title = "Implement slice {{slice_num}} via TDD: {{slice_title}}"
+needs = ["plan"]
+description = """Implement slice {{slice_num}} ({{slice_id}}) following the plan in plans/slices/slice-{{slice_num}}.md, using strict TDD (use the tdd skill).
+
+- Create a feature branch off latest main for this slice; do all work on that branch.
+- Red -> green -> refactor for every behavior: write a failing test first, make it pass with minimal code, then refactor with tests green.
+- No production code without a failing test that demands it.
+- Finish with the full test suite passing on the feature branch. Do not merge or push in this step."""
+
+[[steps]]
+id = "autoreview"
+title = "Autoreview slice {{slice_num}}: {{slice_title}}"
+needs = ["implement-tdd"]
+description = """Run the autoreview code-review skill on the slice {{slice_num}} feature branch changes ({{slice_id}}).
+
+- Invoke the autoreview skill against the diff of the feature branch vs main.
+- Address all actionable findings (fix on the feature branch, keeping tests green); re-run autoreview if substantial fixes were made.
+- Record any deliberately-skipped findings and why in the bead notes/comments."""
+
+[[steps]]
+id = "merge"
+title = "Merge slice {{slice_num}} to main: {{slice_title}}"
+needs = ["autoreview"]
+description = """Land slice {{slice_num}} ({{slice_id}}) locally.
+
+- Commit all remaining work on the feature branch (clean, descriptive commits).
+- Merge the feature branch into local main (no push to any remote).
+- Verify the full test suite passes on main after the merge.
+- Close the slice bead {{slice_id}} (bd close {{slice_id}})."""
