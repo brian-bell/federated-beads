@@ -140,12 +140,29 @@ Reuse the existing `seed_repo` / `roster` test helpers.
 
 `cargo test --test bd_integration` must still pass unchanged (no bd surface added).
 
-## Manual smoke (to record after green)
+## Manual smoke (recorded)
 
-`cargo run -- repos list` / `add <tmp repo>` / `discover <tmp root>` / `remove` on a
-throwaway `Paths` base, leaving the real config untouched (tests use `with_base`;
-smoke will use a scratch `XDG_*`-independent tempdir via the same code path exercised
-in tests). Record the observed lines in this section.
+Ran the binary with `HOME` pointed at a scratch tempdir (so `Paths::resolve` and
+`~` expansion both landed under the sandbox, real config untouched), over a
+`dev/{x/.beads, y/.beads, z}` tree:
+
+```
+repos list            → roster is empty; add repos with `fbd repos add <path>`
+repos add ~/dev/x     → added <canonical>/dev/x to the roster
+repos add ~/dev/x     → already in the roster: <canonical>/dev/x   (no dup)
+repos add dev/z       → error: not a beads repo: …/dev/z has no .beads directory —
+                         run `bd init` there first   (exit 1)
+repos discover dev    → found 1 beads repo(s) …: …/dev/y  + "re-run with --add"
+                         (x already rostered → skipped)
+repos discover dev --add → added 1 repo(s) …: …/dev/y
+repos list            → roster (2 repos): x, y
+repos remove ~/dev/x  → removed …/dev/x + "note: run `fbd reset` …"
+repos remove dev/nope → not in the roster: …/dev/nope
+```
+
+`~` expanded and canonicalized to the sandbox home; duplicate add and
+already-added discover both deduped; non-repo add rejected with the `bd init` hint
+and a nonzero exit; remove printed the `fbd reset` hub hint. Sandbox removed after.
 
 ## Edge cases handled
 
