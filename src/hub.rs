@@ -72,6 +72,11 @@ pub fn ensure_hub(
     let hub = hub_dir(paths);
     mkdir_all(&hub)?;
 
+    // Single-process reconciliation: this check-then-init (and the roster
+    // read/add below) is not guarded against a second fbd running concurrently.
+    // Cross-process safety is the Slice 4 hub lock's job (see the master plan's
+    // process-level locking design); ensure_hub stays simple here and surfaces a
+    // genuine init failure rather than masking it behind a partial `.beads`.
     if !is_initialized(&hub) {
         bd.init(&hub, HUB_PREFIX)?;
     }
@@ -395,6 +400,20 @@ mod tests {
                 .any(|c| matches!(c, Call::RepoAdd(_, _))),
             "a hub-relative stored entry must match the absolute roster path"
         );
+    }
+
+    #[test]
+    fn init_failure_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // A genuine init failure must surface, not be silently swallowed.
+        let fake = FakeBdClient::new().with_init_err(BdError {
+            command: "bd init".into(),
+            stderr: "disk full".into(),
+            kind: crate::bd::BdErrorKind::NonZeroExit { code: Some(1) },
+        });
+
+        assert!(ensure_hub(&fake, &paths, &Config::default()).is_err());
     }
 
     #[test]
