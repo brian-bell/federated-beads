@@ -125,8 +125,11 @@ fn scroll_offset(selected: Option<usize>, height: usize, total: usize) -> u16 {
     offset.min(u16::MAX as usize) as u16
 }
 
-/// The status-bar text: last-refreshed age (or a refreshing indicator) plus a
-/// one-line summary of any warnings, pointing at `fbd doctor` for detail.
+/// The status-bar text: last-refreshed age (or a refreshing indicator) plus the
+/// actual first warning (with a `(+N more)` count when several), so a degraded
+/// refresh is diagnosable from the TUI itself rather than deferred to a command
+/// that cannot reproduce these warnings. The age leads, so it is never clipped
+/// when the warning text is long; ratatui truncates the line to the width.
 fn status_line(app: &App, now: SystemTime) -> String {
     let mut status = match app.fetched_at() {
         Some(t) => format!("refreshed {}", format_age(now, t)),
@@ -137,10 +140,15 @@ fn status_line(app: &App, now: SystemTime) -> String {
     if app.is_stale() && app.fetched_at().is_some() {
         status.push_str(" · refreshing…");
     }
-    let n = app.status_warnings().len();
-    if n > 0 {
-        let plural = if n == 1 { "" } else { "s" };
-        status.push_str(&format!(" · {n} repo{plural} failed (see doctor)"));
+    let warnings = app.status_warnings();
+    if let Some(first) = warnings.first() {
+        // Sanitize at the render boundary: warnings embed bd stderr / paths and
+        // are written straight to the terminal (the runtime pre-sanitizes, but
+        // the view must not assume its inputs are clean).
+        status.push_str(&format!(" · {}", sanitize(first)));
+        if warnings.len() > 1 {
+            status.push_str(&format!(" (+{} more)", warnings.len() - 1));
+        }
     }
     status
 }
@@ -306,8 +314,35 @@ mod tests {
             "status shows humanized age: {status:?}"
         );
         assert!(
-            status.contains("1 repo failed (see doctor)"),
-            "status summarizes the warning: {status:?}"
+            status.contains("export failed for reading-lite"),
+            "status shows the actual warning text, not a doctor redirect: {status:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_first_warning_and_count() {
+        // Multiple warnings: the first is shown verbatim with a remaining count,
+        // and a non-repo warning (version gate) is not mislabeled "repo failed".
+        let app = app_with(
+            vec![row("repo-a", "ra-1", 1, "t")],
+            vec![
+                "fbd requires bd >= 1.1.0".into(),
+                "id prefix `dup` claimed by 2 repos".into(),
+            ],
+        );
+        let status = line_text(&render(&app, at(1000)), H - 1);
+
+        assert!(
+            status.contains("fbd requires bd >= 1.1.0"),
+            "the first warning is shown verbatim: {status:?}"
+        );
+        assert!(
+            status.contains("(+1 more)"),
+            "remaining warnings are counted: {status:?}"
+        );
+        assert!(
+            !status.contains("repo failed"),
+            "a version-gate warning is not mislabeled as a repo failure: {status:?}"
         );
     }
 
@@ -442,8 +477,8 @@ mod tests {
             "the empty hint is shown instead"
         );
         assert!(
-            line_text(&buf, H - 1).contains("1 repo failed (see doctor)"),
-            "the failure is surfaced in the status bar"
+            line_text(&buf, H - 1).contains("hub sync failed"),
+            "the failure text is surfaced in the status bar"
         );
     }
 

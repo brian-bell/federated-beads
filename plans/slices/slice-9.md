@@ -65,14 +65,19 @@ exist in the Slice 8 core and this slice does not implement them.
    deliberately does not take). `Loading` mode (before the first snapshot) shows
    `Loading…` instead.
 
-4. **The status bar summarizes, it does not dump.** `App::status_warnings()` holds
+4. **The status bar surfaces real diagnostics.** `App::status_warnings()` holds
    full pre-formatted strings (per-repo export failures, prefix collisions,
-   missing paths) that cannot fit one line. The bar shows
-   `refreshed <age>` (or `refreshing…` while `is_stale()` with no prior fetch) and,
-   when warnings are present, `<n> repo<s> failed (see doctor)` pointing at the
-   `fbd doctor` command that prints them in full. `<age>` is humanized
-   (`just now` / `Ns` / `Nm` / `Nh` / `Nd ago`) from `now - fetched_at`, saturating
-   to `just now` on clock skew.
+   missing paths, a version-gate/lock message). The bar shows `refreshed <age>`
+   (or `refreshing…` while `is_stale()` with no prior fetch) and, when warnings
+   are present, the **actual first warning** followed by `(+N more)` when several
+   — so a degraded refresh is diagnosable from the TUI itself, rather than a
+   `see doctor` redirect (doctor cannot reproduce export/sync/lock/collision
+   warnings) or a `repo failed` label that would mislabel non-repo failures. The
+   age leads so it is never clipped; ratatui truncates a long warning to the
+   width. `<age>` is humanized (`just now` / `Ns` / `Nm` / `Nh` / `Nd ago`) from
+   `now - fetched_at`, saturating to `just now` on clock skew. Warnings are
+   `sanitize`d again at the render boundary (the view does not assume clean
+   input).
 
 5. **One `mpsc` channel, two producer threads, one consumer (the UI thread).** A
    crossterm **event thread** polls `event::read()`, maps each `KeyEvent` via
