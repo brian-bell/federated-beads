@@ -337,12 +337,14 @@ fn derive_prefix_from_ids(repo: &Path, dolt_database: &str) -> Option<String> {
         if record.kind.as_deref() != Some("issue") {
             continue;
         }
-        // Ids are `<prefix>-<hash>`; the prefix may itself contain `-`, so split
-        // on the last one, then keep only prefixes that sanitize to dolt_database.
-        let Some((prefix, _)) = record.id.as_deref().and_then(|id| id.rsplit_once('-')) else {
+        let Some(prefix) = record
+            .id
+            .as_deref()
+            .and_then(|id| validating_prefix(id, dolt_database))
+        else {
             continue;
         };
-        if prefix.replace('-', "_") == dolt_database && !distinct.iter().any(|p| p == prefix) {
+        if !distinct.iter().any(|p| p == prefix) {
             distinct.push(prefix.to_string());
             // A second distinct validating prefix makes attribution ambiguous;
             // stop and let the caller fall back rather than guess.
@@ -352,6 +354,18 @@ fn derive_prefix_from_ids(repo: &Path, dolt_database: &str) -> Option<String> {
         }
     }
     distinct.into_iter().next()
+}
+
+/// The prefix portion of an issue `id` (the substring before some `-`) whose
+/// `-`→`_` sanitization equals `dolt_database`, or `None` if none does. Every
+/// `-` in `id` is a candidate boundary, because both the prefix and the local
+/// part may contain `-` (e.g. `federated-beads-mol-1o4` in repo `federated-beads`
+/// has local part `mol-1o4`). Sanitization is length-preserving and 1:1 per
+/// char, so at most one boundary can validate — no ambiguity within a single id.
+fn validating_prefix<'a>(id: &'a str, dolt_database: &str) -> Option<&'a str> {
+    id.match_indices('-')
+        .map(|(i, _)| &id[..i])
+        .find(|candidate| candidate.replace('-', "_") == dolt_database)
 }
 
 #[cfg(test)]
@@ -695,6 +709,23 @@ mod tests {
         let only_foreign =
             seed_repo_with_ids(tmp.path(), "r2", "reading_lite", &["other-thing-xyz"]);
         assert_eq!(read_prefix(&only_foreign).unwrap(), "reading_lite");
+    }
+
+    #[test]
+    fn read_prefix_derives_prefix_from_partitioned_ids_only() {
+        // Partitioned/explicit ids carry a hyphenated local part
+        // (`federated-beads-mol-1o4` = repo `federated-beads`, local `mol-1o4`).
+        // Even when the export has *only* these, the prefix must still be derived
+        // by trying every hyphen boundary, not just the last.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo_with_ids(
+            tmp.path(),
+            "r",
+            "federated_beads",
+            &["federated-beads-mol-1o4", "federated-beads-mol-2gj"],
+        );
+
+        assert_eq!(read_prefix(&repo).unwrap(), "federated-beads");
     }
 
     #[test]
