@@ -123,7 +123,9 @@ pub fn run_snapshot(
 
     let status = hub::ensure_hub(bd, paths, roster)?;
     for warning in &status.warnings {
-        writeln!(err, "warning: {warning}")?;
+        // Warnings embed config/repo-derived text (paths, bd stderr, prefixes)
+        // and go to a terminal, so sanitize them like rows and doctor output.
+        writeln!(err, "warning: {}", sanitize(warning))?;
     }
 
     let hub = hub_dir(paths);
@@ -132,13 +134,13 @@ pub fn run_snapshot(
             // Per-repo failures and prefix collisions are surfaced but never fatal
             // — the hub still synced whatever exported cleanly.
             for repo_error in &outcome.errors {
-                writeln!(err, "warning: {repo_error}")?;
+                writeln!(err, "warning: {}", sanitize(&repo_error.to_string()))?;
             }
             for collision in outcome.prefix_map.collisions() {
                 writeln!(
                     err,
                     "warning: id prefix `{}` is claimed by {} repos; its issues show as `{}`",
-                    collision.prefix,
+                    sanitize(&collision.prefix),
                     collision.repos.len(),
                     snapshot::UNKNOWN_REPO,
                 )?;
@@ -256,7 +258,10 @@ pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
 /// Delete the hub dir (rebuilt on the next snapshot/launch) and report.
 pub fn run_reset(paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
     let hub = hub_dir(paths);
-    let existed = hub.exists();
+    // Mirror `hub::reset`'s own `symlink_metadata` test rather than `Path::exists`:
+    // exists() follows symlinks and reports false for a dangling hub symlink that
+    // reset nonetheless removes, which would misreport it as "nothing to remove".
+    let existed = std::fs::symlink_metadata(&hub).is_ok();
     hub::reset(paths)?;
     if existed {
         writeln!(out, "hub reset: removed {}", hub.display())?;
@@ -656,6 +661,51 @@ mod tests {
         assert!(
             stdout.contains(&hub.display().to_string()),
             "reset reports the removed path: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_reports_removed_for_dangling_hub_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(hub.parent().unwrap()).unwrap();
+        // A dangling symlink: `exists()` is false, but reset removes it, so the
+        // report must say "removed", not "nothing to remove".
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &hub).unwrap();
+        let mut out = Vec::new();
+
+        run_reset(&paths, &mut out).expect("ok");
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("removed") && !stdout.contains("nothing to remove"),
+            "a removed dangling symlink is reported as removed: {stdout}"
+        );
+        assert!(
+            fs::symlink_metadata(&hub).is_err(),
+            "the dangling symlink was actually removed"
+        );
+    }
+
+    #[test]
+    fn snapshot_warnings_are_sanitized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // A roster path carrying terminal-control bytes: it does not exist, so
+        // ensure_hub emits a "does not exist" warning that echoes the raw path.
+        let hostile = tmp.path().join("evil\u{1b}]52;c;x\u{07}\nforged");
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-2hc", 1, "t")]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        run_snapshot(&roster(&[&hostile]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            !stderr.contains('\u{1b}') && !stderr.contains('\u{07}'),
+            "warning output carries no raw terminal-control bytes: {stderr:?}"
         );
     }
 }
