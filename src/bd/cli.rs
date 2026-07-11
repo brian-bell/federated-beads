@@ -127,16 +127,20 @@ fn argv_repo_list(hub: &Path) -> Vec<OsString> {
 }
 
 fn argv_export(repo: &Path) -> Vec<OsString> {
-    // `-o` resolves relative to the `-C` dir, so a bare `.beads/issues.jsonl` is
-    // correct whether `repo` is absolute or relative — passing
-    // `<repo>/.beads/...` would double the path (`repo/repo/.beads/...`) when
-    // `repo` is relative.
+    // bd resolves a relative `-o` against fbd's *process* working directory, not
+    // the `-C` dir (verified against bd 1.1.0: `bd -C <repo> export -o
+    // .beads/issues.jsonl` writes under the caller's cwd, not <repo>). So the
+    // output path must locate the repo explicitly. Joining onto `repo` writes to
+    // `<repo>/.beads/issues.jsonl` correctly whether `repo` is absolute (an
+    // absolute `-o`) or relative (the same cwd base as `-C`), keeping each
+    // export inside its own source repo instead of clobbering the caller's cwd.
+    let out = repo.join(".beads").join("issues.jsonl");
     vec![
         "-C".into(),
         arg(repo),
         "export".into(),
         "-o".into(),
-        ".beads/issues.jsonl".into(),
+        arg(&out),
     ]
 }
 
@@ -252,10 +256,17 @@ mod tests {
             os(&["-C", "/tmp/hub", "repo", "list", "--json"])
         );
 
-        // `-o` is relative to the `-C` dir, so it stays a bare `.beads/...`.
+        // bd resolves a relative `-o` against the caller's cwd, not `-C`, so the
+        // output path is joined onto the repo to keep the export inside it.
         assert_eq!(
             argv_export(Path::new("/tmp/ra")),
-            os(&["-C", "/tmp/ra", "export", "-o", ".beads/issues.jsonl"])
+            os(&[
+                "-C",
+                "/tmp/ra",
+                "export",
+                "-o",
+                "/tmp/ra/.beads/issues.jsonl"
+            ])
         );
 
         assert_eq!(

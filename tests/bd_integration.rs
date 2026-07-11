@@ -137,6 +137,23 @@ fn refresh_two_repos() {
     // The hub must be registered before a refresh can sync it.
     ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
 
+    // Create an issue in `ra` AFTER the fixture helper's own export. Only
+    // refresh's export (writing into ra's own .beads) can carry this into the
+    // hub — so its appearance below proves refresh exported to the right repo,
+    // not the caller's cwd (regression guard for the relative-`-o` bug).
+    let marker = "refresh-export-marker";
+    let created = std::process::Command::new("bd")
+        .arg("-C")
+        .arg(&ra)
+        .args(["create", marker, "-p", "1", "--json"])
+        .output()
+        .expect("bd create marker");
+    assert!(
+        created.status.success(),
+        "bd create marker failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
     let outcome = refresh::run(&BdCli::new(), &roster, &paths).expect("refresh runs");
     assert!(
         outcome.errors.is_empty(),
@@ -152,6 +169,11 @@ fn refresh_two_repos() {
     // The hub now hydrates issues from both repos (blocked ones excluded).
     let hub = hub_dir(&paths);
     let ready = BdCli::new().ready(&hub).expect("bd ready on hub");
+    assert!(
+        ready.iter().any(|i| i.title == marker),
+        "refresh's export must carry the post-ensure marker into the hub: {:?}",
+        ready.iter().map(|i| &i.title).collect::<Vec<_>>()
+    );
     let ra_id = ready
         .iter()
         .find(|i| i.id.starts_with("ra-"))
