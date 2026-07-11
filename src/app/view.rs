@@ -44,6 +44,10 @@ const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc ca
 /// One-line key hints while browsing search results: the keys that act there.
 const SEARCH_RESULTS_HINTS: &str = "fbd search · j/k move · enter open · esc edit · q quit";
 
+/// One-line key hints while a search is pending or failed: only these act there
+/// (navigation and detail-open are inert until results arrive).
+const SEARCH_WAIT_HINTS: &str = "fbd search · esc edit · q quit";
+
 /// Render the whole screen for the current [`App`] state and clock `now`: a title
 /// hint row, the mode-specific content (ready list or list+detail split), and the
 /// status bar.
@@ -59,12 +63,13 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
 
     let hints = match app.view_mode() {
         ViewMode::Detail => DETAIL_HINTS,
-        // Match the hint to the phase's real key routing: while editing, keys are
-        // query text and Enter runs the search; while browsing results, j/k move,
-        // Enter opens the detail, and Esc returns to editing.
+        // Match the hint to the phase's real key routing: editing keys type the
+        // query and Enter runs it; results enable j/k + Enter (open) + Esc (edit);
+        // while loading or after an error only Esc (edit) and q act.
         ViewMode::Search => match app.search_phase() {
             Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
-            _ => SEARCH_RESULTS_HINTS,
+            Some(SearchPhase::Results) => SEARCH_RESULTS_HINTS,
+            _ => SEARCH_WAIT_HINTS,
         },
         ViewMode::List | ViewMode::Loading => LIST_HINTS,
     };
@@ -1089,6 +1094,17 @@ mod tests {
             l.contains("search failed: boom") && !l.contains("search failed: search failed:")
         });
         assert!(once, "the error message renders once, not double-prefixed");
+
+        // Error phase: the title hint omits the inert nav/open keys.
+        let err_title = line_text(&buf, 0);
+        assert!(
+            !err_title.contains("j/k move"),
+            "error hint omits inert navigation: {err_title:?}"
+        );
+        assert!(
+            err_title.contains("esc edit"),
+            "error hint keeps the active esc: {err_title:?}"
+        );
     }
 
     #[test]
