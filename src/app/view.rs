@@ -31,9 +31,10 @@ const EMPTY_HINT: &str = "no repos configured — run: fbd repos discover ~/dev"
 const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p to change";
 
 /// One-line key hints for the list view. Only keys that act are advertised, so
-/// the UI never promises an inert command; `/` search (Slice 11) stays omitted
-/// until it does something. `enter detail` is live as of Slice 10.
-const LIST_HINTS: &str = "fbd · q quit · r refresh · f repo · p prio · j/k move · enter detail";
+/// the UI never promises an inert command; `enter detail` is live as of Slice 10
+/// and `/ search` as of Slice 11.
+const LIST_HINTS: &str =
+    "fbd · q quit · r refresh · / search · f repo · p prio · j/k move · enter detail";
 
 /// One-line key hints for the detail pane: the keys that act there.
 const DETAIL_HINTS: &str = "fbd · esc back · q quit";
@@ -966,6 +967,10 @@ mod tests {
         assert!(
             list_title.contains("enter"),
             "list advertises enter: {list_title:?}"
+        );
+        assert!(
+            list_title.contains("/ search"),
+            "list advertises the search key: {list_title:?}"
         );
 
         let detail = app_in_detail("ra-1", None);
