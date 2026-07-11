@@ -6,6 +6,7 @@
 //! place that touches real paths, spawns `bd`, and maps results to an exit code.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -37,6 +38,35 @@ enum Command {
     Reset,
     /// Report bd version, config/hub paths, and per-repo roster health.
     Doctor,
+    /// Manage the roster of beads repositories (`config.toml`).
+    Repos {
+        #[command(subcommand)]
+        action: ReposAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReposAction {
+    /// Add a beads repository to the roster (must contain a `.beads` directory).
+    Add {
+        /// Path to the beads repository (a leading `~` is expanded).
+        path: PathBuf,
+    },
+    /// Remove a repository from the roster by path.
+    Remove {
+        /// Path of the roster entry to drop (a leading `~` is expanded).
+        path: PathBuf,
+    },
+    /// Print the current roster.
+    List,
+    /// Scan `<root>/*/.beads` one level deep for beads repos.
+    Discover {
+        /// Directory whose immediate children are scanned for `.beads`.
+        root: PathBuf,
+        /// Add the discovered repos instead of only listing them.
+        #[arg(long)]
+        add: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -69,6 +99,16 @@ fn run() -> Result<(), CliError> {
         }
         Some(Command::Reset) => cli::run_reset(&paths, &mut stdout),
         Some(Command::Doctor) => cli::run_doctor(&bd, &paths, &mut stdout),
+        // Roster editing is pure config I/O — no bd, no hub. Each runner loads and
+        // saves the roster itself.
+        Some(Command::Repos { action }) => match action {
+            ReposAction::Add { path } => cli::run_repos_add(&paths, &path, &mut stdout),
+            ReposAction::Remove { path } => cli::run_repos_remove(&paths, &path, &mut stdout),
+            ReposAction::List => cli::run_repos_list(&paths, &mut stdout),
+            ReposAction::Discover { root, add } => {
+                cli::run_repos_discover(&paths, &root, add, &mut stdout)
+            }
+        },
         // Bare `fbd` is reserved for launching the TUI (Slice 9). Until then,
         // orient the user toward the working subcommands rather than erroring.
         None => {
