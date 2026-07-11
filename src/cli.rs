@@ -289,13 +289,32 @@ fn expand_tilde(p: &Path) -> PathBuf {
     }
 }
 
-/// The canonical, absolute form a roster entry is stored under: expand `~`, then
-/// canonicalize (falling back to the expanded path when the target does not exist).
-/// Mirrors `hub::normalize` / `refresh::normalize` so `add`/`discover` dedupe on the
-/// same key `ensure_hub` compares against.
+/// The canonical, absolute key a roster entry is compared and stored under: expand
+/// `~`, then canonicalize. Used both when storing a new entry and when normalizing
+/// existing entries for comparison, so `add`/`remove`/`discover` all match on the
+/// same key regardless of how a path was spelled (relative, aliased, `~`).
+///
+/// When the target itself is gone from disk (e.g. `remove` of a deleted repo, which
+/// is exactly when you want to remove it), `canonicalize` fails; the fallback
+/// canonicalizes the *parent* and rejoins the final component, so a repo added as
+/// `./repo` and stored as its resolved absolute path still matches after deletion —
+/// the parent's symlinks are resolved the same way the original store did. Only when
+/// even the parent is unresolvable does it fall back to a plain cwd-absolutized (then
+/// expanded) path.
 fn store_path(p: &Path) -> PathBuf {
     let expanded = expand_tilde(p);
-    std::fs::canonicalize(&expanded).unwrap_or(expanded)
+    if let Ok(canonical) = std::fs::canonicalize(&expanded) {
+        return canonical;
+    }
+    let parent_canonical = expanded
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .zip(expanded.file_name())
+        .and_then(|(parent, name)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
+    if let Some(parent_canonical) = parent_canonical {
+        return parent_canonical;
+    }
+    std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
 /// Save a mutated roster, mapping the config layer's `anyhow` error into the CLI's
@@ -321,7 +340,15 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
     }
     let canonical = store_path(path);
     let mut roster = load_roster(paths)?;
-    if roster.repos.iter().any(|r| r.path == canonical) {
+    // Normalize each existing entry too, not just the new path: a hand-edited
+    // config.toml may hold relative or symlink-aliased entries, and adding the same
+    // repo by its canonical spelling must still dedupe (mirrors ensure_hub, which
+    // normalizes both sides before comparing).
+    if roster
+        .repos
+        .iter()
+        .any(|r| store_path(&r.path) == canonical)
+    {
         writeln!(
             out,
             "already in the roster: {}",
@@ -345,9 +372,11 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
 /// needs a `fbd reset` to forget it. Removing an entry that is not present is a
 /// friendly no-op (idempotent), not an error.
 ///
-/// Matching tolerates a repo already gone from disk (a reason to remove it, so
-/// `canonicalize` may fail): an entry matches on either the canonical form or a raw
-/// path-string equality.
+/// Matching normalizes both the input and each stored entry through `store_path`, so
+/// a repo added by one spelling is removed by another (relative, aliased, `~`), and
+/// a repo already gone from disk still matches via the parent-canonicalize fallback.
+/// A raw path-string equality is kept as a last resort for the pathological case
+/// where neither side can be resolved at all.
 pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Result<(), CliError> {
     let canonical = store_path(path);
     let expanded = expand_tilde(path);
@@ -355,7 +384,7 @@ pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Res
     let before = roster.repos.len();
     roster
         .repos
-        .retain(|r| r.path != canonical && r.path != expanded && r.path != path);
+        .retain(|r| store_path(&r.path) != canonical && r.path != path);
     if roster.repos.len() == before {
         writeln!(
             out,
@@ -411,8 +440,10 @@ pub fn run_repos_discover(
 ) -> Result<(), CliError> {
     let root = expand_tilde(root);
     let mut roster = load_roster(paths)?;
+    // Normalize stored entries so a candidate already in the roster under a different
+    // spelling (relative/aliased/`~`, e.g. a hand-edited config) is still skipped.
     let known: std::collections::HashSet<PathBuf> =
-        roster.repos.iter().map(|r| r.path.clone()).collect();
+        roster.repos.iter().map(|r| store_path(&r.path)).collect();
 
     // One level deep: a child directory is a candidate iff it holds `.beads/`.
     let mut found: Vec<PathBuf> = Vec::new();
@@ -479,6 +510,11 @@ mod tests {
     use crate::refresh::HubLock;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Serializes the tests that mutate process-global state (`cwd`, `$HOME`), which
+    /// cargo would otherwise run concurrently on separate threads of one process.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn version(v: &str, schema: i64) -> BdVersion {
         BdVersion {
@@ -1117,14 +1153,113 @@ mod tests {
     }
 
     #[test]
+    fn remove_after_repo_deleted_still_matches() {
+        // The remove-after-deletion case: add a repo (stored canonical), delete it
+        // from disk, then remove it by its original relative spelling from the parent.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "doomed", "dm");
+        run_repos_add(&paths, &repo, &mut Vec::new()).unwrap();
+        fs::remove_dir_all(&repo).unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Remove by a relative path resolved from the parent dir (repo is gone).
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let mut out = Vec::new();
+        let result = run_repos_remove(&paths, Path::new("doomed"), &mut out);
+        std::env::set_current_dir(prev).unwrap();
+        result.expect("remove ok");
+
+        assert!(
+            reload(&paths).repos.is_empty(),
+            "the stale entry was removed"
+        );
+        assert!(
+            String::from_utf8(out).unwrap().contains("removed"),
+            "deleted repo removed by its original relative spelling"
+        );
+    }
+
+    #[test]
+    fn add_dedupes_against_relative_hand_edited_entry() {
+        // A config a user hand-edited to hold a relative entry: adding the same repo
+        // by its canonical absolute path must dedupe against it, not duplicate.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "r", "r");
+        // Persist a roster whose entry is the *relative* name, resolvable from tmp.
+        Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("r"),
+            }],
+        }
+        .save(paths.config_file())
+        .unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let mut out = Vec::new();
+        // Add by the canonical absolute path.
+        let result = run_repos_add(&paths, &repo.canonicalize().unwrap(), &mut out);
+        std::env::set_current_dir(prev).unwrap();
+        result.expect("add ok");
+
+        assert_eq!(
+            reload(&paths).repos.len(),
+            1,
+            "aliased hand-edited entry is deduped, not duplicated"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("already in the roster"),
+            "the pre-existing aliased entry is recognized"
+        );
+    }
+
+    #[test]
+    fn discover_skips_relative_hand_edited_entry() {
+        // discover must also normalize stored entries: an already-added repo spelled
+        // relatively in the config should not be re-offered.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let (root, x, _y) = discovery_tree(tmp.path());
+        // Hand-edited roster: x stored relative to tmp.
+        let rel_x = x.strip_prefix(tmp.path()).unwrap().to_path_buf();
+        Config {
+            repos: vec![RepoEntry { path: rel_x }],
+        }
+        .save(paths.config_file())
+        .unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let mut out = Vec::new();
+        let result = run_repos_discover(&paths, &root, false, &mut out);
+        std::env::set_current_dir(prev).unwrap();
+        result.expect("discover ok");
+
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains(&x.canonicalize().unwrap().display().to_string()),
+            "an already-rostered repo (relative spelling) is not re-offered"
+        );
+    }
+
+    #[test]
     fn add_expands_tilde_and_canonicalizes() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         // Point HOME at a tempdir holding a seeded repo, then add it via `~/r`.
         let home = tmp.path().join("home");
         let r = seed_repo(&home, "r", "r");
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("HOME");
-        // SAFETY: single-threaded test; restored below.
+        // SAFETY: ENV_LOCK serializes HOME/cwd mutation across tests; restored below.
         unsafe { std::env::set_var("HOME", &home) };
         let mut out = Vec::new();
         let result = run_repos_add(&paths, Path::new("~/r"), &mut out);
