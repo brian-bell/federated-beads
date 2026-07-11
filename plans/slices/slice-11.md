@@ -328,3 +328,50 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --test bd_integration
 ```
+
+## Autoreview outcomes (codex gpt-5.6-sol, high; branch vs main)
+
+Ran to convergence over eight rounds; all seven findings accepted and fixed
+(none rejected or filed as out-of-scope beads).
+
+- **Round 1 — key-decode race (P2).** The input thread decoded state-dependent
+  keys against an asynchronously-published `editing` `AtomicBool`, so a pasted or
+  rapid `/query` burst could decode `query`'s characters in command mode before
+  `OpenSearch` was reduced — e.g. `q` quitting. **Fixed:** the input thread now
+  forwards raw key events (`Incoming::Key`); the UI thread decodes each via
+  `map_key` against the app's live search focus, and channel ordering makes the
+  race structurally impossible (the shared flag is removed). Test
+  `pasted_query_keys_never_run_commands`.
+- **Round 2 — search-opened detail moved the ready selection (P2).** A refresh
+  landing while a detail opened *from a search result* was shown relocated the
+  hidden ready selection onto that id when it was also a ready row, corrupting the
+  restore-on-exit. **Fixed:** relocate the ready selection only when the detail
+  came from the ready list (`search.is_none()`; decision revised). Test
+  `refresh_under_search_detail_preserves_ready_selection`.
+- **Round 3 — two view defects (P3).** The search title hint was static and
+  advertised editing bindings on the results screen; and the `Error` status line
+  re-prefixed the worker's already-`search failed:`-prefixed message. **Fixed:**
+  phase-aware title hints; render the error message directly. Test
+  `search_hints_are_phase_aware_and_error_renders_once`.
+- **Round 4 — loading/error advertised inert keys (P3).** `Loading`/`Error`
+  reused the results hint (`j/k move`, `enter open`), which are inert there.
+  **Fixed:** a `SEARCH_WAIT_HINTS` listing only the keys that act (`esc edit`,
+  `q quit`).
+- **Round 5 — search undiscoverable (P2).** `LIST_HINTS` omitted `/` and its
+  comment stale-claimed search was inert. **Fixed:** added `/ search` to the list
+  hint (the README keybindings table remains a Slice 12 deliverable).
+- **Round 6 — stale results under a new query (P2).** `draw_search` rendered the
+  retained results in every phase, so `Esc`→edit left the prior query's hits
+  showing beneath the new one. **Fixed:** render rows only in `Results` (the list
+  is still retained so returning from a detail re-shows it). Test
+  `editing_after_results_hides_stale_rows`.
+- **Round 7 — filter-hidden results were a blank pane (P2).** `f`/`p` filter the
+  results, but a filter hiding all of them rendered nothing, with a stale count
+  and no filter-key hints. **Fixed:** show the ready list's `NO_MATCH_HINT` when
+  results exist but are all filtered out (distinguished from a genuinely empty
+  query), and advertise `f`/`p` in the results hint. Test
+  `filtered_empty_search_shows_filter_hint`.
+- **Round 8: clean** — helper exited 0 with no accepted/actionable findings.
+
+Final counts on the branch: **175 unit + 7 integration** tests green;
+`fmt`/`clippy` clean.
