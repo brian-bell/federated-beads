@@ -61,9 +61,16 @@ pub enum CliError {
 /// (cursor moves, or an OSC 52 clipboard write). JSON output is unaffected —
 /// serde escapes control characters on its own.
 pub fn format_row(row: &Row) -> String {
+    format!("[{}] {}", sanitize(&row.repo_name), format_row_body(row))
+}
+
+/// Format the repo-independent body of a row: `P<priority> <id> <title>`, with
+/// bd-sourced `id`/`title` [`sanitize`]d. Shared with Slice 9's TUI view, which
+/// draws the repo in a group header instead of inline — so the headless
+/// (`fbd snapshot`) and TUI renderings of a row can never drift.
+pub fn format_row_body(row: &Row) -> String {
     format!(
-        "[{}] P{} {} {}",
-        sanitize(&row.repo_name),
+        "P{} {} {}",
         row.issue.priority,
         sanitize(&row.issue.id),
         sanitize(&row.issue.title),
@@ -73,7 +80,10 @@ pub fn format_row(row: &Row) -> String {
 /// Replace every control character (C0/C1, DEL, and the line breaks that would
 /// let a value span rows) with the Unicode replacement character, so bd-sourced
 /// text cannot inject terminal-control sequences into human-readable output.
-fn sanitize(s: &str) -> String {
+///
+/// `pub(crate)` so the TUI view can neutralize the same bd-sourced text (repo
+/// names, ids, titles) it renders straight into the terminal buffer.
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
