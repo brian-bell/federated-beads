@@ -38,8 +38,11 @@ const LIST_HINTS: &str = "fbd · q quit · r refresh · f repo · p prio · j/k 
 /// One-line key hints for the detail pane: the keys that act there.
 const DETAIL_HINTS: &str = "fbd · esc back · q quit";
 
-/// One-line key hints for the search screen: the keys that act there.
-const SEARCH_HINTS: &str = "fbd search · type query · enter run · esc back · j/k move · enter open";
+/// One-line key hints while editing the search query: the keys that act there.
+const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc cancel";
+
+/// One-line key hints while browsing search results: the keys that act there.
+const SEARCH_RESULTS_HINTS: &str = "fbd search · j/k move · enter open · esc edit · q quit";
 
 /// Render the whole screen for the current [`App`] state and clock `now`: a title
 /// hint row, the mode-specific content (ready list or list+detail split), and the
@@ -56,7 +59,13 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
 
     let hints = match app.view_mode() {
         ViewMode::Detail => DETAIL_HINTS,
-        ViewMode::Search => SEARCH_HINTS,
+        // Match the hint to the phase's real key routing: while editing, keys are
+        // query text and Enter runs the search; while browsing results, j/k move,
+        // Enter opens the detail, and Esc returns to editing.
+        ViewMode::Search => match app.search_phase() {
+            Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
+            _ => SEARCH_RESULTS_HINTS,
+        },
         ViewMode::List | ViewMode::Loading => LIST_HINTS,
     };
     frame.render_widget(Paragraph::new(hints), chunks[0]);
@@ -235,7 +244,9 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
             "{count} result{} for \"{query}\"",
             if count == 1 { "" } else { "s" }
         ),
-        Some(SearchPhase::Error(msg)) => format!("search failed: {}", sanitize(msg)),
+        // The worker already prefixes ("search failed: …") and the boundary
+        // re-sanitizes; don't prefix again (was "search failed: search failed: …").
+        Some(SearchPhase::Error(msg)) => sanitize(msg),
         None => String::new(),
     };
     frame.render_widget(Paragraph::new(status), parts[1]);
@@ -1037,6 +1048,47 @@ mod tests {
             find_at(&buf, EMPTY_HINT, w, h).is_none(),
             "the ready-list discover hint must not appear for an empty search"
         );
+    }
+
+    #[test]
+    fn search_hints_are_phase_aware_and_error_renders_once() {
+        let (w, h) = (80, 24);
+
+        // Editing: the title hint advertises the editing keys.
+        let mut editing = app_with(vec![row("ra", "ra-1", 1, "ready")], vec![]);
+        editing.reduce(Msg::OpenSearch);
+        let title = line_text(&render_sized(&editing, at(1000), w, h), 0);
+        assert!(title.contains("type query"), "editing hint: {title:?}");
+
+        // Results: the hint advertises navigation, not the inert "type query".
+        let results = app_in_search("foo", vec![row("ra", "ra-1", 1, "hit")]);
+        let title = line_text(&render_sized(&results, at(1000), w, h), 0);
+        assert!(title.contains("j/k move"), "results hint: {title:?}");
+        assert!(
+            !title.contains("type query"),
+            "results hint drops editing-only bindings: {title:?}"
+        );
+
+        // Error: the worker-prefixed message renders once, not double-prefixed.
+        let mut err = app_with(vec![row("ra", "ra-1", 1, "ready")], vec![]);
+        err.reduce(Msg::OpenSearch);
+        for c in "foo".chars() {
+            err.reduce(Msg::SearchInput(c));
+        }
+        let token = match err.reduce(Msg::SubmitSearch).as_slice() {
+            [crate::app::Effect::Search { token, .. }] => *token,
+            other => panic!("expected one Search effect, got {other:?}"),
+        };
+        err.reduce(Msg::SearchResults {
+            token,
+            rows: Err("search failed: boom".into()),
+        });
+        let buf = render_sized(&err, at(1000), w, h);
+        let once = (0..h).any(|y| {
+            let l: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
+            l.contains("search failed: boom") && !l.contains("search failed: search failed:")
+        });
+        assert!(once, "the error message renders once, not double-prefixed");
     }
 
     #[test]
