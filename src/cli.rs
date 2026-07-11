@@ -48,11 +48,30 @@ pub enum CliError {
 ///
 /// Pure `Row → String`; Slice 9's ready-list view reuses it so the headless and
 /// TUI renderings of a row never drift.
+///
+/// bd-sourced fields (repo name, id, title) are [`sanitize`]d: they are attacker-
+/// influenceable data (an issue title in a federated repo you don't control), and
+/// this string is written straight to a terminal. Left raw, a title carrying
+/// newlines or ANSI/OSC escapes could forge extra rows or drive the terminal
+/// (cursor moves, or an OSC 52 clipboard write). JSON output is unaffected —
+/// serde escapes control characters on its own.
 pub fn format_row(row: &Row) -> String {
     format!(
         "[{}] P{} {} {}",
-        row.repo_name, row.issue.priority, row.issue.id, row.issue.title
+        sanitize(&row.repo_name),
+        row.issue.priority,
+        sanitize(&row.issue.id),
+        sanitize(&row.issue.title),
     )
+}
+
+/// Replace every control character (C0/C1, DEL, and the line breaks that would
+/// let a value span rows) with the Unicode replacement character, so bd-sourced
+/// text cannot inject terminal-control sequences into human-readable output.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// Accept a bd version iff `schema_version == 1` and `version >= 1.1.0`.
@@ -312,6 +331,22 @@ mod tests {
     fn format_row_matches_spec() {
         let r = row("ra", "ra-2hc", 1, "Ready task one");
         assert_eq!(format_row(&r), "[ra] P1 ra-2hc Ready task one");
+    }
+
+    #[test]
+    fn format_row_neutralizes_terminal_control_chars() {
+        // A hostile title: an OSC 52 clipboard-write escape plus a newline that
+        // would otherwise forge a second row.
+        let r = row("ra", "ra-2hc", 1, "pwn\u{1b}]52;c;aGk=\u{07}\nfake row");
+        let line = format_row(&r);
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\n') && !line.contains('\u{07}'),
+            "no raw control chars survive: {line:?}"
+        );
+        assert!(
+            line.starts_with("[ra] P1 ra-2hc "),
+            "the row prefix is intact: {line:?}"
+        );
     }
 
     #[test]
