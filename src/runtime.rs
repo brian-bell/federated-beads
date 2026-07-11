@@ -8,7 +8,7 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -31,6 +31,10 @@ use crate::snapshot::{self, Snapshot};
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
 const INPUT_POLL: Duration = Duration::from_millis(100);
+
+/// How long the UI thread waits for a message before redrawing anyway, so the
+/// status bar's last-refreshed age advances while the user is idle.
+const TICK: Duration = Duration::from_secs(1);
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -64,14 +68,23 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     spawn_refresh(&tx, paths, roster);
     draw(terminal, &app)?;
 
-    while let Ok(msg) = rx.recv() {
-        for effect in app.reduce(msg) {
-            match effect {
-                Effect::Refresh => spawn_refresh(&tx, paths, roster),
+    // Redraw on every message and on every idle tick, so the staleness age keeps
+    // advancing even while no messages arrive. `Disconnected` cannot occur while
+    // this thread still holds `tx`, but is handled defensively as a clean exit.
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(msg) => {
+                for effect in app.reduce(msg) {
+                    match effect {
+                        Effect::Refresh => spawn_refresh(&tx, paths, roster),
+                    }
+                }
+                if app.is_done() {
+                    break;
+                }
             }
-        }
-        if app.is_done() {
-            break;
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
         draw(terminal, &app)?;
     }
@@ -184,7 +197,10 @@ pub(crate) fn gather_snapshot(
 }
 
 /// The crossterm event producer: map key presses to [`Msg`]s until told to stop.
-/// Polls with a timeout so the stop flag is observed even while idle.
+/// Polls with a timeout so the stop flag is observed even while idle. On a
+/// terminal read/poll failure it sends `Quit` before exiting, so the UI thread —
+/// which holds its own sender and would otherwise block on `recv` forever with no
+/// producer left — always has a path to a clean shutdown.
 fn input_thread(tx: &Sender<Msg>, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         match event::poll(INPUT_POLL) {
@@ -196,22 +212,42 @@ fn input_thread(tx: &Sender<Msg>, stop: &AtomicBool) {
                         return; // UI thread gone.
                     }
                 }
-                Ok(_) => {}       // non-key event (resize, mouse): ignored
-                Err(_) => return, // terminal read failure: stop producing
+                Ok(_) => {} // non-key event (resize, mouse): ignored
+                Err(_) => {
+                    let _ = tx.send(Msg::Quit); // can't read input: quit cleanly
+                    return;
+                }
             },
             Ok(false) => {} // timeout: loop and re-check the stop flag
-            Err(_) => return,
+            Err(_) => {
+                let _ = tx.send(Msg::Quit);
+                return;
+            }
         }
     }
 }
 
 /// Enter raw mode + the alternate screen and install the restoring panic hook.
+///
+/// Rolls back each step if a later one fails, so a partial setup never returns
+/// `Err` while leaving the terminal in raw mode or the alternate screen (the
+/// caller has no `Tui` to restore in that case).
 fn setup_terminal() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e);
+    }
     set_panic_hook();
-    Terminal::new(CrosstermBackend::new(stdout))
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => Ok(terminal),
+        Err(e) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            Err(e)
+        }
+    }
 }
 
 /// Leave the alternate screen, disable raw mode, and show the cursor.

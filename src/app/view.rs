@@ -44,9 +44,14 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
 }
 
 /// Build and render the middle list area: the loading placeholder, the empty
-/// hint, or the repo-grouped rows with the selection highlighted.
+/// hint, or the repo-grouped rows with the selection scrolled into view.
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
-    if app.view_mode() == ViewMode::Loading {
+    // Show "Loading…" only while the first refresh is actually in flight. A
+    // failed initial refresh (`RefreshCompleted { snapshot: None }`) leaves the
+    // App in `Loading` with `stale` cleared; falling through renders the empty
+    // hint instead of a permanent, misleading spinner (the status bar carries
+    // the failure warning).
+    if app.view_mode() == ViewMode::Loading && app.is_stale() {
         frame.render_widget(Paragraph::new("Loading…"), area);
         return;
     }
@@ -72,11 +77,15 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    // The rendered line index (headers included) of the selected row, so the
+    // list can be scrolled to keep it on screen once it exceeds the area height.
+    let mut selected_line: Option<usize> = None;
     for (name, items) in &groups {
         lines.push(Line::styled(format!("▸ {}", sanitize(name)), header_style));
         for (i, row) in items {
             let text = format!("  {}", format_row_body(row));
             if selection == Some(*i) {
+                selected_line = Some(lines.len());
                 // Pad to the full width so the reversed highlight fills the row.
                 let padded = format!("{text:<width$}", width = area.width as usize);
                 lines.push(Line::styled(padded, selected_style));
@@ -86,7 +95,22 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    // Scroll just enough to keep the selected line inside the viewport: nothing
+    // until it would fall off the bottom, then anchor it to the last visible
+    // row. Stateless (recomputed each draw), so no cross-frame offset to track.
+    let offset = scroll_offset(selected_line, area.height as usize, lines.len());
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), area);
+}
+
+/// The vertical scroll offset that keeps `selected` visible within `height`
+/// rendered rows. Returns 0 when the selection fits above the fold or there is
+/// nothing to scroll.
+fn scroll_offset(selected: Option<usize>, height: usize, total: usize) -> u16 {
+    let (Some(sel), true) = (selected, height > 0 && total > height) else {
+        return 0;
+    };
+    let offset = if sel < height { 0 } else { sel - height + 1 };
+    offset.min(u16::MAX as usize) as u16
 }
 
 /// The status-bar text: last-refreshed age (or a refreshing indicator) plus a
@@ -295,6 +319,70 @@ mod tests {
         assert!(
             find_line(&buf, EMPTY_HINT).is_none(),
             "loading is not the empty state"
+        );
+    }
+
+    #[test]
+    fn keeps_selection_in_viewport() {
+        // A list far taller than the 24-row screen: selecting the last row must
+        // scroll it into view (and the first row out).
+        let rows: Vec<Row> = (0..40)
+            .map(|n| row("session-tui", &format!("ra-{n:02}"), 1, "task"))
+            .collect();
+        let mut app = app_with(rows, vec![]);
+        for _ in 0..39 {
+            app.reduce(Msg::SelectNext); // selection -> last row (ra-39)
+        }
+        let buf = render(&app, at(1000));
+
+        let sel_y = find_line(&buf, "ra-39").expect("selected last row is on screen");
+        assert!(
+            buf.cell((2, sel_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "the scrolled-to selection is highlighted"
+        );
+        assert!(
+            find_line(&buf, "ra-00").is_none(),
+            "the first row has scrolled off the top"
+        );
+    }
+
+    #[test]
+    fn scroll_offset_keeps_selection_visible() {
+        // Fits above the fold: no scroll.
+        assert_eq!(scroll_offset(Some(3), 10, 40), 0);
+        assert_eq!(scroll_offset(None, 10, 40), 0);
+        // Short list (fits entirely): never scroll.
+        assert_eq!(scroll_offset(Some(5), 10, 8), 0);
+        // Past the fold: anchor selection to the last visible row.
+        assert_eq!(scroll_offset(Some(10), 10, 40), 1);
+        assert_eq!(scroll_offset(Some(39), 10, 40), 30);
+    }
+
+    #[test]
+    fn failed_initial_refresh_shows_hint_not_loading() {
+        // The first refresh fails (no snapshot): the App stays in `Loading` with
+        // `stale` cleared. The list must not show a permanent spinner.
+        let mut app = App::new();
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: None,
+            warnings: vec!["hub sync failed".into()],
+        });
+        let buf = render(&app, at(1000));
+
+        assert!(
+            find_line(&buf, "Loading…").is_none(),
+            "a concluded (failed) refresh is not still 'Loading…'"
+        );
+        assert!(
+            find_line(&buf, EMPTY_HINT).is_some(),
+            "the empty hint is shown instead"
+        );
+        assert!(
+            line_text(&buf, H - 1).contains("1 repo failed (see doctor)"),
+            "the failure is surfaced in the status bar"
         );
     }
 
