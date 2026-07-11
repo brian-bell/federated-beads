@@ -25,17 +25,20 @@ use crate::cli::sanitize;
 /// and safe when pasted: a repo path containing a space would otherwise break
 /// `cd`, and a shell metacharacter (`;`, `$()`, quotes) in a path or id would
 /// otherwise execute. The id is additionally [`sanitize`]d (it is bd-sourced).
+///
+/// A repo path that is not valid UTF-8 (Unix paths may hold arbitrary bytes)
+/// cannot be represented in the command string without a lossy substitution that
+/// would `cd` to the wrong directory, so it falls back to the always-runnable hub
+/// form rather than emit a subtly-wrong command.
 pub fn shell_command(repo: Option<&Path>, hub: &Path, id: &str) -> String {
     let id = shell_quote(&sanitize(id));
-    match repo {
-        Some(repo) => format!("cd {} && bd show {}", quote_path(repo), id),
-        None => format!("bd -C {} show {}", quote_path(hub), id),
+    match repo.and_then(Path::to_str) {
+        Some(repo) => format!("cd {} && bd show {}", shell_quote(repo), id),
+        // No repo (unattributed) or a non-UTF-8 repo path: the hub form. The hub
+        // path is fbd-owned under the XDG data dir; `to_string_lossy` is the last
+        // resort if even it is non-UTF-8, where no faithful representation exists.
+        None => format!("bd -C {} show {}", shell_quote(&hub.to_string_lossy()), id),
     }
-}
-
-/// Shell-quote a filesystem path for interpolation into a command.
-fn quote_path(p: &Path) -> String {
-    shell_quote(&p.to_string_lossy())
 }
 
 /// POSIX shell-quote `s` so it interpolates as a single, literal argument. A word
@@ -213,6 +216,21 @@ mod tests {
         // An embedded single quote is closed-escaped-reopened, not left dangling.
         let q = shell_command(Some(Path::new("/tmp/it's")), Path::new("/h"), "mc-1");
         assert!(q.contains(r"'/tmp/it'\''s'"), "single quote escaped: {q:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_repo_path_falls_back_to_hub() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // A repo path with invalid UTF-8 bytes cannot be a faithful command
+        // string; the hub form is emitted instead of a lossy, wrong `cd`.
+        let bad = std::path::PathBuf::from(OsStr::from_bytes(b"/tmp/\xff\xferepo"));
+        let cmd = shell_command(Some(&bad), Path::new("/data/hub"), "mc-1");
+        assert_eq!(
+            cmd, "bd -C /data/hub show mc-1",
+            "a non-UTF-8 repo path degrades to the always-runnable hub form"
+        );
     }
 
     #[test]

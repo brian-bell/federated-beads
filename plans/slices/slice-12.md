@@ -225,4 +225,12 @@ Round 3 (codex, gpt-5.6-sol) — two findings, both accepted and fixed:
 New tests: `markdown_preserves_multiline_description`, and
 `copy_in_detail_uses_pinned_issue_after_refresh` extended to assert attribution.
 
-Round 4: clean (no accepted/actionable findings).
+Round 4 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
+
+7. **[P2] Non-UTF-8 repo paths.** `to_string_lossy` on a repo path with invalid
+   UTF-8 bytes (which the bd adapter deliberately preserves elsewhere) would emit
+   a `cd` to a corrupted directory. `shell_command` now gates the `cd` form on
+   `Path::to_str` and falls back to the always-runnable hub form for a non-UTF-8
+   repo path. New test `non_utf8_repo_path_falls_back_to_hub`.
+
+Round 5: clean (no accepted/actionable findings).
