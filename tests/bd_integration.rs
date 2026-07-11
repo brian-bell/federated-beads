@@ -201,6 +201,56 @@ fn refresh_two_repos() {
 }
 
 #[test]
+fn refresh_attributes_hyphenated_repo() {
+    // Regression for dxh.17: a repo whose real id prefix contains a hyphen
+    // (`ready-fix`) is stored by bd with an underscore-sanitized dolt_database
+    // (`ready_fix`). Attribution must key off the real id prefix, not the
+    // sanitized DB name, so its ids don't fall into the unknown bucket.
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("reading-lite");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    build_ready_fixture_repo_with_prefix(&repo, "ready-fix");
+
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        repos: vec![RepoEntry { path: repo.clone() }],
+    };
+
+    ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
+    let outcome = refresh::run(&BdCli::new(), &roster, &paths).expect("refresh runs");
+    assert!(
+        outcome.errors.is_empty(),
+        "the repo is healthy, so no per-repo errors: {:?}",
+        outcome.errors
+    );
+    assert!(
+        outcome.prefix_map.collisions().is_empty(),
+        "single repo, so no collisions: {:?}",
+        outcome.prefix_map.collisions()
+    );
+
+    let hub = hub_dir(&paths);
+    let ready = BdCli::new().ready(&hub).expect("bd ready on hub");
+    let id = ready
+        .iter()
+        .find(|i| i.id.starts_with("ready-fix-"))
+        .map(|i| i.id.clone())
+        .expect("a hyphenated ready-fix- id is ready in the hub");
+
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+    assert_eq!(
+        outcome.prefix_map.repo_for(&id).map(|r| canon(&r.path)),
+        Some(canon(&repo)),
+        "a hyphenated id attributes to its repo, not the unknown bucket"
+    );
+}
+
+#[test]
 fn snapshot_command_end_to_end() {
     if !bd_available() {
         eprintln!("SKIP: bd not installed");
