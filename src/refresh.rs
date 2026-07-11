@@ -291,11 +291,16 @@ struct IssueLine {
 /// bd keeps `-` in ids but sanitizes `-`→`_` for the Dolt database name (Dolt
 /// disallows hyphens), so `dolt_database` alone is a lossy, hyphen-erased form
 /// that misattributes hyphenated repos. The exact, verified invariant is
-/// `id_prefix.replace('-', "_") == dolt_database`, so we take the first exported
-/// id whose derived prefix satisfies it — guaranteeing we return this repo's own
-/// prefix and never a foreign hydrated id's. When no id validates (an empty repo
-/// or a missing `issues.jsonl`), fall back to `dolt_database`: such a repo has no
-/// ids of its own in the hub, so its prefix is never queried anyway.
+/// `id_prefix.replace('-', "_") == dolt_database`.
+///
+/// That sanitization is many-to-one (`a_b-c` and `a-b_c` both map to `a_b_c`),
+/// so a foreign hydrated id could validate against this repo's `dolt_database`
+/// too. Rather than trust the *first* validating id (order-dependent, and it
+/// could be that foreign id), we return the *most frequent* validating prefix:
+/// the repo's own issues always dominate its export, so a stray foreign id of a
+/// same-sanitizing prefix cannot flip the result. When no id validates (an empty
+/// repo or a missing `issues.jsonl`), fall back to `dolt_database`: such a repo
+/// has no ids of its own in the hub, so its prefix is never queried anyway.
 ///
 /// `metadata.json` remains required (a missing or unparseable one is an error),
 /// preserving the attribution contract.
@@ -310,14 +315,18 @@ pub fn read_prefix(repo: &Path) -> Result<String, String> {
     Ok(derive_prefix_from_ids(repo, &meta.dolt_database).unwrap_or(meta.dolt_database))
 }
 
-/// Scan `<repo>/.beads/issues.jsonl` for the first issue id whose derived prefix
-/// matches `dolt_database` under bd's `-`→`_` sanitization, returning that
-/// (hyphen-preserving) prefix. `None` when the file is absent/unreadable or no id
-/// validates — the caller then falls back to `dolt_database`.
+/// Return the most frequent prefix among `<repo>/.beads/issues.jsonl`'s issue
+/// ids whose derived prefix matches `dolt_database` under bd's `-`→`_`
+/// sanitization. `None` when the file is absent/unreadable or no id validates —
+/// the caller then falls back to `dolt_database`. Ties (astronomically rare —
+/// two same-sanitizing prefixes with equal counts) break by first appearance,
+/// keeping the result deterministic.
 fn derive_prefix_from_ids(repo: &Path, dolt_database: &str) -> Option<String> {
     let file = File::open(repo.join(".beads").join("issues.jsonl")).ok()?;
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
+        let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
@@ -328,14 +337,23 @@ fn derive_prefix_from_ids(repo: &Path, dolt_database: &str) -> Option<String> {
             continue;
         }
         // Ids are `<prefix>-<hash>`; the prefix may itself contain `-`, so split
-        // on the last one. Accept only this repo's own prefix (validated below).
-        if let Some((prefix, _)) = record.id.as_deref().and_then(|id| id.rsplit_once('-'))
-            && prefix.replace('-', "_") == dolt_database
-        {
-            return Some(prefix.to_string());
+        // on the last one. Only this repo's own prefix sanitizes to dolt_database.
+        let Some((prefix, _)) = record.id.as_deref().and_then(|id| id.rsplit_once('-')) else {
+            continue;
+        };
+        if prefix.replace('-', "_") != dolt_database {
+            continue;
         }
+        if !counts.contains_key(prefix) {
+            order.push(prefix.to_string());
+        }
+        *counts.entry(prefix.to_string()).or_default() += 1;
     }
-    None
+    // Reduce keeps the earlier prefix on ties (only switches on strictly greater),
+    // so first-seen order is the deterministic tie-break.
+    order
+        .into_iter()
+        .reduce(|best, p| if counts[&p] > counts[&best] { p } else { best })
 }
 
 #[cfg(test)]
@@ -679,6 +697,33 @@ mod tests {
         let only_foreign =
             seed_repo_with_ids(tmp.path(), "r2", "reading_lite", &["other-thing-xyz"]);
         assert_eq!(read_prefix(&only_foreign).unwrap(), "reading_lite");
+    }
+
+    #[test]
+    fn read_prefix_disambiguates_same_sanitizing_prefixes_by_frequency() {
+        // bd's `-`→`_` DB sanitization is many-to-one: `a_b-c` and `a-b_c` both
+        // sanitize to `a_b_c`, so a foreign hydrated id can validate against this
+        // repo's dolt_database. The repo's own issues dominate its export, so the
+        // most-frequent validating prefix wins — regardless of file order, and
+        // even when the foreign id appears first.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo_with_ids(
+            tmp.path(),
+            "r",
+            "a_b_c",
+            &[
+                "a-b_c-foreign", // a foreign hydrated id, same sanitized form, first
+                "a_b-c-1",       // this repo's own ids (majority)
+                "a_b-c-2",
+                "a_b-c-3",
+            ],
+        );
+
+        assert_eq!(
+            read_prefix(&repo).unwrap(),
+            "a_b-c",
+            "the repo's own (majority) prefix wins over a same-sanitizing foreign id"
+        );
     }
 
     #[test]
