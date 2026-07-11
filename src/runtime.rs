@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -26,7 +26,7 @@ use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ensure_hub, hub_dir};
 use crate::refresh::{self, RefreshError};
-use crate::snapshot::{self, Snapshot};
+use crate::snapshot::{self, Row, Snapshot};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -37,6 +37,29 @@ const INPUT_POLL: Duration = Duration::from_millis(100);
 const TICK: Duration = Duration::from_secs(1);
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+/// What the UI thread consumes from its one channel: a **raw** key event from the
+/// input thread, or an app [`Msg`] from a background worker.
+///
+/// Keys arrive raw (not pre-decoded) so [`keys::map_key`] runs on the UI thread
+/// against the app's *live* search-input focus. Because the channel preserves
+/// order, a `/` that opens the search editor is reduced before the next key is
+/// decoded — so a pasted `/query` burst can never decode `query`'s characters as
+/// commands (e.g. `q` quitting) the way a producer-thread decoder racing an
+/// asynchronously-published mode flag could.
+#[derive(Debug)]
+pub(crate) enum Incoming {
+    /// A raw key press/repeat, decoded on the UI thread against live app state.
+    Key(KeyEvent),
+    /// An app message from a background worker (refresh / detail / search).
+    Msg(Msg),
+}
+
+impl From<Msg> for Incoming {
+    fn from(msg: Msg) -> Self {
+        Incoming::Msg(msg)
+    }
+}
 
 /// Launch the interactive TUI (bare `fbd`). Sets up the terminal, runs the event
 /// loop against `roster`, and always restores the terminal before returning —
@@ -54,7 +77,7 @@ pub fn run(paths: &Paths, roster: Config) -> Result<(), CliError> {
 /// The UI thread: spawn the input + initial-refresh producers, then consume
 /// messages, reduce, execute effects, and redraw until the app is done.
 fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), CliError> {
-    let (tx, rx) = mpsc::channel::<Msg>();
+    let (tx, rx) = mpsc::channel::<Incoming>();
     let stop = Arc::new(AtomicBool::new(false));
 
     let input_handle = {
@@ -99,8 +122,8 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
 /// whether this returns `Ok` (a `q` quit) or `Err` (a terminal draw failure).
 fn ui_loop(
     terminal: &mut Tui,
-    rx: &Receiver<Msg>,
-    tx: &Sender<Msg>,
+    rx: &Receiver<Incoming>,
+    tx: &Sender<Incoming>,
     app: &mut App,
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
@@ -112,12 +135,21 @@ fn ui_loop(
     // the caller still holds `tx`, but is handled defensively as a clean exit.
     loop {
         match rx.recv_timeout(TICK) {
-            Ok(msg) => {
-                for effect in app.reduce(msg) {
-                    execute_effect(effect, tx, worker_handles, paths, roster);
-                }
-                if app.is_done() {
-                    return Ok(());
+            Ok(incoming) => {
+                // Decode a raw key against the app's *current* search focus (so a
+                // pasted `/query` burst can't run `query` as commands); worker
+                // messages pass through. An unmapped key yields no message.
+                let msg = match incoming {
+                    Incoming::Key(key) => keys::map_key(key, app.search_editing()),
+                    Incoming::Msg(msg) => Some(msg),
+                };
+                if let Some(msg) = msg {
+                    for effect in app.reduce(msg) {
+                        execute_effect(effect, tx, worker_handles, paths, roster);
+                    }
+                    if app.is_done() {
+                        return Ok(());
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -133,7 +165,7 @@ fn ui_loop(
 /// to [`ui_loop`]. Finished handles are pruned first so the vec stays bounded.
 fn execute_effect(
     effect: Effect,
-    tx: &Sender<Msg>,
+    tx: &Sender<Incoming>,
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
     roster: &Config,
@@ -142,6 +174,7 @@ fn execute_effect(
     let handle = match effect {
         Effect::Refresh => spawn_refresh(tx, paths, roster),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
+        Effect::Search { query, token } => spawn_search(tx, paths, roster, query, token),
     };
     worker_handles.push(handle);
 }
@@ -157,7 +190,7 @@ fn draw(terminal: &mut Tui, app: &App) -> Result<(), CliError> {
 /// Spawn a background refresh worker that reports over `tx`, returning its join
 /// handle so the event loop can wait for it on shutdown. Clones the roster and
 /// paths into the thread and builds a fresh [`BdCli`] (stateless).
-fn spawn_refresh(tx: &Sender<Msg>, paths: &Paths, roster: &Config) -> thread::JoinHandle<()> {
+fn spawn_refresh(tx: &Sender<Incoming>, paths: &Paths, roster: &Config) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
@@ -167,16 +200,26 @@ fn spawn_refresh(tx: &Sender<Msg>, paths: &Paths, roster: &Config) -> thread::Jo
 /// The refresh worker body: announce the start, run the pipeline, then send
 /// exactly one atomic completion. Owned args so it moves cleanly into a thread;
 /// unit-tested directly with a [`crate::bd::FakeBdClient`] and a channel.
-pub(crate) fn refresh_worker(bd: impl BdClient, roster: Config, paths: Paths, tx: Sender<Msg>) {
-    let _ = tx.send(Msg::RefreshStarted);
+pub(crate) fn refresh_worker(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    tx: Sender<Incoming>,
+) {
+    let _ = tx.send(Msg::RefreshStarted.into());
     let (snapshot, warnings) = gather_snapshot(&bd, &roster, &paths);
-    let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings });
+    let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings }.into());
 }
 
 /// Spawn a background detail worker that reports over `tx`, returning its join
 /// handle so the event loop can wait for it on shutdown. Clones the paths into
 /// the thread and builds a fresh [`BdCli`] (stateless).
-fn spawn_detail(tx: &Sender<Msg>, paths: &Paths, id: String, token: u64) -> thread::JoinHandle<()> {
+fn spawn_detail(
+    tx: &Sender<Incoming>,
+    paths: &Paths,
+    id: String,
+    token: u64,
+) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     thread::spawn(move || detail_worker(BdCli::new(), paths, id, token, tx))
@@ -191,10 +234,10 @@ pub(crate) fn detail_worker(
     paths: Paths,
     id: String,
     token: u64,
-    tx: Sender<Msg>,
+    tx: Sender<Incoming>,
 ) {
     let detail = gather_detail(&bd, &paths, &id).map(Box::new);
-    let _ = tx.send(Msg::DetailReady { token, detail });
+    let _ = tx.send(Msg::DetailReady { token, detail }.into());
 }
 
 /// Run `bd show <id> --json` against the hub, mapping a [`BdError`] to a
@@ -208,6 +251,59 @@ pub(crate) fn gather_detail(
 ) -> Result<IssueDetail, String> {
     bd.show(&hub_dir(paths), id)
         .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
+}
+
+/// Spawn a background search worker that reports over `tx`, returning its join
+/// handle so the event loop can wait for it on shutdown. Clones the roster and
+/// paths into the thread and builds a fresh [`BdCli`] (stateless).
+fn spawn_search(
+    tx: &Sender<Incoming>,
+    paths: &Paths,
+    roster: &Config,
+    query: String,
+    token: u64,
+) -> thread::JoinHandle<()> {
+    let tx = tx.clone();
+    let paths = paths.clone();
+    let roster = roster.clone();
+    thread::spawn(move || search_worker(BdCli::new(), roster, paths, query, token, tx))
+}
+
+/// The search worker body: run the query, attribute the results, and send exactly
+/// one [`Msg::SearchResults`] echoing `token` (so a superseded response can be
+/// dropped). Owned args so it moves cleanly into a thread; unit-tested directly
+/// with a [`crate::bd::FakeBdClient`] and a channel.
+pub(crate) fn search_worker(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    query: String,
+    token: u64,
+    tx: Sender<Incoming>,
+) {
+    let rows = gather_search(&bd, &roster, &paths, &query);
+    let _ = tx.send(Msg::SearchResults { token, rows }.into());
+}
+
+/// Run `bd search <query> --json` against the hub and attribute the results
+/// through the **same** [`snapshot::attribute`] path as ready rows, so search rows
+/// carry `repo_name` identically. The prefix map is rebuilt from the roster via
+/// [`refresh::attribution_map`] (its per-repo prefix-read failures are non-fatal —
+/// those ids fall to the `unknown` bucket). A `bd search` failure maps to a
+/// [`sanitize`]d message. No version gate / `ensure_hub`: search is reachable only
+/// from the list, i.e. after a snapshot already hydrated the hub.
+pub(crate) fn gather_search(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    query: &str,
+) -> Result<Vec<Row>, String> {
+    let hub = hub_dir(paths);
+    let issues = bd
+        .search(&hub, query)
+        .map_err(|e| sanitize(&format!("search failed: {e}")))?;
+    let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
+    Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
 /// Run `ensure_hub → refresh → fetch` and return the fresh snapshot (or `None`
@@ -284,31 +380,30 @@ pub(crate) fn gather_snapshot(
     }
 }
 
-/// The crossterm event producer: map key presses to [`Msg`]s until told to stop.
-/// Polls with a timeout so the stop flag is observed even while idle. On a
-/// terminal read/poll failure it sends `Quit` before exiting, so the UI thread —
-/// which holds its own sender and would otherwise block on `recv` forever with no
-/// producer left — always has a path to a clean shutdown.
-fn input_thread(tx: &Sender<Msg>, stop: &AtomicBool) {
+/// The crossterm event producer: forward **raw** key presses until told to stop
+/// (the UI thread decodes them against live app state). Polls with a timeout so
+/// the stop flag is observed even while idle. On a terminal read/poll failure it
+/// sends `Quit` before exiting, so the UI thread — which holds its own sender and
+/// would otherwise block on `recv` forever with no producer left — always has a
+/// path to a clean shutdown.
+fn input_thread(tx: &Sender<Incoming>, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         match event::poll(INPUT_POLL) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
-                    if let Some(msg) = keys::map_key(key)
-                        && tx.send(msg).is_err()
-                    {
+                    if tx.send(Incoming::Key(key)).is_err() {
                         return; // UI thread gone.
                     }
                 }
                 Ok(_) => {} // non-key event (resize, mouse): ignored
                 Err(_) => {
-                    let _ = tx.send(Msg::Quit); // can't read input: quit cleanly
+                    let _ = tx.send(Msg::Quit.into()); // can't read input: quit cleanly
                     return;
                 }
             },
             Ok(false) => {} // timeout: loop and re-check the stop flag
             Err(_) => {
-                let _ = tx.send(Msg::Quit);
+                let _ = tx.send(Msg::Quit.into());
                 return;
             }
         }
@@ -369,6 +464,15 @@ mod tests {
     use crate::refresh::HubLock;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Receive the next app message a worker sent, unwrapping the [`Incoming`]
+    /// channel envelope (workers only ever send `Incoming::Msg`).
+    fn recv_msg(rx: &Receiver<Incoming>) -> Msg {
+        match rx.recv().expect("a worker message") {
+            Incoming::Msg(msg) => msg,
+            Incoming::Key(key) => panic!("workers never send keys, got {key:?}"),
+        }
+    }
 
     fn issue(id: &str, priority: i64, title: &str) -> Issue {
         Issue {
@@ -432,8 +536,8 @@ mod tests {
         let handle = thread::spawn(move || refresh_worker(bd, roster(&[&ra]), paths, tx));
 
         // Exactly: RefreshStarted, then one RefreshCompleted carrying the rows.
-        assert_eq!(rx.recv().unwrap(), Msg::RefreshStarted);
-        match rx.recv().unwrap() {
+        assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
+        match recv_msg(&rx) {
             Msg::RefreshCompleted { snapshot, .. } => {
                 let snap = snapshot.expect("a snapshot on success");
                 assert!(
@@ -514,7 +618,7 @@ mod tests {
 
         let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 7, tx));
 
-        match rx.recv().unwrap() {
+        match recv_msg(&rx) {
             Msg::DetailReady { token, detail } => {
                 assert_eq!(token, 7, "the request token is echoed back");
                 let d = detail.expect("a detail on success");
@@ -537,7 +641,7 @@ mod tests {
 
         let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 1, tx));
 
-        match rx.recv().unwrap() {
+        match recv_msg(&rx) {
             Msg::DetailReady { token, detail } => {
                 assert_eq!(token, 1);
                 let msg = detail.expect_err("a message on failure");
@@ -549,6 +653,100 @@ mod tests {
             other => panic!("expected DetailReady, got {other:?}"),
         }
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_sends_results_for_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_search(vec![issue("ra-1", 1, "Found one")]);
+        let (tx, rx) = mpsc::channel();
+
+        let handle =
+            thread::spawn(move || search_worker(bd, roster(&[&ra]), paths, "foo".into(), 7, tx));
+
+        match recv_msg(&rx) {
+            Msg::SearchResults { token, rows } => {
+                assert_eq!(token, 7, "the request token is echoed back");
+                let rows = rows.expect("results on success");
+                let found = rows
+                    .iter()
+                    .find(|r| r.issue.id == "ra-1")
+                    .expect("row present");
+                assert_eq!(
+                    found.repo_name, "ra",
+                    "results are attributed via the roster prefix map"
+                );
+            }
+            other => panic!("expected SearchResults, got {other:?}"),
+        }
+        // The worker's tx drops on return: exactly one message, then closed.
+        assert!(rx.recv().is_err(), "exactly one SearchResults, then closed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_maps_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_search_err(bd_err());
+        let (tx, rx) = mpsc::channel();
+
+        let handle =
+            thread::spawn(move || search_worker(bd, roster(&[&ra]), paths, "foo".into(), 3, tx));
+
+        match recv_msg(&rx) {
+            Msg::SearchResults { token, rows } => {
+                assert_eq!(token, 3);
+                let msg = rows.expect_err("a message on failure");
+                assert!(
+                    msg.to_lowercase().contains("search failed") || msg.contains("boom"),
+                    "the failure is surfaced: {msg}"
+                );
+            }
+            other => panic!("expected SearchResults, got {other:?}"),
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pasted_query_keys_never_run_commands() {
+        // Regression for the autoreview finding: a pasted `/qk` burst must open
+        // search and type "qk" — never quit on `q` or move the list on `k`.
+        // Decoding each raw key against the app's *live* focus (as `ui_loop`
+        // does) guarantees this; a producer-side decoder reading an
+        // asynchronously-published mode flag could map `q` to Quit before the
+        // `/` was reduced. Here we drive the exact decode-then-reduce seam.
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut app = App::new();
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(Snapshot {
+                rows: Vec::new(),
+                fetched_at: SystemTime::now(),
+            }),
+            warnings: Vec::new(),
+        });
+
+        for code in [KeyCode::Char('/'), KeyCode::Char('q'), KeyCode::Char('k')] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            // Mirror the UI loop: decode against the current focus, then reduce.
+            if let Some(msg) = keys::map_key(key, app.search_editing()) {
+                app.reduce(msg);
+            }
+        }
+
+        assert!(
+            !app.is_done(),
+            "the pasted 'q' typed into the query, not quit"
+        );
+        assert_eq!(
+            app.search_query(),
+            Some("qk"),
+            "the whole burst after '/' became the query text"
+        );
     }
 
     #[test]

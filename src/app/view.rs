@@ -18,7 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{App, DetailState, ViewMode};
+use super::{App, DetailState, Row, SearchPhase, ViewMode};
 use crate::bd::{Dependency, IssueDetail};
 use crate::cli::{format_row_body, sanitize};
 
@@ -31,12 +31,25 @@ const EMPTY_HINT: &str = "no repos configured — run: fbd repos discover ~/dev"
 const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p to change";
 
 /// One-line key hints for the list view. Only keys that act are advertised, so
-/// the UI never promises an inert command; `/` search (Slice 11) stays omitted
-/// until it does something. `enter detail` is live as of Slice 10.
-const LIST_HINTS: &str = "fbd · q quit · r refresh · f repo · p prio · j/k move · enter detail";
+/// the UI never promises an inert command; `enter detail` is live as of Slice 10
+/// and `/ search` as of Slice 11.
+const LIST_HINTS: &str =
+    "fbd · q quit · r refresh · / search · f repo · p prio · j/k move · enter detail";
 
 /// One-line key hints for the detail pane: the keys that act there.
 const DETAIL_HINTS: &str = "fbd · esc back · q quit";
+
+/// One-line key hints while editing the search query: the keys that act there.
+const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc cancel";
+
+/// One-line key hints while browsing search results: the keys that act there
+/// (`f`/`p` filter the results the same as the ready list).
+const SEARCH_RESULTS_HINTS: &str =
+    "fbd search · j/k move · f repo · p prio · enter open · esc edit · q quit";
+
+/// One-line key hints while a search is pending or failed: only these act there
+/// (navigation and detail-open are inert until results arrive).
+const SEARCH_WAIT_HINTS: &str = "fbd search · esc edit · q quit";
 
 /// Render the whole screen for the current [`App`] state and clock `now`: a title
 /// hint row, the mode-specific content (ready list or list+detail split), and the
@@ -51,16 +64,23 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
         ])
         .split(frame.area());
 
-    let hints = if app.view_mode() == ViewMode::Detail {
-        DETAIL_HINTS
-    } else {
-        LIST_HINTS
+    let hints = match app.view_mode() {
+        ViewMode::Detail => DETAIL_HINTS,
+        // Match the hint to the phase's real key routing: editing keys type the
+        // query and Enter runs it; results enable j/k + Enter (open) + Esc (edit);
+        // while loading or after an error only Esc (edit) and q act.
+        ViewMode::Search => match app.search_phase() {
+            Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
+            Some(SearchPhase::Results) => SEARCH_RESULTS_HINTS,
+            _ => SEARCH_WAIT_HINTS,
+        },
+        ViewMode::List | ViewMode::Loading => LIST_HINTS,
     };
     frame.render_widget(Paragraph::new(hints), chunks[0]);
-    if app.view_mode() == ViewMode::Detail {
-        draw_detail_split(frame, app, chunks[1]);
-    } else {
-        draw_list(frame, app, chunks[1]);
+    match app.view_mode() {
+        ViewMode::Detail => draw_detail_split(frame, app, chunks[1]),
+        ViewMode::Search => draw_search(frame, app, chunks[1]),
+        ViewMode::List | ViewMode::Loading => draw_list(frame, app, chunks[1]),
     }
     frame.render_widget(Paragraph::new(status_line(app, now)), chunks[2]);
 }
@@ -196,9 +216,76 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    draw_rows(frame, &rows, app.selection(), area);
+}
+
+/// Render the cross-repo search screen: a query input line, a status/count line,
+/// and the attributed results (through the same grouped row renderer as the ready
+/// list). The results list, its selection, and its filters are the app's active
+/// [`super::RowList`], so `draw_rows` and every read accessor behave identically
+/// to the ready view.
+fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // query input
+            Constraint::Length(1), // status / result count
+            Constraint::Min(0),    // results
+        ])
+        .split(area);
+
+    let query = sanitize(app.search_query().unwrap_or(""));
+    let editing = app.search_editing();
+    // A block cursor while editing so the input reads as focused.
+    let input = if editing {
+        format!("search: {query}\u{2588}")
+    } else {
+        format!("search: {query}")
+    };
+    frame.render_widget(Paragraph::new(input), parts[0]);
+
+    let count = app.search_result_count();
+    let status = match app.search_phase() {
+        Some(SearchPhase::Editing) => "type a query · enter to search · esc to cancel".to_string(),
+        Some(SearchPhase::Loading) => format!("searching for \"{query}\"…"),
+        Some(SearchPhase::Results) => format!(
+            "{count} result{} for \"{query}\"",
+            if count == 1 { "" } else { "s" }
+        ),
+        // The worker already prefixes ("search failed: …") and the boundary
+        // re-sanitizes; don't prefix again (was "search failed: search failed: …").
+        Some(SearchPhase::Error(msg)) => sanitize(msg),
+        None => String::new(),
+    };
+    frame.render_widget(Paragraph::new(status), parts[1]);
+
+    // Draw the results only in the `Results` phase. The list is retained
+    // internally across `Esc`→edit and a re-submit (so returning from a detail
+    // re-shows it), but must not linger under a new query being edited or loaded —
+    // that would misattribute a prior query's hits to the current one. (Empty is
+    // fine — the count line already says "0 results"; no ready-list "no repos"
+    // hint here, which would misdirect.)
+    if matches!(app.search_phase(), Some(SearchPhase::Results)) {
+        let rows = app.filtered_rows();
+        if !rows.is_empty() {
+            draw_rows(frame, &rows, app.selection(), parts[2]);
+        } else if app.search_result_count() > 0 {
+            // Results exist but the active repo/priority filter hides them all —
+            // explain the filter (and how to clear it) instead of a blank pane.
+            frame.render_widget(Paragraph::new(NO_MATCH_HINT), parts[2]);
+        }
+        // else: the query genuinely returned nothing; the count line says so.
+    }
+}
+
+/// Render a grouped, selectable, scrolling row list into `area`: a `▸ <repo>`
+/// header whenever the repo changes, `P<pri> <id> <title>` rows in the list's flat
+/// (selection) order, the selected row highlighted, and a sticky repo header when
+/// the viewport scrolls. Shared by the ready list and the search results so the
+/// two render identically.
+fn draw_rows(frame: &mut Frame, rows: &[&Row], selection: Option<usize>, area: Rect) {
     let header_style = Style::default().add_modifier(Modifier::BOLD);
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-    let selection = app.selection();
 
     // Render rows in the App's flat order (the selection space) and emit a repo
     // header whenever the repo changes, so the on-screen order matches the
@@ -894,12 +981,185 @@ mod tests {
             list_title.contains("enter"),
             "list advertises enter: {list_title:?}"
         );
+        assert!(
+            list_title.contains("/ search"),
+            "list advertises the search key: {list_title:?}"
+        );
 
         let detail = app_in_detail("ra-1", None);
         let detail_title = line_text(&render_sized(&detail, at(1000), w, h), 0);
         assert!(
             detail_title.contains("esc"),
             "detail advertises esc: {detail_title:?}"
+        );
+    }
+
+    // ---- Cross-repo search (Slice 11) ----
+
+    /// An app in `Search`+`Results` for `query`, holding `rows` (attributed),
+    /// driven through the real reduce path (OpenSearch → type → SubmitSearch →
+    /// SearchResults).
+    fn app_in_search(query: &str, rows: Vec<Row>) -> App {
+        let mut app = app_with(vec![row("ra", "ra-1", 1, "ready")], vec![]);
+        app.reduce(Msg::OpenSearch);
+        for c in query.chars() {
+            app.reduce(Msg::SearchInput(c));
+        }
+        let token = match app.reduce(Msg::SubmitSearch).as_slice() {
+            [crate::app::Effect::Search { token, .. }] => *token,
+            other => panic!("expected one Search effect, got {other:?}"),
+        };
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(rows),
+        });
+        app
+    }
+
+    #[test]
+    fn renders_search_input_and_result_count() {
+        let rows: Vec<Row> = (0..12)
+            .map(|n| row("megaclock", &format!("mc-{n:02}"), 1, "a hit"))
+            .collect();
+        let app = app_in_search("foo", rows);
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        assert!(
+            find_at(&buf, "foo", w, h).is_some(),
+            "the query appears on the input line"
+        );
+        assert!(
+            find_at(&buf, "12 results for \"foo\"", w, h).is_some(),
+            "the result count line is shown"
+        );
+        // A result row renders through the shared grouped renderer.
+        assert!(
+            find_at(&buf, "mc-00", w, h).is_some(),
+            "a result row's id is rendered"
+        );
+        assert!(
+            find_at(&buf, "▸ megaclock", w, h).is_some(),
+            "results carry their repo header (shared row renderer)"
+        );
+    }
+
+    #[test]
+    fn renders_search_editing_and_empty() {
+        // Editing: the input line shows the query with a cursor and a hint.
+        let mut app = app_with(vec![row("ra", "ra-1", 1, "ready")], vec![]);
+        app.reduce(Msg::OpenSearch);
+        for c in "wip".chars() {
+            app.reduce(Msg::SearchInput(c));
+        }
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+        assert!(find_at(&buf, "wip", w, h).is_some(), "query while editing");
+        assert!(
+            find_at(&buf, "type a query", w, h).is_some(),
+            "an editing hint is shown"
+        );
+
+        // Zero results shows "0 results", not the ready-list "no repos" hint.
+        let empty = app_in_search("nope", vec![]);
+        let buf = render_sized(&empty, at(1000), w, h);
+        assert!(
+            find_at(&buf, "0 results for \"nope\"", w, h).is_some(),
+            "empty results are counted, not mistaken for an unconfigured roster"
+        );
+        assert!(
+            find_at(&buf, EMPTY_HINT, w, h).is_none(),
+            "the ready-list discover hint must not appear for an empty search"
+        );
+    }
+
+    #[test]
+    fn filtered_empty_search_shows_filter_hint() {
+        // A filter that hides every result must explain itself, not blank out.
+        let (w, h) = (80, 24);
+        let mut app = app_in_search("foo", vec![row("ra", "ra-1", 2, "low prio hit")]);
+        app.reduce(Msg::TogglePriorityFilter); // HighOnly hides the P2 result
+        let buf = render_sized(&app, at(1000), w, h);
+        assert!(
+            find_at(&buf, NO_MATCH_HINT, w, h).is_some(),
+            "filtered-empty search shows the filter hint, not a blank pane"
+        );
+        // The results-phase hint advertises the live filter keys.
+        let title = line_text(&buf, 0);
+        assert!(
+            title.contains("f repo"),
+            "results hint advertises f/p: {title:?}"
+        );
+    }
+
+    #[test]
+    fn editing_after_results_hides_stale_rows() {
+        // After results for one query, `Esc` to edit must not leave the old rows
+        // showing under the new (now empty) query.
+        let (w, h) = (80, 24);
+        let mut app = app_in_search("foo", vec![row("megaclock", "mc-1", 0, "old hit")]);
+        assert!(
+            find_at(&render_sized(&app, at(1000), w, h), "mc-1", w, h).is_some(),
+            "the result is visible in the Results phase"
+        );
+
+        app.reduce(Msg::Back); // Results -> Editing
+        assert_eq!(app.search_phase(), Some(&SearchPhase::Editing));
+        assert!(
+            find_at(&render_sized(&app, at(1000), w, h), "mc-1", w, h).is_none(),
+            "the prior query's results are hidden while editing a new query"
+        );
+    }
+
+    #[test]
+    fn search_hints_are_phase_aware_and_error_renders_once() {
+        let (w, h) = (80, 24);
+
+        // Editing: the title hint advertises the editing keys.
+        let mut editing = app_with(vec![row("ra", "ra-1", 1, "ready")], vec![]);
+        editing.reduce(Msg::OpenSearch);
+        let title = line_text(&render_sized(&editing, at(1000), w, h), 0);
+        assert!(title.contains("type query"), "editing hint: {title:?}");
+
+        // Results: the hint advertises navigation, not the inert "type query".
+        let results = app_in_search("foo", vec![row("ra", "ra-1", 1, "hit")]);
+        let title = line_text(&render_sized(&results, at(1000), w, h), 0);
+        assert!(title.contains("j/k move"), "results hint: {title:?}");
+        assert!(
+            !title.contains("type query"),
+            "results hint drops editing-only bindings: {title:?}"
+        );
+
+        // Error: the worker-prefixed message renders once, not double-prefixed.
+        let mut err = app_with(vec![row("ra", "ra-1", 1, "ready")], vec![]);
+        err.reduce(Msg::OpenSearch);
+        for c in "foo".chars() {
+            err.reduce(Msg::SearchInput(c));
+        }
+        let token = match err.reduce(Msg::SubmitSearch).as_slice() {
+            [crate::app::Effect::Search { token, .. }] => *token,
+            other => panic!("expected one Search effect, got {other:?}"),
+        };
+        err.reduce(Msg::SearchResults {
+            token,
+            rows: Err("search failed: boom".into()),
+        });
+        let buf = render_sized(&err, at(1000), w, h);
+        let once = (0..h).any(|y| {
+            let l: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
+            l.contains("search failed: boom") && !l.contains("search failed: search failed:")
+        });
+        assert!(once, "the error message renders once, not double-prefixed");
+
+        // Error phase: the title hint omits the inert nav/open keys.
+        let err_title = line_text(&buf, 0);
+        assert!(
+            !err_title.contains("j/k move"),
+            "error hint omits inert navigation: {err_title:?}"
+        );
+        assert!(
+            err_title.contains("esc edit"),
+            "error hint keeps the active esc: {err_title:?}"
         );
     }
 

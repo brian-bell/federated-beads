@@ -52,8 +52,14 @@ pub fn fetch(
     prefix_map: &PrefixMap,
     fetched_at: SystemTime,
 ) -> Result<Snapshot, BdError> {
-    let issues = bd.ready(hub)?;
+    Ok(attribute(bd.ready(hub)?, prefix_map, fetched_at))
+}
 
+/// The pure core of [`fetch`]: attribute a list of issues to their source repos
+/// via `prefix_map` and sort them for display. Shared with cross-repo search
+/// (Slice 11), whose worker feeds `bd search` results through this same path so
+/// search rows carry `repo_name` and sort exactly as ready rows do.
+pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemTime) -> Snapshot {
     // Attribute every issue to its source repo first (carrying the unique id
     // prefix), so a repo's display name can be made unique across the repos that
     // actually appear before it is stamped onto rows.
@@ -102,7 +108,7 @@ pub fn fetch(
             .then_with(|| a.issue.id.cmp(&b.issue.id))
     });
 
-    Ok(Snapshot { rows, fetched_at })
+    Snapshot { rows, fetched_at }
 }
 
 /// A path's final component as a string, falling back to the full path string
@@ -337,6 +343,37 @@ mod tests {
             "the issue is nested under the row and exposes its id"
         );
         assert!(json.get("fetched_at").is_some(), "fetch time is serialized");
+    }
+
+    #[test]
+    fn attribute_is_shared_by_fetch() {
+        // The pure `attribute` core produces the same rows/order/attribution
+        // `fetch` does, so cross-repo search (Slice 11) can reuse it directly.
+        let issues = vec![
+            issue("ra-2", 2, Some("2026-07-11T00:00:03Z")),
+            issue("rb-1", 0, Some("2026-07-11T00:00:02Z")),
+            issue("ra-1", 1, Some("2026-07-11T00:00:01Z")),
+        ];
+        let map = prefix_map(&[("ra", "/dev/repo-a"), ("rb", "/dev/repo-b")]);
+        let when = at(1_700_000_000);
+
+        // Direct call — no bd, purely from the issue list.
+        let direct = attribute(issues.clone(), &map, when);
+        // Via fetch (which reads the same issues from `bd ready`).
+        let bd = FakeBdClient::new().with_ready(issues);
+        let via_fetch = fetch(&bd, Path::new("/hub"), &map, when).expect("fetch ok");
+
+        assert_eq!(direct, via_fetch, "fetch delegates to attribute");
+        let order: Vec<&str> = direct.rows.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["rb-1", "ra-1", "ra-2"],
+            "priority-then-updated sort"
+        );
+        assert_eq!(
+            direct.rows[0].repo_name, "repo-b",
+            "attribution carried through"
+        );
     }
 
     #[test]
