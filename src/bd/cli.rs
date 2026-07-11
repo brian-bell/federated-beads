@@ -127,12 +127,16 @@ fn argv_repo_list(hub: &Path) -> Vec<OsString> {
 }
 
 fn argv_export(repo: &Path) -> Vec<OsString> {
+    // `-o` resolves relative to the `-C` dir, so a bare `.beads/issues.jsonl` is
+    // correct whether `repo` is absolute or relative — passing
+    // `<repo>/.beads/...` would double the path (`repo/repo/.beads/...`) when
+    // `repo` is relative.
     vec![
         "-C".into(),
         arg(repo),
         "export".into(),
         "-o".into(),
-        arg(&repo.join(".beads/issues.jsonl")),
+        ".beads/issues.jsonl".into(),
     ]
 }
 
@@ -141,7 +145,16 @@ fn argv_repo_sync(hub: &Path) -> Vec<OsString> {
 }
 
 fn argv_ready(hub: &Path) -> Vec<OsString> {
-    vec!["-C".into(), arg(hub), "ready".into(), "--json".into()]
+    // `--limit 0` = unlimited; bd's `ready` otherwise caps output at 100, which
+    // would silently truncate a large cross-repo hub.
+    vec![
+        "-C".into(),
+        arg(hub),
+        "ready".into(),
+        "--limit".into(),
+        "0".into(),
+        "--json".into(),
+    ]
 }
 
 fn argv_show(hub: &Path, id: &str) -> Vec<OsString> {
@@ -155,11 +168,15 @@ fn argv_show(hub: &Path, id: &str) -> Vec<OsString> {
 }
 
 fn argv_search(hub: &Path, query: &str) -> Vec<OsString> {
+    // `--query=<value>` keeps a flag-like query (e.g. `--help`) literal instead
+    // of letting bd parse it as an option; `--limit 0` avoids the default 50 cap.
     vec![
         "-C".into(),
         arg(hub),
         "search".into(),
-        query.into(),
+        format!("--query={query}").into(),
+        "--limit".into(),
+        "0".into(),
         "--json".into(),
     ]
 }
@@ -235,15 +252,10 @@ mod tests {
             os(&["-C", "/tmp/hub", "repo", "list", "--json"])
         );
 
+        // `-o` is relative to the `-C` dir, so it stays a bare `.beads/...`.
         assert_eq!(
             argv_export(Path::new("/tmp/ra")),
-            os(&[
-                "-C",
-                "/tmp/ra",
-                "export",
-                "-o",
-                "/tmp/ra/.beads/issues.jsonl"
-            ])
+            os(&["-C", "/tmp/ra", "export", "-o", ".beads/issues.jsonl"])
         );
 
         assert_eq!(
@@ -251,9 +263,10 @@ mod tests {
             os(&["-C", "/tmp/hub", "repo", "sync"])
         );
 
+        // `--limit 0` (unlimited) defeats bd's default 100-result cap.
         assert_eq!(
             argv_ready(Path::new("/tmp/hub")),
-            os(&["-C", "/tmp/hub", "ready", "--json"])
+            os(&["-C", "/tmp/hub", "ready", "--limit", "0", "--json"])
         );
 
         assert_eq!(
@@ -261,9 +274,24 @@ mod tests {
             os(&["-C", "/tmp/hub", "show", "ra-2hc", "--json"])
         );
 
+        // Flag-like queries stay literal via `--query=`; `--limit 0` = unlimited.
         assert_eq!(
             argv_search(Path::new("/tmp/hub"), "needle"),
-            os(&["-C", "/tmp/hub", "search", "needle", "--json"])
+            os(&[
+                "-C",
+                "/tmp/hub",
+                "search",
+                "--query=needle",
+                "--limit",
+                "0",
+                "--json"
+            ])
+        );
+
+        // A query that begins with `-` must not become a bd flag.
+        assert_eq!(
+            argv_search(Path::new("/tmp/hub"), "--help")[3],
+            OsString::from("--query=--help")
         );
     }
 
@@ -273,7 +301,7 @@ mod tests {
         let dir = Path::new("/tmp/my repos/rä");
         assert_eq!(
             argv_ready(dir),
-            os(&["-C", "/tmp/my repos/rä", "ready", "--json"])
+            os(&["-C", "/tmp/my repos/rä", "ready", "--limit", "0", "--json"])
         );
     }
 

@@ -73,11 +73,11 @@ Notes:
 | `init(dir, "ra")` | `["init", "--prefix", "ra"]` run with cwd = `dir` (bd rejects `-C` for init: it pre-checks for an existing project) |
 | `repo_add(hub, path)` | `["-C", hub, "repo", "add", path]` |
 | `repo_list(hub)` | `["-C", hub, "repo", "list", "--json"]` |
-| `export(repo)` | `["-C", repo, "export", "-o", repo/".beads/issues.jsonl"]` |
+| `export(repo)` | `["-C", repo, "export", "-o", ".beads/issues.jsonl"]` (relative to `-C`; avoids path doubling for relative `repo`) |
 | `repo_sync(hub)` | `["-C", hub, "repo", "sync"]` |
-| `ready(hub)` | `["-C", hub, "ready", "--json"]` |
+| `ready(hub)` | `["-C", hub, "ready", "--limit", "0", "--json"]` (bd caps `ready` at 100 by default; 0 = unlimited) |
 | `show(hub, id)` | `["-C", hub, "show", id, "--json"]` |
-| `search(hub, q)` | `["-C", hub, "search", q, "--json"]` |
+| `search(hub, q)` | `["-C", hub, "search", "--query=<q>", "--limit", "0", "--json"]` (`--query=` keeps flag-like `q` literal; bd caps `search` at 50 by default) |
 
 Design: each builder is a free/assoc fn `argv_version()`, `argv_ready(dir)`, …
 returning `Vec<String>` (paths rendered with `Path::display`/`to_string_lossy`).
