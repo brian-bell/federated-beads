@@ -8,11 +8,19 @@ use serde::de::DeserializeOwned;
 use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail};
 
 /// The real [`BdClient`]: every method shells out to the `bd` binary on PATH.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BdCli {
     /// The program to spawn; `bd` by default. A field (not a const) so a future
     /// caller could point at an absolute path without touching call sites.
     program: String,
+}
+
+impl Default for BdCli {
+    fn default() -> Self {
+        // Delegate to `new()` so `default()` yields a usable `bd` client rather
+        // than an empty program string that would fail every spawn.
+        Self::new()
+    }
 }
 
 impl BdCli {

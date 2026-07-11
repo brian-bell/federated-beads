@@ -6,6 +6,7 @@
 //! can drive it. It is a test double, not part of fbd's supported API.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{BdClient, BdError, BdVersion, Issue, IssueDetail};
@@ -32,6 +33,11 @@ pub enum Call {
 /// (not consumed). Unset JSON responses default to something benign (empty list,
 /// bd 1.1.0 version); the mutating calls default to `Ok(())`. Every call is
 /// recorded and retrievable via [`FakeBdClient::calls`].
+///
+/// `export` failures are programmable **per repo path** (see
+/// [`FakeBdClient::with_export_err`]) so the refresh pipeline's
+/// one-repo-fails-others-succeed path is testable: an unprogrammed path still
+/// exports `Ok`.
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct FakeBdClient {
@@ -41,6 +47,7 @@ pub struct FakeBdClient {
     search: Option<Result<Vec<Issue>, BdError>>,
     show: Option<Result<IssueDetail, BdError>>,
     repo_list: Option<Result<serde_json::Value, BdError>>,
+    export_errs: HashMap<PathBuf, BdError>,
 }
 
 impl FakeBdClient {
@@ -75,6 +82,13 @@ impl FakeBdClient {
 
     pub fn with_repo_list(mut self, value: serde_json::Value) -> Self {
         self.repo_list = Some(Ok(value));
+        self
+    }
+
+    /// Program `export(repo)` to fail for exactly this path; other paths still
+    /// export `Ok`. Lets a refresh test fail one repo while the rest proceed.
+    pub fn with_export_err(mut self, repo: impl Into<PathBuf>, err: BdError) -> Self {
+        self.export_errs.insert(repo.into(), err);
         self
     }
 
@@ -123,7 +137,10 @@ impl BdClient for FakeBdClient {
 
     fn export(&self, repo: &Path) -> Result<(), BdError> {
         self.record(Call::Export(repo.to_path_buf()));
-        Ok(())
+        match self.export_errs.get(repo) {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        }
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError> {
@@ -209,6 +226,20 @@ mod tests {
             err.kind,
             BdErrorKind::NonZeroExit { code: Some(2) }
         ));
+    }
+
+    #[test]
+    fn export_fails_only_for_programmed_path() {
+        let boom = BdError {
+            command: "bd -C /tmp/b export ...".into(),
+            stderr: "disk full".into(),
+            kind: BdErrorKind::NonZeroExit { code: Some(1) },
+        };
+        let fake = FakeBdClient::new().with_export_err("/tmp/b", boom);
+
+        // Programmed path fails; a different path still exports Ok.
+        assert!(fake.export(Path::new("/tmp/a")).is_ok());
+        assert!(fake.export(Path::new("/tmp/b")).is_err());
     }
 
     #[test]
