@@ -21,14 +21,38 @@ use crate::cli::sanitize;
 /// configured prefix, or a collided/ambiguous one): `bd -C <hub> show <id>`,
 /// which is always correct because the hub holds every hydrated issue.
 ///
-/// The id is [`sanitize`]d (it is bd-sourced and the result may be pasted into a
-/// terminal); repo/hub paths are local and rendered verbatim.
+/// Every interpolated argument is [`shell_quote`]d so the command stays runnable
+/// and safe when pasted: a repo path containing a space would otherwise break
+/// `cd`, and a shell metacharacter (`;`, `$()`, quotes) in a path or id would
+/// otherwise execute. The id is additionally [`sanitize`]d (it is bd-sourced).
 pub fn shell_command(repo: Option<&Path>, hub: &Path, id: &str) -> String {
-    let id = sanitize(id);
+    let id = shell_quote(&sanitize(id));
     match repo {
-        Some(repo) => format!("cd {} && bd show {}", repo.display(), id),
-        None => format!("bd -C {} show {}", hub.display(), id),
+        Some(repo) => format!("cd {} && bd show {}", quote_path(repo), id),
+        None => format!("bd -C {} show {}", quote_path(hub), id),
     }
+}
+
+/// Shell-quote a filesystem path for interpolation into a command.
+fn quote_path(p: &Path) -> String {
+    shell_quote(&p.to_string_lossy())
+}
+
+/// POSIX shell-quote `s` so it interpolates as a single, literal argument. A word
+/// made only of unambiguous, metacharacter-free characters is returned bare (so
+/// the common `cd /Users/me/dev/repo && bd show mc-abc` reads cleanly); anything
+/// else is wrapped in single quotes, with any embedded `'` closed-escaped-reopened
+/// (`'\''`), which makes every other byte — spaces, `;`, `$`, `` ` ``, newlines —
+/// literal.
+fn shell_quote(s: &str) -> String {
+    fn is_safe(c: char) -> bool {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '_' | '-' | '/' | '@' | '%' | '+' | ',' | ':' | '=')
+    }
+    if !s.is_empty() && s.chars().all(is_safe) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Build a shareable markdown block for the issue: a title heading, an id/repo
@@ -137,6 +161,35 @@ mod tests {
         // No source repo (unknown/collided prefix): the hub form, always runnable.
         let cmd = shell_command(None, Path::new("/data/hub"), "mc-abc");
         assert_eq!(cmd, "bd -C /data/hub show mc-abc");
+    }
+
+    #[test]
+    fn shell_quotes_paths_with_spaces() {
+        // A repo path with a space would break `cd` unquoted; it must be quoted so
+        // the pasted command still runs.
+        let cmd = shell_command(Some(Path::new("/Users/x/my repo")), Path::new("/h"), "mc-1");
+        assert_eq!(cmd, "cd '/Users/x/my repo' && bd show mc-1");
+    }
+
+    #[test]
+    fn shell_quotes_metacharacters() {
+        // Metacharacters in a path or id must not execute when pasted.
+        let cmd = shell_command(
+            Some(Path::new("/tmp/a;rm -rf b")),
+            Path::new("/h"),
+            "x$(id)",
+        );
+        assert!(
+            cmd.starts_with("cd '/tmp/a;rm -rf b' && bd show "),
+            "the dangerous path is single-quoted: {cmd:?}"
+        );
+        assert!(
+            cmd.contains("'x$(id)'"),
+            "the dangerous id is single-quoted: {cmd:?}"
+        );
+        // An embedded single quote is closed-escaped-reopened, not left dangling.
+        let q = shell_command(Some(Path::new("/tmp/it's")), Path::new("/h"), "mc-1");
+        assert!(q.contains(r"'/tmp/it'\''s'"), "single quote escaped: {q:?}");
     }
 
     #[test]

@@ -179,7 +179,11 @@ fn execute_effect(
         Effect::Refresh => spawn_refresh(tx, paths, roster),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
         Effect::Search { query, token } => spawn_search(tx, paths, roster, query, token),
-        Effect::Copy { row, markdown } => spawn_copy(tx, paths, roster, *row, markdown),
+        Effect::Copy {
+            row,
+            markdown,
+            token,
+        } => spawn_copy(tx, paths, roster, *row, markdown, token),
         // Not a worker: write the OSC 52 escape here, on the UI thread that owns
         // the tty, so it can never interleave with a ratatui draw. Returns without
         // a handle to track.
@@ -327,11 +331,12 @@ fn spawn_copy(
     roster: &Config,
     row: Row,
     markdown: bool,
+    token: u64,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
-    thread::spawn(move || copy_worker(BdCli::new(), roster, paths, row, markdown, tx))
+    thread::spawn(move || copy_worker(BdCli::new(), roster, paths, row, markdown, token, tx))
 }
 
 /// The copy worker body: build the clipboard payload + status summary off the UI
@@ -345,10 +350,18 @@ pub(crate) fn copy_worker(
     paths: Paths,
     row: Row,
     markdown: bool,
+    token: u64,
     tx: Sender<Incoming>,
 ) {
     let (payload, summary) = build_copy(&bd, &roster, &paths, &row, markdown);
-    let _ = tx.send(Msg::Copied { payload, summary }.into());
+    let _ = tx.send(
+        Msg::Copied {
+            token,
+            payload,
+            summary,
+        }
+        .into(),
+    );
 }
 
 /// Build the clipboard payload and its status-bar summary for `row`.
@@ -792,10 +805,14 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// The single `Msg::Copied` a copy worker sends, unwrapping payload + summary.
-    fn recv_copied(rx: &Receiver<Incoming>) -> (String, String) {
+    /// The single `Msg::Copied` a copy worker sends: (token, payload, summary).
+    fn recv_copied(rx: &Receiver<Incoming>) -> (u64, String, String) {
         match recv_msg(rx) {
-            Msg::Copied { payload, summary } => (payload, summary),
+            Msg::Copied {
+                token,
+                payload,
+                summary,
+            } => (token, payload, summary),
             other => panic!("expected Copied, got {other:?}"),
         }
     }
@@ -819,9 +836,10 @@ mod tests {
         let paths2 = paths.clone();
         let ra2 = ra.clone();
         let handle =
-            thread::spawn(move || copy_worker(bd, roster(&[&ra2]), paths2, row, false, tx));
+            thread::spawn(move || copy_worker(bd, roster(&[&ra2]), paths2, row, false, 7, tx));
 
-        let (payload, summary) = recv_copied(&rx);
+        let (token, payload, summary) = recv_copied(&rx);
+        assert_eq!(token, 7, "the request token is echoed back");
         assert_eq!(
             payload,
             format!("cd {} && bd show ra-1", ra.display()),
@@ -845,9 +863,10 @@ mod tests {
         // An id whose prefix (`zz`) matches no roster repo → hub fallback.
         let row = copy_row("unknown", "zz-9");
         let paths2 = paths.clone();
-        let handle = thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths2, row, false, tx));
+        let handle =
+            thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths2, row, false, 1, tx));
 
-        let (payload, _) = recv_copied(&rx);
+        let (_, payload, _) = recv_copied(&rx);
         assert_eq!(
             payload,
             format!("bd -C {} show zz-9", hub_dir(&paths).display()),
@@ -865,9 +884,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
 
         let row = copy_row("session-tui", "ra-1");
-        let handle = thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths, row, true, tx));
+        let handle =
+            thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths, row, true, 1, tx));
 
-        let (payload, _) = recv_copied(&rx);
+        let (_, payload, _) = recv_copied(&rx);
         assert!(payload.contains("Ready one"), "markdown title: {payload:?}");
         assert!(payload.contains("ra-1"), "markdown id: {payload:?}");
         assert!(

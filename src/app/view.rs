@@ -1171,7 +1171,12 @@ mod tests {
     fn renders_copy_confirmation() {
         // After a copy worker reports back, the status bar confirms it.
         let mut app = app_with(vec![row("megaclock", "mc-abc", 1, "task")], vec![]);
+        let token = match app.reduce(Msg::CopyContext).as_slice() {
+            [crate::app::Effect::Copy { token, .. }] => *token,
+            other => panic!("expected one Copy effect, got {other:?}"),
+        };
         app.reduce(Msg::Copied {
+            token,
             payload: "cd /dev/megaclock && bd show mc-abc".into(),
             summary: "cd /dev/megaclock && bd show mc-abc".into(),
         });

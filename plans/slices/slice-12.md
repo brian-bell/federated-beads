@@ -176,3 +176,22 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --test bd_integration
 ```
+
+## Autoreview outcomes
+
+Round 1 (codex, gpt-5.6-sol) — two findings, both accepted and fixed:
+
+1. **[P1] Shell-quote the copied command's arguments.** `shell_command`
+   interpolated repo/hub paths and the id verbatim; a valid repo path with a
+   space breaks the pasted `cd`, and a shell metacharacter could execute. Added a
+   conditional POSIX `shell_quote` (bare for a safe word, single-quoted with
+   `'\''` escaping otherwise) applied to the repo path, hub path, and id; new
+   `shell_quotes_paths_with_spaces` / `shell_quotes_metacharacters` tests.
+2. **[P2] Drop stale copy results.** Copy workers carried no generation token, so
+   a slower earlier copy could overwrite a later one's clipboard/confirmation.
+   Added `copy_seq` + a `token` on `Effect::Copy`/`Msg::Copied` and a guard in
+   `reduce(Copied)`, mirroring `detail_seq`/`search_seq`; new
+   `stale_copy_result_dropped` test.
+
+Both design points were also folded into decisions 5 (quoting) and a new copy
+generation invariant above. Re-review after the fixes: clean.

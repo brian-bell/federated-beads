@@ -94,12 +94,20 @@ pub enum Msg {
     /// (`Y`); `reduce` emits [`Effect::Copy`] with `markdown: true`.
     CopyMarkdown,
     /// A copy worker finished building the clipboard string (runtime copy worker →
-    /// app). `payload` is the full text to place on the clipboard (via OSC 52);
-    /// `summary` is the pre-truncated one-liner for the status-bar confirmation.
-    /// Both are built off the UI thread (the id→repo-path resolution runs `bd`);
+    /// app). `token` echoes the request's generation (see [`Effect::Copy`]) so a
+    /// superseded copy's late reply — the user copied row A, moved, copied row B,
+    /// and A's slower path-resolution finished last — is dropped rather than
+    /// clobbering the clipboard/confirmation with the stale selection. `payload`
+    /// is the full text to place on the clipboard (via OSC 52); `summary` is the
+    /// pre-truncated one-liner for the status-bar confirmation. Both are built off
+    /// the UI thread (the id→repo-path resolution runs `bd`); on acceptance
     /// `reduce` stores `summary` and returns [`Effect::WriteClipboard`] so the
     /// actual tty write happens back on the UI thread.
-    Copied { payload: String, summary: String },
+    Copied {
+        token: u64,
+        payload: String,
+        summary: String,
+    },
     /// Leave the current sub-mode back to the list (`Esc`). No-op in `List`;
     /// Slices 10/11 return from `Detail`/`Search`.
     Back,
@@ -130,10 +138,15 @@ pub enum Effect {
     /// small. The runtime resolves the row's source-repo path from its issue id
     /// (the same prefix-map path search uses), builds the `cd …`/`bd -C …`
     /// command (`markdown: false`) or a markdown block (`markdown: true`), and
-    /// sends it back as [`Msg::Copied`]. Kept off `reduce` because `Row` carries
-    /// no filesystem path (by [`crate::snapshot`] design), so the string can only
-    /// be built where the roster/prefix map is available.
-    Copy { row: Box<Row>, markdown: bool },
+    /// sends it back as [`Msg::Copied`] echoing `token` (the request's generation,
+    /// so a superseded copy's late reply is dropped). Kept off `reduce` because
+    /// `Row` carries no filesystem path (by [`crate::snapshot`] design), so the
+    /// string can only be built where the roster/prefix map is available.
+    Copy {
+        row: Box<Row>,
+        markdown: bool,
+        token: u64,
+    },
     /// Write `payload` to the terminal clipboard via an OSC 52 escape (the
     /// [`Msg::Copied`] follow-up). Performed on the UI thread, which owns the tty,
     /// so the escape can never interleave with a ratatui draw from a worker.
@@ -417,6 +430,10 @@ pub struct App {
     /// worker reports back and cleared on the next refresh cycle. `None` when no
     /// copy has happened since the last refresh.
     copy_flash: Option<String>,
+    /// A monotonic generation stamped on each copy request, echoed by the worker
+    /// so a superseded copy's late result is dropped (mirrors `detail_seq` /
+    /// `search_seq`): the newest copy always wins the clipboard.
+    copy_seq: u64,
     /// The user asked to quit; the runtime loop should exit.
     done: bool,
 }
@@ -448,6 +465,7 @@ impl App {
             detail_seq: 0,
             detail_scroll: 0,
             copy_flash: None,
+            copy_seq: 0,
             done: false,
         }
     }
@@ -699,11 +717,18 @@ impl App {
             // runtime resolves the path + builds the string off the UI thread.
             Msg::CopyContext => return self.copy_effect(false),
             Msg::CopyMarkdown => return self.copy_effect(true),
-            Msg::Copied { payload, summary } => {
-                // The worker built the string; show the confirmation and hand the
-                // payload back for the UI-thread tty write.
-                self.copy_flash = Some(summary);
-                return vec![Effect::WriteClipboard(payload)];
+            Msg::Copied {
+                token,
+                payload,
+                summary,
+            } => {
+                // Accept only the newest copy's result; a superseded one (a faster
+                // earlier request finishing after a later one) carries an older
+                // token and is dropped, so the clipboard reflects the last `y`/`Y`.
+                if token == self.copy_seq {
+                    self.copy_flash = Some(summary);
+                    return vec![Effect::WriteClipboard(payload)];
+                }
             }
             Msg::Quit => self.done = true,
         }
@@ -715,14 +740,18 @@ impl App {
     /// active list is the search results while a search is live (including a
     /// detail opened from one) else the ready list, so `y`/`Y` copy the issue the
     /// user is actually looking at in List / Search-results / Detail alike.
-    fn copy_effect(&self, markdown: bool) -> Vec<Effect> {
-        match self.active().selected_row() {
-            Some(row) => vec![Effect::Copy {
-                row: Box::new(row.clone()),
-                markdown,
-            }],
-            None => Vec::new(),
-        }
+    fn copy_effect(&mut self, markdown: bool) -> Vec<Effect> {
+        // Clone before bumping the generation so a no-selection copy neither
+        // advances the sequence nor emits an effect.
+        let Some(row) = self.active().selected_row().cloned() else {
+            return Vec::new();
+        };
+        self.copy_seq += 1;
+        vec![Effect::Copy {
+            row: Box::new(row),
+            markdown,
+            token: self.copy_seq,
+        }]
     }
 
     /// The list the read accessors and the view reflect: the search results while
@@ -1455,10 +1484,17 @@ mod tests {
 
     // ---- Copy-context (Slice 12) ----
 
-    /// The single `Effect::Copy` from a copy message, panicking otherwise.
-    fn copy(app: &mut App, msg: Msg) -> (Row, bool) {
+    /// The single `Effect::Copy` from a copy message (row, markdown, token),
+    /// panicking otherwise.
+    fn copy(app: &mut App, msg: Msg) -> (Row, bool, u64) {
         match app.reduce(msg).as_slice() {
-            [Effect::Copy { row, markdown }] => ((**row).clone(), *markdown),
+            [
+                Effect::Copy {
+                    row,
+                    markdown,
+                    token,
+                },
+            ] => ((**row).clone(), *markdown, *token),
             other => panic!("expected one Copy effect, got {other:?}"),
         }
     }
@@ -1466,16 +1502,17 @@ mod tests {
     #[test]
     fn copy_context_emits_effect() {
         let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
-        let (r, markdown) = copy(&mut app, Msg::CopyContext);
+        let (r, markdown, token) = copy(&mut app, Msg::CopyContext);
         assert_eq!(r.issue.id, "mc-abc", "the selected row is carried");
         assert_eq!(r.repo_name, "megaclock");
         assert!(!markdown, "y copies the command form");
+        assert_eq!(token, 1, "the first copy is generation 1");
     }
 
     #[test]
     fn copy_markdown_emits_effect() {
         let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
-        let (r, markdown) = copy(&mut app, Msg::CopyMarkdown);
+        let (r, markdown, _) = copy(&mut app, Msg::CopyMarkdown);
         assert_eq!(r.issue.id, "mc-abc");
         assert!(markdown, "Y copies the markdown form");
     }
@@ -1492,7 +1529,7 @@ mod tests {
             ]),
         });
         app.reduce(Msg::SelectNext); // select st-9 in the results
-        let (r, _) = copy(&mut app, Msg::CopyContext);
+        let (r, _, _) = copy(&mut app, Msg::CopyContext);
         assert_eq!(r.issue.id, "st-9", "copies the selected search result");
     }
 
@@ -1505,7 +1542,7 @@ mod tests {
             detail: Ok(detail("mc-abc", vec![])),
         });
         assert_eq!(app.view_mode(), ViewMode::Detail);
-        let (r, _) = copy(&mut app, Msg::CopyContext);
+        let (r, _, _) = copy(&mut app, Msg::CopyContext);
         assert_eq!(r.issue.id, "mc-abc", "copies the opened issue from Detail");
     }
 
@@ -1524,7 +1561,9 @@ mod tests {
     #[test]
     fn copied_sets_flash_and_writes() {
         let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, token) = copy(&mut app, Msg::CopyContext);
         let effects = app.reduce(Msg::Copied {
+            token,
             payload: "cd /dev/megaclock && bd show mc-abc".into(),
             summary: "copied cd mc-abc".into(),
         });
@@ -1539,9 +1578,46 @@ mod tests {
     }
 
     #[test]
+    fn stale_copy_result_dropped() {
+        // Copy A (gen 1), then copy B (gen 2). A's slower worker answers last and
+        // must not clobber B's clipboard/confirmation.
+        let mut app = app_with(vec![
+            row("megaclock", "mc-a", 1),
+            row("session-tui", "st-b", 1),
+        ]);
+        let (_, _, first) = copy(&mut app, Msg::CopyContext);
+        app.reduce(Msg::SelectNext);
+        let (_, _, second) = copy(&mut app, Msg::CopyContext);
+        assert_ne!(first, second, "each copy gets a fresh generation");
+
+        // B lands first and is shown.
+        app.reduce(Msg::Copied {
+            token: second,
+            payload: "cd b && bd show st-b".into(),
+            summary: "copied st-b".into(),
+        });
+        assert_eq!(app.copy_flash(), Some("copied st-b"));
+
+        // A answers late: dropped, no WriteClipboard, confirmation unchanged.
+        let effects = app.reduce(Msg::Copied {
+            token: first,
+            payload: "cd a && bd show mc-a".into(),
+            summary: "copied mc-a".into(),
+        });
+        assert_eq!(effects, Vec::new(), "the superseded copy writes nothing");
+        assert_eq!(
+            app.copy_flash(),
+            Some("copied st-b"),
+            "the stale reply did not overwrite the newest copy"
+        );
+    }
+
+    #[test]
     fn copy_flash_clears_on_refresh() {
         let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, token) = copy(&mut app, Msg::CopyContext);
         app.reduce(Msg::Copied {
+            token,
             payload: "x".into(),
             summary: "copied cd mc-abc".into(),
         });
