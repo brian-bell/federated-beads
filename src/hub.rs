@@ -11,6 +11,7 @@
 //! `repos.additional`, not `bd repo list --json`: bd 1.1.0 ignores `--json` for
 //! `repo list` and prints human-readable text (see `plans/slices/slice-3.md`).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,9 +76,11 @@ pub fn ensure_hub(
         bd.init(&hub, HUB_PREFIX)?;
     }
 
-    let existing: Vec<PathBuf> = read_hub_roster(&hub)?
+    // bd stores additional repos relative to the hub (`bd -C <hub>`), so resolve
+    // any relative stored entry against `hub` — not fbd's cwd — before comparing.
+    let mut existing: HashSet<PathBuf> = read_hub_roster(&hub)?
         .iter()
-        .map(|p| normalize(p))
+        .map(|p| normalize(&resolve_against(&hub, p)))
         .collect();
 
     let mut warnings = Vec::new();
@@ -90,7 +93,9 @@ pub fn ensure_hub(
             continue;
         }
         let canonical = normalize(&entry.path);
-        if existing.contains(&canonical) {
+        // Skip repos the hub already tracks — including ones added earlier in
+        // this same run, so duplicate/aliased roster entries add exactly once.
+        if !existing.insert(canonical.clone()) {
             continue;
         }
         bd.repo_add(&hub, &canonical)?;
@@ -178,6 +183,17 @@ fn is_initialized(hub: &Path) -> bool {
 /// compare roster entries against the hub's stored (absolute) paths robustly.
 fn normalize(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Resolve a possibly-relative path against `base`. Absolute paths pass through;
+/// relative ones are joined onto `base`. bd stores hub-roster entries relative to
+/// the hub dir, so stored entries must be resolved against it before comparison.
+fn resolve_against(base: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
 }
 
 fn mkdir_all(dir: &Path) -> Result<(), HubError> {
@@ -330,6 +346,54 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Call::RepoAdd(_, _))),
             "an already-tracked repo must never be re-added"
+        );
+    }
+
+    #[test]
+    fn dedupes_duplicate_roster_entries_within_one_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = make_repo(tmp.path(), "ra");
+        seed_hub_config(&hub_dir(&paths), &[]);
+        let fake = FakeBdClient::new();
+
+        // Same untracked repo listed twice must be added exactly once.
+        ensure_hub(&fake, &paths, &roster(&[&ra, &ra])).unwrap();
+
+        let adds = fake
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::RepoAdd(_, _)))
+            .count();
+        assert_eq!(adds, 1, "duplicate roster entry must add only once");
+    }
+
+    #[test]
+    fn treats_hub_relative_stored_entry_as_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        // `ra` sits beside the hub; the hub stores it as the relative `../ra`,
+        // which bd interprets against the hub dir.
+        let ra = make_repo(paths.data_dir(), "ra");
+        fs::create_dir_all(hub.join(".beads")).unwrap();
+        fs::write(
+            hub.join(".beads").join("config.yaml"),
+            "repos:\n  primary: \".\"\n  additional:\n    - \"../ra\"\n",
+        )
+        .unwrap();
+        let fake = FakeBdClient::new();
+
+        // Roster names the absolute repo; it must be recognized as already
+        // tracked despite the stored entry being hub-relative.
+        ensure_hub(&fake, &paths, &roster(&[&ra])).unwrap();
+
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::RepoAdd(_, _))),
+            "a hub-relative stored entry must match the absolute roster path"
         );
     }
 
