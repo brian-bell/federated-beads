@@ -23,18 +23,23 @@ that Slice 11's `Search` will reuse.
 
 ## Design decisions (recorded so downstream slices and autoreview don't re-litigate)
 
-1. **`Msg::DetailReady { id, detail: Result<IssueDetail, String> }` — tagged with
-   the requested id, carrying success *or* a message.** The master plan's
-   shorthand is `Msg::DetailReady(IssueDetail)`. Two additions are load-bearing:
-   - **The `id`** lets `reduce` drop a **stale/mismatched** response. A user can
-     Enter issue X, `Esc`, then Enter issue Y before X's ~0.2 s `bd show` returns;
-     without the tag, X's late response would overwrite Y's pane. `reduce` accepts
-     a completion only when its `id` equals the id the pane is currently bound to.
+1. **`Msg::DetailReady { token, detail: Result<Box<IssueDetail>, String> }` —
+   tagged with a request generation, carrying success *or* a message.** The master
+   plan's shorthand is `Msg::DetailReady(IssueDetail)`. Two additions are
+   load-bearing:
+   - **The `token`** (a monotonic `detail_seq` bumped on each `OpenDetail`, echoed
+     by the worker) lets `reduce` drop a **stale/out-of-order** response. `reduce`
+     accepts a completion only when its token still matches the pane's current
+     request. This covers Enter X → `Esc` → Enter Y (different ids) *and* Enter X →
+     `Esc` → Enter X (same id, different token) — an id-only match would wrongly
+     accept the first X worker's late reply over the second's. (Revised after
+     autoreview from an id-only match; see Autoreview outcomes.)
    - **The `Result`** carries a fetch **error message** so `detail_fetch_error_
      shows_message` can render "couldn't load" in the pane while the list stays
      intact — the runtime pre-formats and `sanitize`s the `bd` error into the
      `Err` string, keeping this core free of `BdError` types (same policy as
-     `RefreshCompleted`'s pre-formatted warnings).
+     `RefreshCompleted`'s pre-formatted warnings). The payload is `Box`ed so the
+     large `IssueDetail` does not bloat every `Msg` (clippy `large_enum_variant`).
 
 2. **`Effect::FetchDetail(String)` is the second reserved I/O variant.** `reduce`
    emits it on `Msg::OpenDetail`; the runtime spawns a `bd show` worker. Additive:
@@ -78,6 +83,17 @@ that Slice 11's `Search` will reuse.
    selection is preserved across an open/close. In `List`/`Loading` it stays a
    no-op (nothing to return from).
 
+6a. **In `Detail`, `j`/`k` scroll the pane; `f`/`p` are inert; the list selection
+   never moves.** (Revised after autoreview.) Gating navigation to `List` alone
+   would freeze the list selection *and* leave a tall detail unscrollable — its
+   dependency lines could fall off the bottom of the narrow stacked pane with no
+   way to reach them. So `Detail`-mode `SelectNext`/`SelectPrev` adjust a
+   `detail_scroll: u16` (saturating at 0) instead, and the **view clamps** the
+   applied offset to the wrapped content height (`Paragraph::line_count`, ratatui's
+   `unstable-rendered-line-info`), so all content is reachable and an over-scroll
+   shows no blank. `detail_scroll` resets on open and close. Filters (`f`/`p`) have
+   no meaning over a single issue and stay inert in `Detail`.
+
 7. **Split layout by *frame* width: side-by-side ≥ 100 cols, stacked below else.**
    The vertical title/content/status split does not change width, so the content
    area width equals the frame width. `draw_detail_split` picks `Horizontal`
@@ -87,16 +103,20 @@ that Slice 11's `Search` will reuse.
    scroll) inside its half.
 
 8. **The detail renderer sanitizes all bd-sourced text and wraps to the pane.**
-   Title, id, description, and every dependency field are `sanitize`d (they are
-   attacker-influenceable federated-repo text written straight to the terminal —
-   same posture as `format_row_body`). Content is a `Vec<Line>` rendered through a
+   Title, id, description, labels, and every dependency field are `sanitize`d (they
+   are attacker-influenceable federated-repo text written straight to the terminal
+   — same posture as `format_row_body`). Content is a `Vec<Line>` rendered through a
    wrapping `Paragraph`, so a long description wraps to the pane width instead of
    truncating. `sanitize` still neutralizes embedded newlines to `U+FFFD` (row-
-   forging defense); wrapping handles width. A dependency renders as
+   forging defense); wrapping handles width. The meta line is
+   `status · P<pri> · <type> · <n> comments`, followed by a `labels: …` line when
+   the issue has any (`bd show` emits a `labels` array only when non-empty, so
+   `Issue.labels` is `#[serde(default)]`). A dependency renders as
    `⛔ {type}: {id} {title} ({status})`, e.g. `⛔ blocks: ra-z70 Blocker task
    (open)`, with `dependency_type`/`title`/`status` defaulting when bd omits them.
    The `⛔` glyph is our literal (not bd text). `Loading` shows `Loading <id>…`;
-   `Error` shows the id and the message.
+   `Error` shows the id and the message. (Labels added after autoreview — the
+   master plan lists them and `Issue` had discarded them at deserialization.)
 
 9. **Key hints become mode-aware.** Slice 9 omitted Enter/Esc from the title hint
    because they were inert. Now `List` advertises `enter detail` and `Detail`
@@ -272,3 +292,30 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --test bd_integration
 ```
+
+## Autoreview outcomes (codex gpt-5.6-sol, high; branch vs main)
+
+Ran to convergence.
+
+- **Round 1** — three findings:
+  1. *Hidden list navigation while the pane is open (P2).* `j`/`k`/`f`/`p` mutated
+     the underlying list selection in `Detail`, so `Esc` could return to a
+     different row than the pane was opened from. **Fixed** — decision 6a: `Detail`
+     gates filters off and repurposes `j`/`k` to scroll the pane, freezing the list
+     selection. Test `navigation_inert_while_detail_open`.
+  2. *Missing labels (P2).* The master plan lists labels; `bd show` emits a
+     `labels` array when present, but `Issue` had no field so they were discarded.
+     **Fixed** — decision 8: `Issue.labels` (`#[serde(default)]`) rendered in the
+     meta. Tests `parses_labels_and_defaults_when_absent`, `renders_detail_labels`.
+  3. *Same-id reopen accepts a stale response (P2).* Filed initially as
+     `federated-beads-dxh.20`, then **fixed** in round 2 (below).
+- **Round 2** — two findings:
+  1. *Same-id reopen (re-raised).* Escalated from a follow-up bead to a fix:
+     decision 1 now matches `DetailReady` by a monotonic request **token**, not id,
+     so a reopened issue's earlier worker cannot overwrite the newer pane. Tests
+     `same_id_reopen_drops_earlier_response`, `stale_detail_response_is_dropped`.
+     Bead `federated-beads-dxh.20` closed as done.
+  2. *Long detail clipped with no scroll (P2)* — worsened by round 1's navigation
+     gating. **Fixed** — decision 6a adds pane scrolling with a view-side clamp to
+     the wrapped height. Test `long_detail_dependencies_reachable_by_scroll`.
+- **Round 3** — clean (helper exited 0, no accepted/actionable findings).

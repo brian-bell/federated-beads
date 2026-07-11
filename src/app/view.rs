@@ -103,7 +103,14 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         // rendering nothing is a safe fallback rather than a panic.
         None => Vec::new(),
     };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Clamp the requested scroll to the wrapped content so a long detail (whose
+    // dependency lines would otherwise fall off the bottom of the narrow stacked
+    // pane) is fully reachable with `j`/`k`, while an over-scroll shows no blank.
+    let content = paragraph.line_count(area.width) as u16;
+    let max_scroll = content.saturating_sub(area.height);
+    let offset = app.detail_scroll().min(max_scroll);
+    frame.render_widget(paragraph.scroll((offset, 0)), area);
 }
 
 /// Build the wrapped-text lines for a loaded issue detail.
@@ -669,10 +676,14 @@ mod tests {
     /// given detail via the real reduce path. `None` leaves it `Loading`.
     fn app_in_detail(id: &str, ready: Option<Result<IssueDetail, String>>) -> App {
         let mut app = app_with(vec![row("session-tui", id, 2, "Blocked task")], vec![]);
-        app.reduce(Msg::OpenDetail);
+        // The single OpenDetail on a fresh app yields request token 1.
+        let token = match app.reduce(Msg::OpenDetail).as_slice() {
+            [crate::app::Effect::FetchDetail { token, .. }] => *token,
+            other => panic!("expected one FetchDetail, got {other:?}"),
+        };
         if let Some(detail) = ready {
             app.reduce(Msg::DetailReady {
-                id: id.into(),
+                token,
                 detail: detail.map(Box::new),
             });
         }
@@ -794,6 +805,45 @@ mod tests {
         assert!(
             find_at(&buf, "ra-4zf", w, h).is_some(),
             "list row still rendered"
+        );
+    }
+
+    #[test]
+    fn long_detail_dependencies_reachable_by_scroll() {
+        // In the narrow stacked layout the pane is short; a long description would
+        // push the dependency line off the bottom. Scrolling must bring it back,
+        // and the clamp must not scroll past the content into blank.
+        let long = "word ".repeat(200); // ~1000 cols → many rows even at full width
+        let mut app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail(
+                "ra-4zf",
+                "Blocked task",
+                long.trim(),
+                vec![dep("ra-z70", "Blocker task", "open", "blocks")],
+            ))),
+        );
+        let (w, h) = (80, 24);
+
+        // Off the bottom initially.
+        assert!(
+            find_at(&render_sized(&app, at(1000), w, h), "blocks:", w, h).is_none(),
+            "dependency starts below the fold"
+        );
+
+        // Scroll down enough to reach the end (clamped by the view).
+        for _ in 0..100 {
+            app.reduce(Msg::SelectNext);
+        }
+        let buf = render_sized(&app, at(1000), w, h);
+        assert!(
+            find_at(&buf, "blocks:", w, h).is_some(),
+            "the dependency is reachable by scrolling"
+        );
+        // Clamped: the last content row is visible, not scrolled into blank.
+        assert!(
+            find_at(&buf, "(open)", w, h).is_some(),
+            "over-scroll clamps to the content's end, showing no blank gap"
         );
     }
 

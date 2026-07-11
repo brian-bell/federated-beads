@@ -37,13 +37,14 @@ pub enum Msg {
         snapshot: Option<Snapshot>,
         warnings: Vec<String>,
     },
-    /// A `bd show <id>` detail fetch concluded (runtime detail worker → app). The
-    /// `id` tags which request this answers so a stale/out-of-order response for
-    /// an issue the pane is no longer bound to can be dropped; `detail` is the
-    /// fetched [`IssueDetail`] on success or a pre-formatted, sanitized message on
-    /// failure (keeping this core free of `bd` error types).
+    /// A `bd show` detail fetch concluded (runtime detail worker → app). The
+    /// `token` echoes the request's generation (see [`Effect::FetchDetail`]) so a
+    /// stale/out-of-order response is dropped — even when the *same* issue is
+    /// reopened, whose two fetches would share an id but not a token. `detail` is
+    /// the fetched [`IssueDetail`] on success or a pre-formatted, sanitized message
+    /// on failure (keeping this core free of `bd` error types).
     DetailReady {
-        id: String,
+        token: u64,
         detail: Result<Box<IssueDetail>, String>,
     },
 
@@ -79,16 +80,17 @@ pub enum Msg {
 
 /// A side effect the runtime must perform after a transition. `reduce` stays pure
 /// by *describing* I/O rather than performing it. Slice 8 emits only
-/// [`Effect::Refresh`]; Slice 10 adds `FetchDetail(String)`, Slice 11
-/// `Search(String)` — additive, without changing `reduce`'s signature.
+/// [`Effect::Refresh`]; Slice 10 adds `FetchDetail`, Slice 11 `Search(String)` —
+/// additive, without changing `reduce`'s signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Spawn a refresh worker (the `r` keypress → `Msg::Refresh`).
     Refresh,
     /// Fetch one issue's detail via `bd show <id> --json` (the `Enter` keypress →
-    /// `Msg::OpenDetail`). The runtime runs it on a worker thread and feeds the
-    /// result back as [`Msg::DetailReady`].
-    FetchDetail(String),
+    /// `Msg::OpenDetail`). `token` is the request's generation; the runtime runs
+    /// the fetch on a worker thread and echoes `token` back in [`Msg::DetailReady`]
+    /// so a superseded request's late response is dropped.
+    FetchDetail { id: String, token: u64 },
 }
 
 /// Which screen the app is showing. Slice 11 adds `Search`.
@@ -102,9 +104,8 @@ pub enum ViewMode {
     Detail,
 }
 
-/// The detail pane's state, bound to a single issue id (see [`DetailState::id`]).
-/// `Loaded` is boxed so the enum stays small (the [`IssueDetail`] payload dwarfs
-/// the other variants).
+/// The detail pane's state for one issue id. `Loaded` is boxed so the enum stays
+/// small (the [`IssueDetail`] payload dwarfs the other variants).
 #[derive(Debug, Clone)]
 pub enum DetailState {
     /// The `bd show` fetch is in flight for this id.
@@ -116,8 +117,8 @@ pub enum DetailState {
 }
 
 impl DetailState {
-    /// The issue id the pane is bound to, across every variant. Used to drop a
-    /// `DetailReady` whose id no longer matches (a stale/out-of-order response).
+    /// The issue id the pane is showing, across every variant (for the header /
+    /// error line; stale-response matching is by request token, not id).
     pub fn id(&self) -> &str {
         match self {
             DetailState::Loading { id } => id,
@@ -202,9 +203,16 @@ pub struct App {
     /// When the shown snapshot was fetched (injected upstream; Slice 9 renders
     /// its age against a `now`). `None` before the first snapshot.
     fetched_at: Option<SystemTime>,
-    /// The detail pane, `Some` exactly when `view_mode == Detail`. Bound to one
-    /// issue id (its [`DetailState::id`]) so a stale `DetailReady` is dropped.
+    /// The detail pane, `Some` exactly when `view_mode == Detail`.
     detail: Option<DetailState>,
+    /// A monotonic generation stamped on each detail request. The current pane's
+    /// token is this value; a `DetailReady` is accepted only when its token still
+    /// matches, so a superseded fetch (including a reopen of the same issue) is
+    /// dropped.
+    detail_seq: u64,
+    /// The detail pane's vertical scroll offset (rows). Reset on open/close; the
+    /// view clamps it to the wrapped content so all of a long detail is reachable.
+    detail_scroll: u16,
     /// The user asked to quit; the runtime loop should exit.
     done: bool,
 }
@@ -234,6 +242,8 @@ impl App {
             status_warnings: Vec::new(),
             fetched_at: None,
             detail: None,
+            detail_seq: 0,
+            detail_scroll: 0,
             done: false,
         }
     }
@@ -271,23 +281,28 @@ impl App {
                 // The single, atomic point that ends the in-flight cycle.
                 self.stale = false;
             }
-            // Navigation and filters act only on the list. Gating them to `List`
-            // keeps the detail pane modal: while it is open, `j`/`k`/`f`/`p` must
-            // not silently move the underlying selection, or `Esc` would return to
-            // a different row than the one the pane was opened from (breaking the
-            // selection-preservation promise). (In `Loading` they were already
-            // no-ops over the empty list.)
-            Msg::SelectNext => {
-                if self.view_mode == ViewMode::List && !self.filtered_ix.is_empty() {
-                    self.selection = (self.selection + 1).min(self.filtered_ix.len() - 1);
+            // `j`/`k` move the list selection in `List`, but scroll the pane in
+            // `Detail` — so while the pane is open the underlying selection never
+            // moves (`Esc` returns to the row it was opened from) yet a long detail
+            // stays fully reachable. (In `Loading` both are no-ops.)
+            Msg::SelectNext => match self.view_mode {
+                ViewMode::List => {
+                    if !self.filtered_ix.is_empty() {
+                        self.selection = (self.selection + 1).min(self.filtered_ix.len() - 1);
+                    }
                 }
-            }
-            Msg::SelectPrev => {
+                // The view clamps to the wrapped content height, so an over-scroll
+                // past the end shows no blank; keep `reduce` dimension-free.
+                ViewMode::Detail => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                ViewMode::Loading => {}
+            },
+            Msg::SelectPrev => match self.view_mode {
                 // Saturating: safe when already at 0 or the list is empty.
-                if self.view_mode == ViewMode::List {
-                    self.selection = self.selection.saturating_sub(1);
-                }
-            }
+                ViewMode::List => self.selection = self.selection.saturating_sub(1),
+                ViewMode::Detail => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                ViewMode::Loading => {}
+            },
+            // Filters act only on the list; they are inert while the pane is open.
             Msg::CycleRepoFilter => {
                 if self.view_mode == ViewMode::List {
                     self.filter.repo = self.next_repo_filter();
@@ -327,18 +342,32 @@ impl App {
                     && let Some(row) = self.selected_row()
                 {
                     let id = row.issue.id.clone();
+                    self.detail_seq += 1;
+                    let token = self.detail_seq;
                     self.view_mode = ViewMode::Detail;
                     self.detail = Some(DetailState::Loading { id: id.clone() });
-                    return vec![Effect::FetchDetail(id)];
+                    self.detail_scroll = 0;
+                    return vec![Effect::FetchDetail { id, token }];
                 }
             }
-            Msg::DetailReady { id, detail } => {
-                // Accept only a response for the id the pane is currently bound to;
-                // a stale/out-of-order one (the user moved on) is dropped.
-                if self.detail.as_ref().map(DetailState::id) == Some(id.as_str()) {
+            Msg::DetailReady { token, detail } => {
+                // Accept only the response for the pane's current request; a
+                // superseded one (the user moved on, or reopened the same issue)
+                // carries an older token and is dropped.
+                if self.detail.is_some() && token == self.detail_seq {
                     self.detail = Some(match detail {
                         Ok(loaded) => DetailState::Loaded(loaded),
-                        Err(message) => DetailState::Error { id, message },
+                        // Reuse the id the pane is already bound to (the Loading
+                        // state) so the error names the right issue.
+                        Err(message) => DetailState::Error {
+                            id: self
+                                .detail
+                                .as_ref()
+                                .map(DetailState::id)
+                                .unwrap_or("")
+                                .to_string(),
+                            message,
+                        },
                     });
                 }
             }
@@ -348,6 +377,7 @@ impl App {
                 if self.view_mode == ViewMode::Detail {
                     self.view_mode = ViewMode::List;
                     self.detail = None;
+                    self.detail_scroll = 0;
                 }
             }
             // Placeholders: the pipeline accepts these now; the slice that owns
@@ -457,6 +487,12 @@ impl App {
     pub fn detail(&self) -> Option<&DetailState> {
         self.detail.as_ref()
     }
+
+    /// The detail pane's requested vertical scroll offset (rows). The view clamps
+    /// this to the wrapped content so an over-scroll never shows blank space.
+    pub fn detail_scroll(&self) -> u16 {
+        self.detail_scroll
+    }
 }
 
 #[cfg(test)]
@@ -546,13 +582,28 @@ mod tests {
         }
     }
 
+    /// Open the detail for the current selection, returning the request token from
+    /// the emitted `FetchDetail` (so tests echo the right token in `DetailReady`).
+    fn open(app: &mut App) -> u64 {
+        match app.reduce(Msg::OpenDetail).as_slice() {
+            [Effect::FetchDetail { token, .. }] => *token,
+            other => panic!("expected one FetchDetail, got {other:?}"),
+        }
+    }
+
     #[test]
     fn enter_requests_detail() {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         assert_eq!(app.view_mode(), ViewMode::List);
 
         let effects = app.reduce(Msg::OpenDetail);
-        assert_eq!(effects, vec![Effect::FetchDetail("ra-1".into())]);
+        assert_eq!(
+            effects,
+            vec![Effect::FetchDetail {
+                id: "ra-1".into(),
+                token: 1
+            }]
+        );
         assert_eq!(app.view_mode(), ViewMode::Detail);
         assert!(
             matches!(app.detail(), Some(DetailState::Loading { id }) if id == "ra-1"),
@@ -583,10 +634,10 @@ mod tests {
     #[test]
     fn detail_ready_stores_for_matching_id() {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
-        app.reduce(Msg::OpenDetail);
+        let token = open(&mut app);
 
         app.reduce(Msg::DetailReady {
-            id: "ra-1".into(),
+            token,
             detail: Ok(detail("ra-1", vec![blocker("ra-z70")])),
         });
         match app.detail() {
@@ -602,41 +653,64 @@ mod tests {
     #[test]
     fn stale_detail_response_is_dropped() {
         let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
-        app.reduce(Msg::OpenDetail); // bound to ra-1
+        let token = open(&mut app); // bound to ra-1
 
-        // A response for a different id is dropped, leaving the pane loading ra-1.
+        // A response carrying a token that is not the current request is dropped.
         app.reduce(Msg::DetailReady {
-            id: "ra-2".into(),
-            detail: Ok(detail("ra-2", vec![])),
-        });
-        assert!(
-            matches!(app.detail(), Some(DetailState::Loading { id }) if id == "ra-1"),
-            "a mismatched response is dropped: {:?}",
-            app.detail()
-        );
-
-        // Enter ra-1 → Esc → Enter ra-2, then ra-1's late response is dropped.
-        app.reduce(Msg::Back);
-        app.reduce(Msg::SelectNext);
-        app.reduce(Msg::OpenDetail); // now bound to ra-2
-        app.reduce(Msg::DetailReady {
-            id: "ra-1".into(),
+            token: token + 99,
             detail: Ok(detail("ra-1", vec![])),
         });
         assert!(
-            matches!(app.detail(), Some(DetailState::Loading { id }) if id == "ra-2"),
-            "a superseded id's late response is dropped: {:?}",
+            matches!(app.detail(), Some(DetailState::Loading { id }) if id == "ra-1"),
+            "a mismatched-token response is dropped: {:?}",
             app.detail()
         );
+
+        // The pane's own request still completes.
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+        assert!(matches!(app.detail(), Some(DetailState::Loaded(_))));
+    }
+
+    #[test]
+    fn same_id_reopen_drops_earlier_response() {
+        // Open ra-1, Esc, reopen ra-1: the two fetches share an id but not a
+        // token, so the first (slower) worker's late response must not overwrite
+        // the pane the second request owns.
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let first = open(&mut app);
+        app.reduce(Msg::Back);
+        let second = open(&mut app);
+        assert_ne!(first, second, "each open gets a fresh token");
+
+        // The first request answers late (after the reopen): dropped.
+        app.reduce(Msg::DetailReady {
+            token: first,
+            detail: Err("stale error".into()),
+        });
+        assert!(
+            matches!(app.detail(), Some(DetailState::Loading { .. })),
+            "the earlier request's late response is dropped: {:?}",
+            app.detail()
+        );
+
+        // The second (current) request lands and is shown.
+        app.reduce(Msg::DetailReady {
+            token: second,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+        assert!(matches!(app.detail(), Some(DetailState::Loaded(_))));
     }
 
     #[test]
     fn detail_fetch_error_shows_message() {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
-        app.reduce(Msg::OpenDetail);
+        let token = open(&mut app);
 
         app.reduce(Msg::DetailReady {
-            id: "ra-1".into(),
+            token,
             detail: Err("bd show failed: boom".into()),
         });
         match app.detail() {
@@ -655,9 +729,9 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
         app.reduce(Msg::SelectNext); // selection = 1 -> ra-2
         assert_eq!(app.selection(), Some(1));
-        app.reduce(Msg::OpenDetail);
+        let token = open(&mut app);
         app.reduce(Msg::DetailReady {
-            id: "ra-2".into(),
+            token,
             detail: Ok(detail("ra-2", vec![])),
         });
 
@@ -673,8 +747,9 @@ mod tests {
 
     #[test]
     fn navigation_inert_while_detail_open() {
-        // With the pane open, j/k/f/p must not move the underlying selection —
-        // otherwise Esc would return to a different row than it was opened from.
+        // With the pane open, j/k must not move the underlying list selection (they
+        // scroll the pane instead) and f/p are inert — otherwise Esc would return
+        // to a different row than it was opened from.
         let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
         app.reduce(Msg::OpenDetail); // Detail, bound to ra-1, selection 0
 
@@ -689,12 +764,31 @@ mod tests {
     }
 
     #[test]
+    fn detail_scroll_moves_and_resets() {
+        // In Detail mode j/k scroll the pane; the offset resets on open and close.
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        open(&mut app);
+        assert_eq!(app.detail_scroll(), 0, "opens at the top");
+
+        app.reduce(Msg::SelectNext);
+        app.reduce(Msg::SelectNext);
+        assert_eq!(app.detail_scroll(), 2, "j scrolls down");
+        app.reduce(Msg::SelectPrev);
+        assert_eq!(app.detail_scroll(), 1, "k scrolls up");
+
+        app.reduce(Msg::Back);
+        assert_eq!(app.detail_scroll(), 0, "reset on close");
+        open(&mut app);
+        assert_eq!(app.detail_scroll(), 0, "reset on reopen");
+    }
+
+    #[test]
     fn refresh_under_detail_keeps_pane() {
         // A background refresh must not slam the open detail pane shut.
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
-        app.reduce(Msg::OpenDetail);
+        let token = open(&mut app);
         app.reduce(Msg::DetailReady {
-            id: "ra-1".into(),
+            token,
             detail: Ok(detail("ra-1", vec![])),
         });
         assert_eq!(app.view_mode(), ViewMode::Detail);

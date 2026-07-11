@@ -141,7 +141,7 @@ fn execute_effect(
     worker_handles.retain(|h| !h.is_finished());
     let handle = match effect {
         Effect::Refresh => spawn_refresh(tx, paths, roster),
-        Effect::FetchDetail(id) => spawn_detail(tx, paths, id),
+        Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
     };
     worker_handles.push(handle);
 }
@@ -176,19 +176,25 @@ pub(crate) fn refresh_worker(bd: impl BdClient, roster: Config, paths: Paths, tx
 /// Spawn a background detail worker that reports over `tx`, returning its join
 /// handle so the event loop can wait for it on shutdown. Clones the paths into
 /// the thread and builds a fresh [`BdCli`] (stateless).
-fn spawn_detail(tx: &Sender<Msg>, paths: &Paths, id: String) -> thread::JoinHandle<()> {
+fn spawn_detail(tx: &Sender<Msg>, paths: &Paths, id: String, token: u64) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
-    thread::spawn(move || detail_worker(BdCli::new(), paths, id, tx))
+    thread::spawn(move || detail_worker(BdCli::new(), paths, id, token, tx))
 }
 
 /// The detail worker body: fetch one issue's detail and send exactly one
-/// [`Msg::DetailReady`] tagged with `id` (so a stale response can be dropped).
+/// [`Msg::DetailReady`] echoing `token` (so a superseded response can be dropped).
 /// Owned args so it moves cleanly into a thread; unit-tested directly with a
 /// [`crate::bd::FakeBdClient`] and a channel.
-pub(crate) fn detail_worker(bd: impl BdClient, paths: Paths, id: String, tx: Sender<Msg>) {
+pub(crate) fn detail_worker(
+    bd: impl BdClient,
+    paths: Paths,
+    id: String,
+    token: u64,
+    tx: Sender<Msg>,
+) {
     let detail = gather_detail(&bd, &paths, &id).map(Box::new);
-    let _ = tx.send(Msg::DetailReady { id, detail });
+    let _ = tx.send(Msg::DetailReady { token, detail });
 }
 
 /// Run `bd show <id> --json` against the hub, mapping a [`BdError`] to a
@@ -506,11 +512,11 @@ mod tests {
         let bd = FakeBdClient::new().with_show(detail());
         let (tx, rx) = mpsc::channel();
 
-        let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), tx));
+        let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 7, tx));
 
         match rx.recv().unwrap() {
-            Msg::DetailReady { id, detail } => {
-                assert_eq!(id, "ra-1");
+            Msg::DetailReady { token, detail } => {
+                assert_eq!(token, 7, "the request token is echoed back");
                 let d = detail.expect("a detail on success");
                 assert_eq!(d.issue.id, "ra-1");
                 assert_eq!(d.dependencies.len(), 1);
@@ -529,11 +535,11 @@ mod tests {
         let bd = FakeBdClient::new().with_show_err(bd_err());
         let (tx, rx) = mpsc::channel();
 
-        let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), tx));
+        let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 1, tx));
 
         match rx.recv().unwrap() {
-            Msg::DetailReady { id, detail } => {
-                assert_eq!(id, "ra-1");
+            Msg::DetailReady { token, detail } => {
+                assert_eq!(token, 1);
                 let msg = detail.expect_err("a message on failure");
                 assert!(
                     msg.contains("boom") || msg.to_lowercase().contains("fail"),
