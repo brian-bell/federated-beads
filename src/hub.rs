@@ -193,9 +193,16 @@ fn ensure_within(parent: &Path, target: &Path) -> Result<(), HubError> {
     })
 }
 
-/// True if `hub` is an initialized beads workspace (`<hub>/.beads` exists).
+/// True if `hub` is a fully initialized beads workspace.
+///
+/// Keys on the embedded Dolt database dir (`.beads/embeddeddolt`), not merely
+/// `.beads/`, to mirror bd's own "already initialized" criterion: a re-run of
+/// `bd init` aborts citing the existing `.beads/embeddeddolt/<db>`. A bare or
+/// partial `.beads/` left by an interrupted `bd init` therefore correctly reads
+/// as uninitialized, so `ensure_hub` re-inits instead of reporting a broken hub
+/// as ready. (fbd always uses the default embedded backend — see the plan.)
 fn is_initialized(hub: &Path) -> bool {
-    hub.join(".beads").is_dir()
+    hub.join(".beads").join("embeddeddolt").is_dir()
 }
 
 /// Canonicalize `p` if it exists on disk; otherwise return it unchanged. Used to
@@ -230,10 +237,11 @@ mod tests {
     use std::path::Path;
 
     /// Write a minimal hub `config.yaml` under `hub` with the given additional
-    /// repos, marking the hub "initialized" for [`is_initialized`].
+    /// repos, and create the embedded-Dolt dir so [`is_initialized`] sees a fully
+    /// initialized workspace (as a real `bd init` would leave it).
     fn seed_hub_config(hub: &Path, additional: &[&Path]) {
         let beads = hub.join(".beads");
-        fs::create_dir_all(&beads).unwrap();
+        fs::create_dir_all(beads.join("embeddeddolt")).unwrap();
         let mut yaml = String::from("repos:\n  primary: \".\"\n  additional:\n");
         for p in additional {
             yaml.push_str(&format!("    - \"{}\"\n", p.display()));
@@ -413,6 +421,26 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Call::RepoAdd(_, _))),
             "a hub-relative stored entry must match the absolute roster path"
+        );
+    }
+
+    #[test]
+    fn reinitializes_when_beads_dir_is_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // A `.beads/` left by an interrupted init, with no embedded Dolt db.
+        fs::create_dir_all(hub_dir(&paths).join(".beads")).unwrap();
+        let fake = FakeBdClient::new();
+
+        ensure_hub(&fake, &paths, &Config::default()).unwrap();
+
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|c| matches!(c, Call::Init(_, _)))
+                .count(),
+            1,
+            "a partial .beads dir (no db) must be treated as uninitialized"
         );
     }
 
