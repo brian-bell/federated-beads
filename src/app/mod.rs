@@ -8,6 +8,7 @@
 //! [`keys`], so this core stays backend-agnostic and exhaustively unit-testable.
 //! See `plans/slices/slice-8.md`.
 
+pub mod context;
 pub mod keys;
 pub mod view;
 
@@ -86,9 +87,27 @@ pub enum Msg {
     /// Run the current search query (`Enter` while editing); `reduce` emits
     /// [`Effect::Search`] unless the query is empty/whitespace.
     SubmitSearch,
-    /// Copy an actionable context string for the selected row (`y`). Placeholder
-    /// in Slice 8; Slice 12 owns it.
+    /// Copy an actionable `cd <repo> && bd show <id>` command for the selected
+    /// row (`y`); `reduce` emits [`Effect::Copy`] with `markdown: false`.
     CopyContext,
+    /// Copy a markdown block (title/id/repo/description) for the selected row
+    /// (`Y`); `reduce` emits [`Effect::Copy`] with `markdown: true`.
+    CopyMarkdown,
+    /// A copy worker finished building the clipboard string (runtime copy worker →
+    /// app). `token` echoes the request's generation (see [`Effect::Copy`]) so a
+    /// superseded copy's late reply — the user copied row A, moved, copied row B,
+    /// and A's slower path-resolution finished last — is dropped rather than
+    /// clobbering the clipboard/confirmation with the stale selection. `payload`
+    /// is the full text to place on the clipboard (via OSC 52); `summary` is the
+    /// pre-truncated one-liner for the status-bar confirmation. Both are built off
+    /// the UI thread (the id→repo-path resolution runs `bd`); on acceptance
+    /// `reduce` stores `summary` and returns [`Effect::WriteClipboard`] so the
+    /// actual tty write happens back on the UI thread.
+    Copied {
+        token: u64,
+        payload: String,
+        summary: String,
+    },
     /// Leave the current sub-mode back to the list (`Esc`). No-op in `List`;
     /// Slices 10/11 return from `Detail`/`Search`.
     Back,
@@ -115,6 +134,23 @@ pub enum Effect {
     /// echoes `token` back in [`Msg::SearchResults`] so a superseded query's late
     /// response is dropped.
     Search { query: String, token: u64 },
+    /// Build the copy-context string for `row` (`y`/`Y`). Boxed to keep `Effect`
+    /// small. The runtime resolves the row's source-repo path from its issue id
+    /// (the same prefix-map path search uses), builds the `cd …`/`bd -C …`
+    /// command (`markdown: false`) or a markdown block (`markdown: true`), and
+    /// sends it back as [`Msg::Copied`] echoing `token` (the request's generation,
+    /// so a superseded copy's late reply is dropped). Kept off `reduce` because
+    /// `Row` carries no filesystem path (by [`crate::snapshot`] design), so the
+    /// string can only be built where the roster/prefix map is available.
+    Copy {
+        row: Box<Row>,
+        markdown: bool,
+        token: u64,
+    },
+    /// Write `payload` to the terminal clipboard via an OSC 52 escape (the
+    /// [`Msg::Copied`] follow-up). Performed on the UI thread, which owns the tty,
+    /// so the escape can never interleave with a ratatui draw from a worker.
+    WriteClipboard(String),
 }
 
 /// Which screen the app is showing.
@@ -382,6 +418,11 @@ pub struct App {
     fetched_at: Option<SystemTime>,
     /// The detail pane, `Some` exactly when `view_mode == Detail`.
     detail: Option<DetailState>,
+    /// The row the detail pane was opened from, kept for the whole pane lifetime
+    /// (`Some` exactly with `detail`). A copy from the pane uses this row's repo
+    /// attribution, so it survives a refresh that drops the issue from the ready
+    /// list; the fetched detail supplies the richer issue body.
+    detail_row: Option<Row>,
     /// A monotonic generation stamped on each detail request. The current pane's
     /// token is this value; a `DetailReady` is accepted only when its token still
     /// matches, so a superseded fetch (including a reopen of the same issue) is
@@ -390,6 +431,22 @@ pub struct App {
     /// The detail pane's vertical scroll offset (rows). Reset on open/close; the
     /// view clamps it to the wrapped content so all of a long detail is reachable.
     detail_scroll: u16,
+    /// A transient "copied: …" confirmation for the status bar, set when a copy
+    /// worker reports back and cleared on the next refresh cycle. `None` when no
+    /// copy has happened since the last refresh.
+    copy_flash: Option<String>,
+    /// A monotonic generation stamped on each copy request, echoed by the worker
+    /// so a superseded copy's late result is dropped (mirrors `detail_seq` /
+    /// `search_seq`): the newest copy always wins the clipboard.
+    copy_seq: u64,
+    /// Whether a copy worker is resolving right now. New copy requests coalesce
+    /// into `copy_pending` while this holds, so a held `y`/`Y` cannot spawn an
+    /// unbounded pile of subprocess-backed workers (at most one runs at a time).
+    copy_in_flight: bool,
+    /// A copy requested while one was already in flight: the target row (captured
+    /// and validated at press time, so a later cursor move can't redirect it) and
+    /// its format. Only the latest is kept; it fires when the flight completes.
+    copy_pending: Option<(Box<Row>, bool)>,
     /// The user asked to quit; the runtime loop should exit.
     done: bool,
 }
@@ -418,8 +475,13 @@ impl App {
             status_warnings: Vec::new(),
             fetched_at: None,
             detail: None,
+            detail_row: None,
             detail_seq: 0,
             detail_scroll: 0,
+            copy_flash: None,
+            copy_seq: 0,
+            copy_in_flight: false,
+            copy_pending: None,
             done: false,
         }
     }
@@ -473,6 +535,8 @@ impl App {
                 }
                 // The runtime sends the full warning set per cycle, so replace.
                 self.status_warnings = warnings;
+                // A fresh cycle clears any lingering copy confirmation.
+                self.copy_flash = None;
                 // The single, atomic point that ends the in-flight cycle.
                 self.stale = false;
             }
@@ -530,11 +594,16 @@ impl App {
                 if self.is_browsing()
                     && let Some(row) = self.active().selected_row()
                 {
+                    // Remember the opened row so a copy from the pane keeps its
+                    // exact issue and repo attribution even if a later refresh
+                    // drops it from the list (the pane pins one issue).
+                    let row = row.clone();
                     let id = row.issue.id.clone();
                     self.detail_seq += 1;
                     let token = self.detail_seq;
                     self.view_mode = ViewMode::Detail;
                     self.detail = Some(DetailState::Loading { id: id.clone() });
+                    self.detail_row = Some(row);
                     self.detail_scroll = 0;
                     return vec![Effect::FetchDetail { id, token }];
                 }
@@ -571,6 +640,7 @@ impl App {
                         ViewMode::List
                     };
                     self.detail = None;
+                    self.detail_row = None;
                     self.detail_scroll = 0;
                 }
                 // From the query editor, `Esc` exits search and restores the ready
@@ -664,11 +734,104 @@ impl App {
                     }
                 }
             }
-            // Placeholder: Slice 12 owns copy-context.
-            Msg::CopyContext => {}
+            // `y`/`Y` copy the selected row's context. `reduce` can't build the
+            // string (a `Row` carries no path), so it emits `Effect::Copy` and the
+            // runtime resolves the path + builds the string off the UI thread.
+            Msg::CopyContext => return self.copy_effect(false),
+            Msg::CopyMarkdown => return self.copy_effect(true),
+            Msg::Copied {
+                token,
+                payload,
+                summary,
+            } => {
+                // Accept only the in-flight copy's result; a stale token (defensive
+                // — coalescing keeps one copy in flight) is dropped without ending
+                // the flight.
+                if token == self.copy_seq {
+                    self.copy_in_flight = false;
+                    self.copy_flash = Some(summary);
+                    let mut effects = vec![Effect::WriteClipboard(payload)];
+                    // A copy requested while this one was resolving was coalesced;
+                    // launch that captured target now (the row was validated and
+                    // snapshotted at press time, so a later cursor move can't
+                    // redirect it), without ever having spawned a second worker.
+                    if let Some((row, markdown)) = self.copy_pending.take() {
+                        effects.push(self.launch_copy(row, markdown));
+                    }
+                    return effects;
+                }
+            }
             Msg::Quit => self.done = true,
         }
         Vec::new()
+    }
+
+    /// Emit an [`Effect::Copy`] for the selected row of the active list, or no
+    /// effect when nothing is selected (an empty list, or the search editor). The
+    /// active list is the search results while a search is live (including a
+    /// detail opened from one) else the ready list, so `y`/`Y` copy the issue the
+    /// user is actually looking at in List / Search-results / Detail alike.
+    fn copy_effect(&mut self, markdown: bool) -> Vec<Effect> {
+        // Resolve the target at press time, so a copy always names the row the user
+        // was looking at when they pressed `y`/`Y` — never a row they moved to
+        // later, and never anything when the current mode has no source (e.g. the
+        // search `Loading` phase, where copy is a no-op).
+        let Some(row) = self.copy_source_row() else {
+            return Vec::new();
+        };
+        let row = Box::new(row);
+        // Coalesce while a copy is resolving: its path resolution runs a `bd`
+        // subprocess per repo on a worker thread, so a held `y`/`Y` (auto-repeat
+        // arrives as a burst of key events) must not pile up workers. Capture this
+        // (already-validated) target; only the latest fires when the flight ends.
+        if self.copy_in_flight {
+            self.copy_pending = Some((row, markdown));
+            return Vec::new();
+        }
+        vec![self.launch_copy(row, markdown)]
+    }
+
+    /// Start a copy for an already-resolved `row`: stamp a fresh generation, mark
+    /// the flight in progress, and return the [`Effect::Copy`] the runtime runs.
+    fn launch_copy(&mut self, row: Box<Row>, markdown: bool) -> Effect {
+        self.copy_seq += 1;
+        self.copy_in_flight = true;
+        Effect::Copy {
+            row,
+            markdown,
+            token: self.copy_seq,
+        }
+    }
+
+    /// The row `y`/`Y` should copy for the current mode, or `None` when there is
+    /// nothing to copy.
+    ///
+    /// In `Detail` this is the issue the pane *pins* — the row it was opened from
+    /// (`detail_row`), **not** the underlying list selection, which a refresh can
+    /// re-clamp to a different row while the pane stays open. Its repo attribution
+    /// is preserved even if the issue has since left the ready list; the fetched
+    /// detail, when loaded, supplies the richer issue body (its full description).
+    /// Otherwise only a browsable list copies (the ready list, or *settled* search
+    /// results): the search editor and its `Loading` phase have no visible
+    /// selection, so `y` there must not copy a retained, invisible result.
+    fn copy_source_row(&self) -> Option<Row> {
+        if self.view_mode == ViewMode::Detail {
+            let opened = self.detail_row.as_ref()?;
+            // Prefer the fetched detail's issue (it carries the description) while
+            // keeping the opened row's repo attribution.
+            let issue = match &self.detail {
+                Some(DetailState::Loaded(d)) if d.issue.id == opened.issue.id => d.issue.clone(),
+                _ => opened.issue.clone(),
+            };
+            return Some(Row {
+                issue,
+                repo_name: opened.repo_name.clone(),
+            });
+        }
+        if self.is_browsing() {
+            return self.active().selected_row().cloned();
+        }
+        None
     }
 
     /// The list the read accessors and the view reflect: the search results while
@@ -790,6 +953,12 @@ impl App {
     /// this to the wrapped content so an over-scroll never shows blank space.
     pub fn detail_scroll(&self) -> u16 {
         self.detail_scroll
+    }
+
+    /// The transient copy confirmation for the status bar, if a copy has happened
+    /// since the last refresh.
+    pub fn copy_flash(&self) -> Option<&str> {
+        self.copy_flash.as_deref()
     }
 }
 
@@ -1391,6 +1560,300 @@ mod tests {
         app.reduce(Msg::Back); // Error -> Editing
         app.reduce(Msg::Back); // Editing -> List
         assert_eq!(ids(&app.filtered_rows()), vec!["ra-1"]);
+    }
+
+    // ---- Copy-context (Slice 12) ----
+
+    /// The single `Effect::Copy` from a copy message (row, markdown, token),
+    /// panicking otherwise.
+    fn copy(app: &mut App, msg: Msg) -> (Row, bool, u64) {
+        match app.reduce(msg).as_slice() {
+            [
+                Effect::Copy {
+                    row,
+                    markdown,
+                    token,
+                },
+            ] => ((**row).clone(), *markdown, *token),
+            other => panic!("expected one Copy effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_context_emits_effect() {
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (r, markdown, token) = copy(&mut app, Msg::CopyContext);
+        assert_eq!(r.issue.id, "mc-abc", "the selected row is carried");
+        assert_eq!(r.repo_name, "megaclock");
+        assert!(!markdown, "y copies the command form");
+        assert_eq!(token, 1, "the first copy is generation 1");
+    }
+
+    #[test]
+    fn copy_markdown_emits_effect() {
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (r, markdown, _) = copy(&mut app, Msg::CopyMarkdown);
+        assert_eq!(r.issue.id, "mc-abc");
+        assert!(markdown, "Y copies the markdown form");
+    }
+
+    #[test]
+    fn copy_in_search_results_emits_effect() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = submit(&mut app, "foo");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![
+                row("megaclock", "mc-1", 0),
+                row("session-tui", "st-9", 2),
+            ]),
+        });
+        app.reduce(Msg::SelectNext); // select st-9 in the results
+        let (r, _, _) = copy(&mut app, Msg::CopyContext);
+        assert_eq!(r.issue.id, "st-9", "copies the selected search result");
+    }
+
+    #[test]
+    fn copy_in_detail_emits_effect() {
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let token = open(&mut app);
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("mc-abc", vec![])),
+        });
+        assert_eq!(app.view_mode(), ViewMode::Detail);
+        let (r, _, _) = copy(&mut app, Msg::CopyContext);
+        assert_eq!(r.issue.id, "mc-abc", "copies the opened issue from Detail");
+    }
+
+    #[test]
+    fn copy_in_detail_uses_pinned_issue_after_refresh() {
+        // Open detail on ra-1, then a refresh removes ra-1 and the ready selection
+        // clamps to ra-2. `y` must still copy the pinned ra-1 (what the pane
+        // shows), not the re-clamped selection.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]);
+        let token = open(&mut app);
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+        app.reduce(completed(vec![row("ra", "ra-2", 2), row("ra", "ra-3", 2)]));
+        assert_eq!(app.view_mode(), ViewMode::Detail, "pane stays open");
+
+        let (r, _, _) = copy(&mut app, Msg::CopyContext);
+        assert_eq!(
+            r.issue.id, "ra-1",
+            "copies the pinned detail issue, not the re-clamped list selection"
+        );
+        assert_eq!(
+            r.repo_name, "ra",
+            "the opened row's repo attribution survives the refresh, not 'unknown'"
+        );
+    }
+
+    #[test]
+    fn copy_noop_while_search_loading() {
+        // A resubmitted query is Loading with the previous results still retained
+        // (but invisible). `y` must not copy that stale, hidden result.
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = submit(&mut app, "foo");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![row("megaclock", "mc-1", 0)]),
+        });
+        app.reduce(Msg::Back); // Results -> Editing (results retained internally)
+        app.reduce(Msg::SearchInput('b'));
+        app.reduce(Msg::SubmitSearch); // -> Loading
+        assert_eq!(app.search_phase(), Some(&SearchPhase::Loading));
+
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "no copy of a retained, invisible result while a new search loads"
+        );
+    }
+
+    #[test]
+    fn copy_no_selection_noops() {
+        let mut app = app_with(vec![]);
+        assert_eq!(app.selected_row(), None);
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "no selection copies nothing"
+        );
+        assert!(app.copy_flash().is_none(), "and shows no confirmation");
+    }
+
+    #[test]
+    fn copied_sets_flash_and_writes() {
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, token) = copy(&mut app, Msg::CopyContext);
+        let effects = app.reduce(Msg::Copied {
+            token,
+            payload: "cd /dev/megaclock && bd show mc-abc".into(),
+            summary: "copied cd mc-abc".into(),
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::WriteClipboard(
+                "cd /dev/megaclock && bd show mc-abc".into()
+            )],
+            "the payload is handed back for the UI-thread tty write"
+        );
+        assert_eq!(app.copy_flash(), Some("copied cd mc-abc"));
+    }
+
+    #[test]
+    fn stale_copy_token_dropped() {
+        // A defensive guard: a `Copied` whose token is not the in-flight copy's is
+        // dropped (writes nothing, keeps the flight open) so only the real result
+        // is applied.
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, token) = copy(&mut app, Msg::CopyContext);
+
+        let effects = app.reduce(Msg::Copied {
+            token: token + 99,
+            payload: "wrong".into(),
+            summary: "wrong".into(),
+        });
+        assert_eq!(
+            effects,
+            Vec::new(),
+            "a mismatched-token result writes nothing"
+        );
+        assert!(app.copy_flash().is_none(), "and shows no confirmation");
+
+        // The real result still lands.
+        let effects = app.reduce(Msg::Copied {
+            token,
+            payload: "right".into(),
+            summary: "copied mc-abc".into(),
+        });
+        assert_eq!(effects, vec![Effect::WriteClipboard("right".into())]);
+        assert_eq!(app.copy_flash(), Some("copied mc-abc"));
+    }
+
+    #[test]
+    fn copy_coalesces_while_in_flight() {
+        // Holding y/Y (or mashing it) while a copy resolves must not spawn a second
+        // worker: the request coalesces and fires once the first completes, for the
+        // then-current selection — so the last press wins with at most one worker
+        // in flight at a time.
+        let mut app = app_with(vec![
+            row("megaclock", "mc-a", 1),
+            row("session-tui", "st-b", 1),
+        ]);
+        let (_, _, first) = copy(&mut app, Msg::CopyContext); // worker for mc-a, in flight
+
+        // A second copy while in flight: no new Copy effect (coalesced), and the
+        // target (st-b) is captured now.
+        app.reduce(Msg::SelectNext); // selecting st-b
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "a copy while one is in flight spawns no second worker"
+        );
+        // Moving the cursor after the coalesced press must NOT redirect the copy.
+        app.reduce(Msg::SelectPrev); // back to mc-a
+
+        // The first completes: writes its payload AND fires the copy captured at
+        // press time (st-b), not the now-current selection (mc-a).
+        let effects = app.reduce(Msg::Copied {
+            token: first,
+            payload: "cd a && bd show mc-a".into(),
+            summary: "copied mc-a".into(),
+        });
+        let second = match effects.as_slice() {
+            [
+                Effect::WriteClipboard(p),
+                Effect::Copy {
+                    row,
+                    markdown: false,
+                    token,
+                },
+            ] => {
+                assert_eq!(p, "cd a && bd show mc-a", "the first copy still writes");
+                assert_eq!(
+                    row.issue.id, "st-b",
+                    "the coalesced copy targets the row selected when it was pressed"
+                );
+                assert_ne!(*token, first, "the coalesced copy is a fresh generation");
+                *token
+            }
+            other => panic!("expected write + coalesced copy, got {other:?}"),
+        };
+
+        // The coalesced copy completes and is shown; nothing further is pending.
+        let effects = app.reduce(Msg::Copied {
+            token: second,
+            payload: "cd b && bd show st-b".into(),
+            summary: "copied st-b".into(),
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::WriteClipboard("cd b && bd show st-b".into())],
+            "no further coalesced copy remains"
+        );
+        assert_eq!(app.copy_flash(), Some("copied st-b"));
+    }
+
+    #[test]
+    fn no_pending_copy_from_a_no_source_state() {
+        // A copy is in flight; the user opens search and submits (Loading phase,
+        // where copy is a no-op). Pressing `y` there must not queue a copy that
+        // later fires against an arriving result.
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, first) = copy(&mut app, Msg::CopyContext); // in flight
+
+        let stoken = submit(&mut app, "foo"); // -> Search, Loading
+        assert_eq!(app.search_phase(), Some(&SearchPhase::Loading));
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "copy in the Loading phase is a no-op and queues nothing"
+        );
+
+        // The in-flight copy completes: no pending copy was captured, so only the
+        // write happens (no stray Copy effect).
+        let effects = app.reduce(Msg::Copied {
+            token: first,
+            payload: "cd a && bd show mc-abc".into(),
+            summary: "copied mc-abc".into(),
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::WriteClipboard("cd a && bd show mc-abc".into())],
+            "nothing was queued during the no-source Loading phase"
+        );
+
+        // Results arrive; the earlier `y` must not have copied one.
+        app.reduce(Msg::SearchResults {
+            token: stoken,
+            rows: Ok(vec![row("session-tui", "st-9", 1)]),
+        });
+        assert_eq!(
+            app.copy_flash(),
+            Some("copied mc-abc"),
+            "no phantom copy fired"
+        );
+    }
+
+    #[test]
+    fn copy_flash_clears_on_refresh() {
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, token) = copy(&mut app, Msg::CopyContext);
+        app.reduce(Msg::Copied {
+            token,
+            payload: "x".into(),
+            summary: "copied cd mc-abc".into(),
+        });
+        assert!(app.copy_flash().is_some());
+        app.reduce(completed(vec![row("megaclock", "mc-abc", 1)]));
+        assert!(
+            app.copy_flash().is_none(),
+            "a fresh refresh cycle clears the stale confirmation"
+        );
     }
 
     #[test]

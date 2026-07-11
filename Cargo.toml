@@ -2,6 +2,12 @@
 name = "fbd"
 version = "0.1.0"
 edition = "2024"
+description = "Federated Beads: a read-only terminal UI over a bd multi-repo hub — one cross-repo ready-work list, detail pane, search, and copy-context."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/gastownhall/federated-beads"
+keywords = ["tui", "beads", "issue-tracker", "ratatui", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.103"
