@@ -263,6 +263,12 @@ impl App {
             }
             Msg::RefreshCompleted { snapshot, warnings } => {
                 if let Some(snapshot) = snapshot {
+                    // With the pane open, remember the opened issue so the refresh's
+                    // re-sort does not move the selection to a *different* row: the
+                    // pane pins one issue, and `Esc` must return to it. (Slice 8
+                    // decision 5 otherwise preserves only the selection index; this
+                    // narrower rule applies just while a detail is open.)
+                    let opened_id = self.detail.as_ref().map(|d| d.id().to_string());
                     self.rows = snapshot.rows;
                     self.fetched_at = Some(snapshot.fetched_at);
                     // Only promote the first-snapshot transition; a refresh
@@ -275,6 +281,16 @@ impl App {
                     // against the new rows and re-clamp the selection. (`None`
                     // keeps the last-good rows, so no recompute is needed.)
                     self.recompute();
+                    // Relocate the selection onto the opened issue if it survived
+                    // the refresh; otherwise the clamped index stands (fallback).
+                    if let Some(id) = opened_id
+                        && let Some(pos) = self
+                            .filtered_ix
+                            .iter()
+                            .position(|&i| self.rows[i].issue.id == id)
+                    {
+                        self.selection = pos;
+                    }
                 }
                 // The runtime sends the full warning set per cycle, so replace.
                 self.status_warnings = warnings;
@@ -801,6 +817,48 @@ mod tests {
         );
         assert!(app.detail().is_some());
         assert_eq!(app.rows().len(), 2, "rows updated underneath the pane");
+    }
+
+    #[test]
+    fn refresh_under_detail_preserves_opened_row() {
+        // Open the detail on ra-1 (selection 0), then a refresh reorders the rows
+        // so ra-1 moves. The selection must follow the opened issue, so Esc
+        // returns to ra-1 rather than whatever now sits at index 0.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]);
+        let token = open(&mut app);
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+
+        app.reduce(completed(vec![
+            row("ra", "ra-0", 0), // new row jumps to the front
+            row("ra", "ra-2", 2),
+            row("ra", "ra-1", 1), // ra-1 now at index 2
+        ]));
+
+        app.reduce(Msg::Back);
+        assert_eq!(
+            app.selected_row().map(|r| r.issue.id.as_str()),
+            Some("ra-1"),
+            "selection follows the opened issue across the refresh re-sort"
+        );
+    }
+
+    #[test]
+    fn refresh_under_detail_falls_back_when_opened_row_gone() {
+        // If the opened issue vanishes from the refreshed rows, the selection
+        // falls back to the clamped index (no panic, still a valid selection).
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]);
+        let token = open(&mut app);
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+
+        app.reduce(completed(vec![row("ra", "ra-2", 2), row("ra", "ra-3", 2)]));
+        app.reduce(Msg::Back);
+        assert!(app.selected_row().is_some(), "a valid selection remains");
     }
 
     #[test]

@@ -318,4 +318,12 @@ Ran to convergence.
   2. *Long detail clipped with no scroll (P2)* — worsened by round 1's navigation
      gating. **Fixed** — decision 6a adds pane scrolling with a view-side clamp to
      the wrapped height. Test `long_detail_dependencies_reachable_by_scroll`.
-- **Round 3** — clean (helper exited 0, no accepted/actionable findings).
+- **Round 3** — one finding: *refresh under the open pane can move the selection
+  to a different issue (P2).* A refresh re-sorts `rows`, and `recompute` preserved
+  only the numeric index, so `Esc` could return to a different row than the pane
+  was opened from. **Fixed** — `RefreshCompleted` now, *while a detail is open*,
+  relocates the selection onto the opened issue's id after recompute (fallback to
+  the clamped index if it vanished); the general list keeps Slice 8 decision 5's
+  index-only behavior. Tests `refresh_under_detail_preserves_opened_row`,
+  `refresh_under_detail_falls_back_when_opened_row_gone`.
+- **Round 4** — clean (helper exited 0, no accepted/actionable findings).
