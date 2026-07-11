@@ -115,12 +115,26 @@ pub fn ensure_hub(
 pub fn reset(paths: &Paths) -> Result<(), HubError> {
     let hub = hub_dir(paths);
     ensure_within(paths.data_dir(), &hub)?;
-    if hub.exists() {
-        fs::remove_dir_all(&hub).map_err(|source| HubError::Io {
-            path: hub.clone(),
-            source,
-        })?;
-    }
+    // `symlink_metadata` does not follow symlinks, so a *dangling* symlink at the
+    // hub path is still detected (unlike `Path::exists`) and removed — otherwise
+    // reset would silently no-op and the stale link would block the next
+    // `ensure_hub` from recreating the directory.
+    let meta = match fs::symlink_metadata(&hub) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(HubError::Io { path: hub, source }),
+    };
+    // Remove a real directory recursively; unlink a symlink (removing the link,
+    // never its target) or a stray file squatting the path.
+    let result = if meta.is_dir() {
+        fs::remove_dir_all(&hub)
+    } else {
+        fs::remove_file(&hub)
+    };
+    result.map_err(|source| HubError::Io {
+        path: hub.clone(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -441,6 +455,26 @@ mod tests {
         assert!(paths.data_dir().exists(), "data dir preserved");
         // A second reset on the now-absent hub is a no-op.
         reset(&paths).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_removes_dangling_hub_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(hub.parent().unwrap()).unwrap();
+        // A symlink to a nonexistent target: `Path::exists()` reports false, but
+        // it still occupies the hub path and must be cleared.
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &hub).unwrap();
+        assert!(!hub.exists(), "precondition: dangling symlink");
+
+        reset(&paths).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&hub).is_err(),
+            "dangling symlink at hub path must be removed"
+        );
     }
 
     #[test]
