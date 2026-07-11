@@ -222,3 +222,30 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --test bd_integration
 ```
+
+## Autoreview outcomes (post-implementation)
+
+Codex (gpt-5.6-sol, high) review of the branch vs main: 3 findings, all fixed
+(none skipped); a second pass was clean ("patch is correct", 0.91).
+
+1. **P1 — exports were written to fbd's cwd, not the source repo.** bd resolves a
+   relative `-o` against the *process* working directory, not the `-C` dir
+   (verified against bd 1.1.0 — the Slice 2 `argv_export` comment was factually
+   wrong). Every refresh export clobbered the caller's `.beads/issues.jsonl` and
+   `repo sync` then consumed each repo's *stale* pre-existing export. Direct
+   evidence: this repo's own export had been overwritten with `rb` fixture data.
+   Fix in `src/bd/cli.rs`: `argv_export` joins the output onto the repo
+   (`<repo>/.beads/issues.jsonl`), correct for absolute and relative repo paths.
+   `refresh_two_repos` was strengthened to create a marker issue *after* the
+   fixture helper's export, so only refresh's own (fixed) export can carry it
+   into the hub — making the test a real regression guard.
+2. **P2 — a shorter unique prefix could mask a longer collided one.** `repo_for`
+   only consulted unique prefixes, so with `app` (unique) and a collided
+   `app-foo`, `app-foo-123` wrongly resolved to `app`. Collided prefixes now stay
+   in the lookup table as `None` entries, so they still win longest-match and
+   resolve to `None` (ambiguous). Regression test:
+   `collided_longer_prefix_is_not_masked_by_shorter`.
+3. **P2 — a duplicate roster entry was a false self-collision.** `run` now dedupes
+   roster entries by canonical path (mirroring `ensure_hub`), so an aliased
+   duplicate exports once and never collides with itself. Regression test:
+   `duplicate_roster_entry_is_not_a_collision`.
