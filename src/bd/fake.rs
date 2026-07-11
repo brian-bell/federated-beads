@@ -29,24 +29,28 @@ pub enum Call {
 
 /// A programmable [`BdClient`] test double.
 ///
-/// Responses are set with the `with_*` builders and are **reused** across calls
-/// (not consumed). Unset JSON responses default to something benign (empty list,
-/// bd 1.1.0 version); the mutating calls default to `Ok(())`. Every call is
-/// recorded and retrievable via [`FakeBdClient::calls`].
-///
-/// `export` failures are programmable **per repo path** (see
-/// [`FakeBdClient::with_export_err`]) so the refresh pipeline's
-/// one-repo-fails-others-succeed path is testable: an unprogrammed path still
-/// exports `Ok`.
+/// **Every** method of the trait is programmable with a success value or a
+/// [`BdError`], so downstream modules can drive their error paths (hub init
+/// failure, roster-list failure, sync failure, per-repo export failure, …)
+/// without writing another fake. Each `with_*` response is **reused** across
+/// calls (not consumed). Unset slots default to something benign: the
+/// value-returning calls yield an empty list / bd 1.1.0 version / an empty show
+/// error, and the unit-returning calls (`init`/`repo_add`/`repo_sync`) yield
+/// `Ok(())`. `export` is keyed **per repo path** so one repo can fail while the
+/// rest succeed. Every call is recorded and retrievable via
+/// [`FakeBdClient::calls`].
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct FakeBdClient {
     calls: RefCell<Vec<Call>>,
     version: Option<Result<BdVersion, BdError>>,
-    ready: Option<Result<Vec<Issue>, BdError>>,
-    search: Option<Result<Vec<Issue>, BdError>>,
-    show: Option<Result<IssueDetail, BdError>>,
+    init: Option<Result<(), BdError>>,
+    repo_add: Option<Result<(), BdError>>,
     repo_list: Option<Result<serde_json::Value, BdError>>,
+    repo_sync: Option<Result<(), BdError>>,
+    ready: Option<Result<Vec<Issue>, BdError>>,
+    show: Option<Result<IssueDetail, BdError>>,
+    search: Option<Result<Vec<Issue>, BdError>>,
     export_errs: HashMap<PathBuf, BdError>,
 }
 
@@ -60,6 +64,36 @@ impl FakeBdClient {
         self
     }
 
+    pub fn with_version_err(mut self, err: BdError) -> Self {
+        self.version = Some(Err(err));
+        self
+    }
+
+    pub fn with_init_err(mut self, err: BdError) -> Self {
+        self.init = Some(Err(err));
+        self
+    }
+
+    pub fn with_repo_add_err(mut self, err: BdError) -> Self {
+        self.repo_add = Some(Err(err));
+        self
+    }
+
+    pub fn with_repo_list(mut self, value: serde_json::Value) -> Self {
+        self.repo_list = Some(Ok(value));
+        self
+    }
+
+    pub fn with_repo_list_err(mut self, err: BdError) -> Self {
+        self.repo_list = Some(Err(err));
+        self
+    }
+
+    pub fn with_repo_sync_err(mut self, err: BdError) -> Self {
+        self.repo_sync = Some(Err(err));
+        self
+    }
+
     pub fn with_ready(mut self, issues: Vec<Issue>) -> Self {
         self.ready = Some(Ok(issues));
         self
@@ -70,18 +104,23 @@ impl FakeBdClient {
         self
     }
 
-    pub fn with_search(mut self, issues: Vec<Issue>) -> Self {
-        self.search = Some(Ok(issues));
-        self
-    }
-
     pub fn with_show(mut self, detail: IssueDetail) -> Self {
         self.show = Some(Ok(detail));
         self
     }
 
-    pub fn with_repo_list(mut self, value: serde_json::Value) -> Self {
-        self.repo_list = Some(Ok(value));
+    pub fn with_show_err(mut self, err: BdError) -> Self {
+        self.show = Some(Err(err));
+        self
+    }
+
+    pub fn with_search(mut self, issues: Vec<Issue>) -> Self {
+        self.search = Some(Ok(issues));
+        self
+    }
+
+    pub fn with_search_err(mut self, err: BdError) -> Self {
+        self.search = Some(Err(err));
         self
     }
 
@@ -102,37 +141,42 @@ impl FakeBdClient {
     }
 }
 
+/// Return a programmed response clone, or `Ok(default())` when unset.
+fn resolve<T: Clone>(
+    slot: &Option<Result<T, BdError>>,
+    default: impl FnOnce() -> T,
+) -> Result<T, BdError> {
+    match slot {
+        Some(r) => r.clone(),
+        None => Ok(default()),
+    }
+}
+
 impl BdClient for FakeBdClient {
     fn version(&self) -> Result<BdVersion, BdError> {
         self.record(Call::Version);
-        match &self.version {
-            Some(r) => r.clone(),
-            None => Ok(BdVersion {
-                version: "1.1.0".into(),
-                schema_version: 1,
-                build: None,
-                commit: None,
-                branch: None,
-            }),
-        }
+        resolve(&self.version, || BdVersion {
+            version: "1.1.0".into(),
+            schema_version: 1,
+            build: None,
+            commit: None,
+            branch: None,
+        })
     }
 
     fn init(&self, dir: &Path, prefix: &str) -> Result<(), BdError> {
         self.record(Call::Init(dir.to_path_buf(), prefix.to_string()));
-        Ok(())
+        resolve(&self.init, || ())
     }
 
     fn repo_add(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError> {
         self.record(Call::RepoAdd(hub.to_path_buf(), repo_path.to_path_buf()));
-        Ok(())
+        resolve(&self.repo_add, || ())
     }
 
     fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError> {
         self.record(Call::RepoList(hub.to_path_buf()));
-        match &self.repo_list {
-            Some(r) => r.clone(),
-            None => Ok(serde_json::Value::Array(Vec::new())),
-        }
+        resolve(&self.repo_list, || serde_json::Value::Array(Vec::new()))
     }
 
     fn export(&self, repo: &Path) -> Result<(), BdError> {
@@ -145,15 +189,12 @@ impl BdClient for FakeBdClient {
 
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError> {
         self.record(Call::RepoSync(hub.to_path_buf()));
-        Ok(())
+        resolve(&self.repo_sync, || ())
     }
 
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError> {
         self.record(Call::Ready(hub.to_path_buf()));
-        match &self.ready {
-            Some(r) => r.clone(),
-            None => Ok(Vec::new()),
-        }
+        resolve(&self.ready, Vec::new)
     }
 
     fn show(&self, hub: &Path, id: &str) -> Result<IssueDetail, BdError> {
@@ -170,10 +211,7 @@ impl BdClient for FakeBdClient {
 
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError> {
         self.record(Call::Search(hub.to_path_buf(), query.to_string()));
-        match &self.search {
-            Some(r) => r.clone(),
-            None => Ok(Vec::new()),
-        }
+        resolve(&self.search, Vec::new)
     }
 }
 
@@ -240,6 +278,59 @@ mod tests {
         // Programmed path fails; a different path still exports Ok.
         assert!(fake.export(Path::new("/tmp/a")).is_ok());
         assert!(fake.export(Path::new("/tmp/b")).is_err());
+    }
+
+    #[test]
+    fn every_method_is_error_programmable() {
+        let err = || BdError {
+            command: "bd ...".into(),
+            stderr: "nope".into(),
+            kind: BdErrorKind::NonZeroExit { code: Some(1) },
+        };
+        let hub = Path::new("/tmp/hub");
+
+        assert!(
+            FakeBdClient::new()
+                .with_version_err(err())
+                .version()
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_init_err(err())
+                .init(hub, "hub")
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_repo_add_err(err())
+                .repo_add(hub, Path::new("/tmp/ra"))
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_repo_list_err(err())
+                .repo_list(hub)
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_repo_sync_err(err())
+                .repo_sync(hub)
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_show_err(err())
+                .show(hub, "ra-1")
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_search_err(err())
+                .search(hub, "q")
+                .is_err()
+        );
     }
 
     #[test]
