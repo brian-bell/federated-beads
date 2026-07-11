@@ -257,11 +257,17 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Paragraph::new(status), parts[1]);
 
-    // The results themselves (empty is fine — the count line already says "0
-    // results"; no ready-list "no repos" hint here, which would misdirect).
-    let rows = app.filtered_rows();
-    if !rows.is_empty() {
-        draw_rows(frame, &rows, app.selection(), parts[2]);
+    // Draw the results only in the `Results` phase. The list is retained
+    // internally across `Esc`→edit and a re-submit (so returning from a detail
+    // re-shows it), but must not linger under a new query being edited or loaded —
+    // that would misattribute a prior query's hits to the current one. (Empty is
+    // fine — the count line already says "0 results"; no ready-list "no repos"
+    // hint here, which would misdirect.)
+    if matches!(app.search_phase(), Some(SearchPhase::Results)) {
+        let rows = app.filtered_rows();
+        if !rows.is_empty() {
+            draw_rows(frame, &rows, app.selection(), parts[2]);
+        }
     }
 }
 
@@ -1057,6 +1063,25 @@ mod tests {
         assert!(
             find_at(&buf, EMPTY_HINT, w, h).is_none(),
             "the ready-list discover hint must not appear for an empty search"
+        );
+    }
+
+    #[test]
+    fn editing_after_results_hides_stale_rows() {
+        // After results for one query, `Esc` to edit must not leave the old rows
+        // showing under the new (now empty) query.
+        let (w, h) = (80, 24);
+        let mut app = app_in_search("foo", vec![row("megaclock", "mc-1", 0, "old hit")]);
+        assert!(
+            find_at(&render_sized(&app, at(1000), w, h), "mc-1", w, h).is_some(),
+            "the result is visible in the Results phase"
+        );
+
+        app.reduce(Msg::Back); // Results -> Editing
+        assert_eq!(app.search_phase(), Some(&SearchPhase::Editing));
+        assert!(
+            find_at(&render_sized(&app, at(1000), w, h), "mc-1", w, h).is_none(),
+            "the prior query's results are hidden while editing a new query"
         );
     }
 
