@@ -26,7 +26,7 @@ use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ensure_hub, hub_dir};
 use crate::refresh::{self, RefreshError};
-use crate::snapshot::{self, Snapshot};
+use crate::snapshot::{self, Row, Snapshot};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -56,11 +56,15 @@ pub fn run(paths: &Paths, roster: Config) -> Result<(), CliError> {
 fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), CliError> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let stop = Arc::new(AtomicBool::new(false));
+    // The search input's focus, published by the UI thread each loop so the input
+    // thread can map keys as text while the query editor is up (see `input_thread`).
+    let editing = Arc::new(AtomicBool::new(false));
 
     let input_handle = {
         let tx = tx.clone();
         let stop = Arc::clone(&stop);
-        thread::spawn(move || input_thread(&tx, &stop))
+        let editing = Arc::clone(&editing);
+        thread::spawn(move || input_thread(&tx, &stop, &editing))
     };
 
     let mut app = App::new();
@@ -86,6 +90,7 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         &mut worker_handles,
         paths,
         roster,
+        &editing,
     );
     stop.store(true, Ordering::SeqCst);
     let _ = input_handle.join();
@@ -97,6 +102,7 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
 
 /// The render/reduce loop, factored out so [`event_loop`] can join its threads
 /// whether this returns `Ok` (a `q` quit) or `Err` (a terminal draw failure).
+#[allow(clippy::too_many_arguments)]
 fn ui_loop(
     terminal: &mut Tui,
     rx: &Receiver<Msg>,
@@ -105,8 +111,11 @@ fn ui_loop(
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
     roster: &Config,
+    editing: &AtomicBool,
 ) -> Result<(), CliError> {
     draw(terminal, app)?;
+    // Publish the initial search-input focus (none) for the input thread.
+    editing.store(app.search_editing(), Ordering::SeqCst);
     // Redraw on every message and on every idle tick, so the staleness age keeps
     // advancing even while no messages arrive. `Disconnected` cannot occur while
     // the caller still holds `tx`, but is handled defensively as a clean exit.
@@ -116,6 +125,10 @@ fn ui_loop(
                 for effect in app.reduce(msg) {
                     execute_effect(effect, tx, worker_handles, paths, roster);
                 }
+                // Republish focus after the transition, before the next key is
+                // read, so the input thread maps it under the new mode (a mode-
+                // changing key was itself mapped under the pre-change flag).
+                editing.store(app.search_editing(), Ordering::SeqCst);
                 if app.is_done() {
                     return Ok(());
                 }
@@ -142,6 +155,7 @@ fn execute_effect(
     let handle = match effect {
         Effect::Refresh => spawn_refresh(tx, paths, roster),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
+        Effect::Search { query, token } => spawn_search(tx, paths, roster, query, token),
     };
     worker_handles.push(handle);
 }
@@ -208,6 +222,59 @@ pub(crate) fn gather_detail(
 ) -> Result<IssueDetail, String> {
     bd.show(&hub_dir(paths), id)
         .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
+}
+
+/// Spawn a background search worker that reports over `tx`, returning its join
+/// handle so the event loop can wait for it on shutdown. Clones the roster and
+/// paths into the thread and builds a fresh [`BdCli`] (stateless).
+fn spawn_search(
+    tx: &Sender<Msg>,
+    paths: &Paths,
+    roster: &Config,
+    query: String,
+    token: u64,
+) -> thread::JoinHandle<()> {
+    let tx = tx.clone();
+    let paths = paths.clone();
+    let roster = roster.clone();
+    thread::spawn(move || search_worker(BdCli::new(), roster, paths, query, token, tx))
+}
+
+/// The search worker body: run the query, attribute the results, and send exactly
+/// one [`Msg::SearchResults`] echoing `token` (so a superseded response can be
+/// dropped). Owned args so it moves cleanly into a thread; unit-tested directly
+/// with a [`crate::bd::FakeBdClient`] and a channel.
+pub(crate) fn search_worker(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    query: String,
+    token: u64,
+    tx: Sender<Msg>,
+) {
+    let rows = gather_search(&bd, &roster, &paths, &query);
+    let _ = tx.send(Msg::SearchResults { token, rows });
+}
+
+/// Run `bd search <query> --json` against the hub and attribute the results
+/// through the **same** [`snapshot::attribute`] path as ready rows, so search rows
+/// carry `repo_name` identically. The prefix map is rebuilt from the roster via
+/// [`refresh::attribution_map`] (its per-repo prefix-read failures are non-fatal —
+/// those ids fall to the `unknown` bucket). A `bd search` failure maps to a
+/// [`sanitize`]d message. No version gate / `ensure_hub`: search is reachable only
+/// from the list, i.e. after a snapshot already hydrated the hub.
+pub(crate) fn gather_search(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    query: &str,
+) -> Result<Vec<Row>, String> {
+    let hub = hub_dir(paths);
+    let issues = bd
+        .search(&hub, query)
+        .map_err(|e| sanitize(&format!("search failed: {e}")))?;
+    let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
+    Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
 /// Run `ensure_hub → refresh → fetch` and return the fresh snapshot (or `None`
@@ -289,12 +356,12 @@ pub(crate) fn gather_snapshot(
 /// terminal read/poll failure it sends `Quit` before exiting, so the UI thread —
 /// which holds its own sender and would otherwise block on `recv` forever with no
 /// producer left — always has a path to a clean shutdown.
-fn input_thread(tx: &Sender<Msg>, stop: &AtomicBool) {
+fn input_thread(tx: &Sender<Msg>, stop: &AtomicBool, editing: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         match event::poll(INPUT_POLL) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
-                    if let Some(msg) = keys::map_key(key)
+                    if let Some(msg) = keys::map_key(key, editing.load(Ordering::SeqCst))
                         && tx.send(msg).is_err()
                     {
                         return; // UI thread gone.
@@ -547,6 +614,62 @@ mod tests {
                 );
             }
             other => panic!("expected DetailReady, got {other:?}"),
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_sends_results_for_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_search(vec![issue("ra-1", 1, "Found one")]);
+        let (tx, rx) = mpsc::channel();
+
+        let handle =
+            thread::spawn(move || search_worker(bd, roster(&[&ra]), paths, "foo".into(), 7, tx));
+
+        match rx.recv().unwrap() {
+            Msg::SearchResults { token, rows } => {
+                assert_eq!(token, 7, "the request token is echoed back");
+                let rows = rows.expect("results on success");
+                let found = rows
+                    .iter()
+                    .find(|r| r.issue.id == "ra-1")
+                    .expect("row present");
+                assert_eq!(
+                    found.repo_name, "ra",
+                    "results are attributed via the roster prefix map"
+                );
+            }
+            other => panic!("expected SearchResults, got {other:?}"),
+        }
+        // The worker's tx drops on return: exactly one message, then closed.
+        assert!(rx.recv().is_err(), "exactly one SearchResults, then closed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn search_worker_maps_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_search_err(bd_err());
+        let (tx, rx) = mpsc::channel();
+
+        let handle =
+            thread::spawn(move || search_worker(bd, roster(&[&ra]), paths, "foo".into(), 3, tx));
+
+        match rx.recv().unwrap() {
+            Msg::SearchResults { token, rows } => {
+                assert_eq!(token, 3);
+                let msg = rows.expect_err("a message on failure");
+                assert!(
+                    msg.to_lowercase().contains("search failed") || msg.contains("boom"),
+                    "the failure is surfaced: {msg}"
+                );
+            }
+            other => panic!("expected SearchResults, got {other:?}"),
         }
         handle.join().unwrap();
     }

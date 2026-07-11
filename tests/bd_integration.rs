@@ -7,11 +7,13 @@
 
 mod helpers;
 
+use std::time::SystemTime;
+
 use fbd::bd::{BdCli, BdClient};
 use fbd::cli::run_snapshot;
 use fbd::config::{Config, Paths, RepoEntry};
 use fbd::hub::{ensure_hub, hub_dir, read_hub_roster};
-use fbd::refresh;
+use fbd::{refresh, snapshot};
 use helpers::{bd_available, build_ready_fixture_repo, build_ready_fixture_repo_with_prefix};
 
 #[test]
@@ -299,5 +301,73 @@ fn snapshot_command_end_to_end() {
     assert!(
         stdout.contains("Ready task one"),
         "the fixture's ready title is printed: {stdout:?}"
+    );
+}
+
+#[test]
+fn search_end_to_end() {
+    // The schema-drift tripwire for `bd search --json` (Slice 11): drive the exact
+    // search-worker path — `bd search` on the hub, then the shared attribution —
+    // and assert cross-repo results come back attributed like ready rows.
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ra = tmp.path().join("ra");
+    let rb = tmp.path().join("rb");
+    std::fs::create_dir_all(&ra).expect("mkdir ra");
+    std::fs::create_dir_all(&rb).expect("mkdir rb");
+    build_ready_fixture_repo_with_prefix(&ra, "ra");
+    build_ready_fixture_repo_with_prefix(&rb, "rb");
+
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        repos: vec![
+            RepoEntry { path: ra.clone() },
+            RepoEntry { path: rb.clone() },
+        ],
+    };
+
+    // Hydrate the hub from both repos.
+    ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
+    refresh::run(&BdCli::new(), &roster, &paths).expect("refresh runs");
+    let hub = hub_dir(&paths);
+
+    // The search-worker path: `bd search --json`, then the same attribution
+    // (`refresh::attribution_map` + `snapshot::attribute`) as ready rows.
+    let issues = BdCli::new()
+        .search(&hub, "task")
+        .expect("bd search --json parses");
+    assert!(
+        !issues.is_empty(),
+        "the fixture titles all contain 'task', so search finds them"
+    );
+    let (map, errors) = refresh::attribution_map(&BdCli::new(), &roster);
+    assert!(
+        errors.is_empty(),
+        "both repos are healthy, so attribution has no errors: {errors:?}"
+    );
+    let snap = snapshot::attribute(issues, &map, SystemTime::now());
+
+    assert!(
+        snap.rows.iter().any(|r| r.repo_name == "ra"),
+        "a result is attributed to the ra repo: {:?}",
+        snap.rows.iter().map(|r| &r.repo_name).collect::<Vec<_>>()
+    );
+    assert!(
+        snap.rows.iter().any(|r| r.repo_name == "rb"),
+        "a result is attributed to the rb repo (cross-repo search)"
+    );
+    assert!(
+        snap.rows
+            .iter()
+            .all(|r| r.repo_name != snapshot::UNKNOWN_REPO),
+        "every hydrated result attributes to a known repo, not the unknown bucket"
+    );
+    assert!(
+        snap.rows.iter().any(|r| r.issue.title.contains("task")),
+        "a result carries the searched-for title text"
     );
 }
