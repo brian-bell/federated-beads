@@ -6,3 +6,4 @@
 
 pub mod bd;
 pub mod config;
+pub mod hub;
