@@ -253,4 +253,17 @@ New tests: `non_utf8_repo_path_is_ansi_c_quoted`,
 `control_bytes_in_path_are_escaped_not_raw`, `non_utf8_hub_path_is_quoted_faithfully`,
 `accented_path_with_space_stays_single_quoted`.
 
-Round 6: clean (no accepted/actionable findings).
+Round 6 (codex, gpt-5.6-sol) — one finding, accepted and fixed:
+
+10. **[P2] Held `y`/`Y` piles up subprocess-backed workers.** Each copy spawns a
+    worker running one `bd` prefix read per repo, and a held copy key (auto-repeat
+    arrives as a key-event burst; fbd doesn't enable the kitty protocol, so it is
+    `Press` events, not `Repeat`) launched an unbounded stream, with shutdown then
+    joining them all. Ignoring `Repeat` alone wouldn't help. `copy_effect` now
+    coalesces: at most one copy is in flight (`copy_in_flight`); a copy requested
+    meanwhile records only the latest format (`copy_pending`) and fires — for the
+    then-current selection — when the flight completes. The token guard is kept as
+    defense. New tests `copy_coalesces_while_in_flight`, `stale_copy_token_dropped`
+    (replacing the concurrent-worker `stale_copy_result_dropped`).
+
+Round 7: clean (no accepted/actionable findings).

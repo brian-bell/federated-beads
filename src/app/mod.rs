@@ -439,6 +439,14 @@ pub struct App {
     /// so a superseded copy's late result is dropped (mirrors `detail_seq` /
     /// `search_seq`): the newest copy always wins the clipboard.
     copy_seq: u64,
+    /// Whether a copy worker is resolving right now. New copy requests coalesce
+    /// into `copy_pending` while this holds, so a held `y`/`Y` cannot spawn an
+    /// unbounded pile of subprocess-backed workers (at most one runs at a time).
+    copy_in_flight: bool,
+    /// The format (`markdown`?) of a copy requested while one was already in
+    /// flight; fired for the then-current selection when the flight completes, so
+    /// only the latest coalesced request runs.
+    copy_pending: Option<bool>,
     /// The user asked to quit; the runtime loop should exit.
     done: bool,
 }
@@ -472,6 +480,8 @@ impl App {
             detail_scroll: 0,
             copy_flash: None,
             copy_seq: 0,
+            copy_in_flight: false,
+            copy_pending: None,
             done: false,
         }
     }
@@ -734,12 +744,20 @@ impl App {
                 payload,
                 summary,
             } => {
-                // Accept only the newest copy's result; a superseded one (a faster
-                // earlier request finishing after a later one) carries an older
-                // token and is dropped, so the clipboard reflects the last `y`/`Y`.
+                // Accept only the in-flight copy's result; a stale token (defensive
+                // — coalescing keeps one copy in flight) is dropped without ending
+                // the flight.
                 if token == self.copy_seq {
+                    self.copy_in_flight = false;
                     self.copy_flash = Some(summary);
-                    return vec![Effect::WriteClipboard(payload)];
+                    let mut effects = vec![Effect::WriteClipboard(payload)];
+                    // A copy requested while this one was resolving was coalesced;
+                    // fire it now for the current selection so the last `y`/`Y` still
+                    // wins, without ever having spawned a second worker meanwhile.
+                    if let Some(markdown) = self.copy_pending.take() {
+                        effects.extend(self.copy_effect(markdown));
+                    }
+                    return effects;
                 }
             }
             Msg::Quit => self.done = true,
@@ -753,12 +771,22 @@ impl App {
     /// detail opened from one) else the ready list, so `y`/`Y` copy the issue the
     /// user is actually looking at in List / Search-results / Detail alike.
     fn copy_effect(&mut self, markdown: bool) -> Vec<Effect> {
+        // Coalesce while a copy is resolving: its path resolution runs a `bd`
+        // subprocess per repo on a worker thread, so a held `y`/`Y` (auto-repeat
+        // arrives as a burst of key events) must not pile up workers. Remember only
+        // the latest requested format; it fires when the in-flight copy completes,
+        // against the selection current at that point, so the last press still wins.
+        if self.copy_in_flight {
+            self.copy_pending = Some(markdown);
+            return Vec::new();
+        }
         // Resolve before bumping the generation so a no-op copy neither advances
-        // the sequence nor emits an effect.
+        // the sequence nor marks a flight.
         let Some(row) = self.copy_source_row() else {
             return Vec::new();
         };
         self.copy_seq += 1;
+        self.copy_in_flight = true;
         vec![Effect::Copy {
             row: Box::new(row),
             markdown,
@@ -1668,38 +1696,94 @@ mod tests {
     }
 
     #[test]
-    fn stale_copy_result_dropped() {
-        // Copy A (gen 1), then copy B (gen 2). A's slower worker answers last and
-        // must not clobber B's clipboard/confirmation.
+    fn stale_copy_token_dropped() {
+        // A defensive guard: a `Copied` whose token is not the in-flight copy's is
+        // dropped (writes nothing, keeps the flight open) so only the real result
+        // is applied.
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let (_, _, token) = copy(&mut app, Msg::CopyContext);
+
+        let effects = app.reduce(Msg::Copied {
+            token: token + 99,
+            payload: "wrong".into(),
+            summary: "wrong".into(),
+        });
+        assert_eq!(
+            effects,
+            Vec::new(),
+            "a mismatched-token result writes nothing"
+        );
+        assert!(app.copy_flash().is_none(), "and shows no confirmation");
+
+        // The real result still lands.
+        let effects = app.reduce(Msg::Copied {
+            token,
+            payload: "right".into(),
+            summary: "copied mc-abc".into(),
+        });
+        assert_eq!(effects, vec![Effect::WriteClipboard("right".into())]);
+        assert_eq!(app.copy_flash(), Some("copied mc-abc"));
+    }
+
+    #[test]
+    fn copy_coalesces_while_in_flight() {
+        // Holding y/Y (or mashing it) while a copy resolves must not spawn a second
+        // worker: the request coalesces and fires once the first completes, for the
+        // then-current selection — so the last press wins with at most one worker
+        // in flight at a time.
         let mut app = app_with(vec![
             row("megaclock", "mc-a", 1),
             row("session-tui", "st-b", 1),
         ]);
-        let (_, _, first) = copy(&mut app, Msg::CopyContext);
-        app.reduce(Msg::SelectNext);
-        let (_, _, second) = copy(&mut app, Msg::CopyContext);
-        assert_ne!(first, second, "each copy gets a fresh generation");
+        let (_, _, first) = copy(&mut app, Msg::CopyContext); // worker for mc-a, in flight
 
-        // B lands first and is shown.
-        app.reduce(Msg::Copied {
-            token: second,
-            payload: "cd b && bd show st-b".into(),
-            summary: "copied st-b".into(),
-        });
-        assert_eq!(app.copy_flash(), Some("copied st-b"));
+        // A second copy while in flight: no new Copy effect (coalesced).
+        app.reduce(Msg::SelectNext); // now selecting st-b
+        assert_eq!(
+            app.reduce(Msg::CopyContext),
+            Vec::new(),
+            "a copy while one is in flight spawns no second worker"
+        );
 
-        // A answers late: dropped, no WriteClipboard, confirmation unchanged.
+        // The first completes: writes its payload AND fires the coalesced copy for
+        // the current selection (st-b) as a fresh generation.
         let effects = app.reduce(Msg::Copied {
             token: first,
             payload: "cd a && bd show mc-a".into(),
             summary: "copied mc-a".into(),
         });
-        assert_eq!(effects, Vec::new(), "the superseded copy writes nothing");
+        let second = match effects.as_slice() {
+            [
+                Effect::WriteClipboard(p),
+                Effect::Copy {
+                    row,
+                    markdown: false,
+                    token,
+                },
+            ] => {
+                assert_eq!(p, "cd a && bd show mc-a", "the first copy still writes");
+                assert_eq!(
+                    row.issue.id, "st-b",
+                    "the coalesced copy is the latest selection"
+                );
+                assert_ne!(*token, first, "the coalesced copy is a fresh generation");
+                *token
+            }
+            other => panic!("expected write + coalesced copy, got {other:?}"),
+        };
+
+        // The coalesced copy completes and is shown; nothing further is pending.
+        let effects = app.reduce(Msg::Copied {
+            token: second,
+            payload: "cd b && bd show st-b".into(),
+            summary: "copied st-b".into(),
+        });
         assert_eq!(
-            app.copy_flash(),
-            Some("copied st-b"),
-            "the stale reply did not overwrite the newest copy"
+            effects,
+            vec![Effect::WriteClipboard("cd b && bd show st-b".into())],
+            "no further coalesced copy remains"
         );
+        assert_eq!(app.copy_flash(), Some("copied st-b"));
     }
 
     #[test]
