@@ -20,8 +20,10 @@ use crate::refresh::PrefixMap;
 pub const UNKNOWN_REPO: &str = "unknown";
 
 /// One ready issue plus the source repo it was attributed to. `repo_name` is the
-/// repo directory's basename — made roster-unique so grouping/filtering never
-/// conflates two repos (see [`fetch`]) — or [`UNKNOWN_REPO`] when unattributed.
+/// repo directory's basename, or `"basename (prefix)"` when another attributed
+/// repo shares that basename (so grouping/filtering never conflates two repos —
+/// see [`fetch`]), or [`UNKNOWN_REPO`] when unattributed. Never a filesystem
+/// path: the serialized snapshot must not leak local layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Row {
     pub issue: Issue,
@@ -52,23 +54,28 @@ pub fn fetch(
 ) -> Result<Snapshot, BdError> {
     let issues = bd.ready(hub)?;
 
-    // Attribute every issue to its source repo first, so a repo's display name
-    // can be made unique across the repos that actually appear before it is
-    // stamped onto rows.
-    let attributed: Vec<(Issue, Option<&Path>)> = issues
+    // Attribute every issue to its source repo first (carrying the unique id
+    // prefix), so a repo's display name can be made unique across the repos that
+    // actually appear before it is stamped onto rows.
+    let attributed: Vec<(Issue, Option<(&str, &Path)>)> = issues
         .into_iter()
         .map(|issue| {
-            let repo = prefix_map.repo_for(&issue.id).map(|e| e.path.as_path());
+            let repo = prefix_map
+                .attribution(&issue.id)
+                .map(|(prefix, e)| (prefix, e.path.as_path()));
             (issue, repo)
         })
         .collect();
 
-    // basename → the distinct repo paths that share it. A basename claimed by
-    // more than one repo is ambiguous, so those rows fall back to the full path.
-    let mut by_basename: HashMap<String, HashSet<&Path>> = HashMap::new();
+    // basename → the distinct repo prefixes that share it. A basename claimed by
+    // more than one repo is ambiguous; those rows get the prefix appended.
+    let mut by_basename: HashMap<String, HashSet<&str>> = HashMap::new();
     for (_, repo) in &attributed {
-        if let Some(path) = repo {
-            by_basename.entry(basename(path)).or_default().insert(path);
+        if let Some((prefix, path)) = repo {
+            by_basename
+                .entry(basename(path))
+                .or_default()
+                .insert(prefix);
         }
     }
 
@@ -76,7 +83,7 @@ pub fn fetch(
         .into_iter()
         .map(|(issue, repo)| {
             let repo_name = match repo {
-                Some(path) => display_name(path, &by_basename),
+                Some((prefix, path)) => display_name(prefix, path, &by_basename),
                 None => UNKNOWN_REPO.to_string(),
             };
             Row { issue, repo_name }
@@ -87,7 +94,10 @@ pub fn fetch(
         a.issue
             .priority
             .cmp(&b.issue.priority)
-            // Reversed operands => newest `updated_at` first; `None` sorts last.
+            // `updated_at` is bd's RFC3339 UTC-`Z`, whole-second timestamp, and
+            // every row in one `bd ready` call shares that format, so a lexical
+            // string compare orders them chronologically. Reversed operands =>
+            // newest first; `None` (omitted) sorts last.
             .then_with(|| b.issue.updated_at.cmp(&a.issue.updated_at))
             .then_with(|| a.issue.id.cmp(&b.issue.id))
     });
@@ -103,14 +113,16 @@ fn basename(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// A roster-unique display label for an attributed repo: its basename when only
-/// one repo carries that basename, else the full path string — so two distinct
-/// repos that happen to share a directory name (e.g. `/work/a/api` and
-/// `/work/b/api`) never collapse into a single group.
-fn display_name(path: &Path, by_basename: &HashMap<String, HashSet<&Path>>) -> String {
+/// A roster-unique, non-sensitive display label for an attributed repo: its
+/// basename when only one repo carries that basename, else `basename (prefix)`.
+/// The prefix is the repo's unique, short id (`ra`, `rb`, …), so two distinct
+/// repos that share a directory name (e.g. `/work/a/api` and `/work/b/api`) get
+/// distinct labels — `api (ra)`, `api (rb)` — without emitting a filesystem path
+/// that would leak local layout through the serialized snapshot.
+fn display_name(prefix: &str, path: &Path, by_basename: &HashMap<String, HashSet<&str>>) -> String {
     let bn = basename(path);
     match by_basename.get(&bn) {
-        Some(paths) if paths.len() > 1 => path.to_string_lossy().into_owned(),
+        Some(prefixes) if prefixes.len() > 1 => format!("{bn} ({prefix})"),
         _ => bn,
     }
 }
@@ -286,11 +298,15 @@ mod tests {
                 .map(|r| r.repo_name.as_str())
                 .expect("row present")
         };
-        // The shared basename is ambiguous, so each falls back to its full path;
-        // grouping by repo_name keeps the two repos distinct.
-        assert_eq!(name("ra-1"), "/work/a/api");
-        assert_eq!(name("rb-1"), "/work/b/api");
-        assert_ne!(name("ra-1"), name("rb-1"), "distinct repos stay distinct");
+        // The shared basename is ambiguous, so each is disambiguated by its
+        // unique prefix — no filesystem path leaks — and grouping by repo_name
+        // keeps the two repos distinct.
+        assert_eq!(name("ra-1"), "api (ra)");
+        assert_eq!(name("rb-1"), "api (rb)");
+        assert!(
+            !name("ra-1").contains('/') && !name("rb-1").contains('/'),
+            "display labels never contain a filesystem path"
+        );
     }
 
     #[test]

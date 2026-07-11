@@ -139,14 +139,23 @@ impl PrefixMap {
     /// of `id`. `None` when nothing matches, or when the longest matching prefix
     /// is a collided (ambiguous) one.
     pub fn repo_for(&self, id: &str) -> Option<&RepoEntry> {
-        self.entries
+        self.attribution(id).map(|(_, repo)| repo)
+    }
+
+    /// Like [`repo_for`](Self::repo_for) but also yields the matched prefix. The
+    /// prefix is a unique, short, non-sensitive repo identity (a collided prefix
+    /// resolves to `None` here), useful to disambiguate repos that share a
+    /// directory basename without exposing a filesystem path.
+    pub fn attribution(&self, id: &str) -> Option<(&str, &RepoEntry)> {
+        let (prefix, repo) = self
+            .entries
             .iter()
             .filter(|(prefix, _)| {
                 id.strip_prefix(prefix.as_str())
                     .is_some_and(|rest| rest.starts_with('-'))
             })
-            .max_by_key(|(prefix, _)| prefix.len())
-            .and_then(|(_, repo)| repo.as_ref())
+            .max_by_key(|(prefix, _)| prefix.len())?;
+        repo.as_ref().map(|repo| (prefix.as_str(), repo))
     }
 
     /// Prefixes claimed by more than one roster repo.
