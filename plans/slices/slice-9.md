@@ -39,22 +39,22 @@ exist in the Slice 8 core and this slice does not implement them.
    pixel a deterministic function of `(App, now)` and unit-testable via
    `TestBackend`.
 
-2. **Grouping is done in the view; navigation follows the App's flat order.** The
-   Slice 8 `App` exposes `filtered_rows()` in the snapshot's order (Slice 5:
-   priority ascending, then `updated_at` descending), and `selection()` indexes
-   that flat list. The view **buckets** those rows by `repo_name` in
-   first-appearance order and draws a `▸ <repo>` header above each bucket, with
-   each row rendered as `P<pri> <id> <title>` (no repo — the header carries it).
-   The selection highlight marks whichever *displayed* row equals
-   `app.selected_row()`. Because the App's flat order is global-priority and the
-   display is bucketed by repo, `j`/`k` walk priority order while the eye sees
-   repo sections, so the highlight can jump between sections when a repo's rows
-   are non-contiguous in priority order. This is an accepted v1 limitation:
-   making navigation follow the grouped display order would require the Slice
-   8/Slice 5 row order itself to be grouped, which is out of scope for a
-   render-only slice and would perturb merged, reviewed modules. Filed as a v2
-   refinement bead. (The render tests construct contiguous-by-repo `App` states —
-   a legitimate state — so they read one header per repo.)
+2. **Grouping headers are inserted over the App's flat order (display order ==
+   navigation order).** The Slice 8 `App` exposes `filtered_rows()` in the
+   snapshot's order (Slice 5: priority ascending, then `updated_at` descending),
+   and `selection()` indexes that flat list. The view renders rows **in that flat
+   order** and emits a `▸ <repo>` header whenever the repo changes from the
+   previous row; each row is `P<pri> <id> <title>` (no repo — the header carries
+   it). Because the on-screen order equals the selection order, `j`/`k` always
+   move exactly one displayed row and the highlight never jumps. The one cost:
+   when a repo's rows are non-contiguous in priority order, its header is
+   re-emitted above each run — an honest label for the priority-sorted run
+   beneath it. (An earlier draft *bucketed* rows into one section per repo, which
+   read cleaner but desynchronized navigation from the display; autoreview flagged
+   it P1 and it was replaced by this flat-order approach.) Collapsing repeated
+   headers into true single sections *without* breaking navigation would require
+   the Slice 5/8 row order itself to be grouped-then-sorted — out of scope for a
+   render-only slice; tracked as a v2 refinement bead.
 
 3. **The empty-state hint is derived from `App` alone.** `draw` is pure over
    `App`, which carries no roster, so the view shows the hint

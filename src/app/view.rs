@@ -5,8 +5,10 @@
 //!
 //! Layout (top to bottom): a one-line title with key hints, the grouped ready
 //! list, and a one-line status bar (last-refreshed age + a warning summary).
-//! Grouping is a view concern: rows arrive in the App's flat priority order and
-//! are bucketed here by `repo_name` under `▸ <repo>` headers.
+//! Grouping is a view concern: rows are rendered in the App's flat order (so the
+//! selection index and the on-screen order stay aligned and `j`/`k` move one
+//! displayed row at a time) with a `▸ <repo>` header emitted whenever the repo
+//! changes from the previous row.
 
 use std::time::SystemTime;
 
@@ -18,11 +20,14 @@ use ratatui::widgets::Paragraph;
 
 use super::{App, ViewMode};
 use crate::cli::{format_row_body, sanitize};
-use crate::snapshot::Row;
 
-/// The empty-list guidance (shown whenever the ready list is empty in `List`
-/// mode — see slice-9 decision 3).
+/// Shown when the roster has no rows at all (no repos configured / nothing
+/// hydrated yet — see slice-9 decision 3).
 const EMPTY_HINT: &str = "no repos configured — run: fbd repos discover ~/dev";
+
+/// Shown when there are rows but the active filters hide them all, so the user
+/// is not misdirected to reconfigure the roster.
+const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p to change";
 
 /// One-line key hints shown along the top.
 const KEY_HINTS: &str = "fbd · q quit · r refresh · / search · f repo · p prio · j/k move";
@@ -58,7 +63,14 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let rows = app.filtered_rows();
     if rows.is_empty() {
-        frame.render_widget(Paragraph::new(EMPTY_HINT), area);
+        // Zero rows at all vs. rows hidden by the active filters: only the former
+        // is a roster problem, so only it points at `repos discover`.
+        let hint = if app.rows().is_empty() {
+            EMPTY_HINT
+        } else {
+            NO_MATCH_HINT
+        };
+        frame.render_widget(Paragraph::new(hint), area);
         return;
     }
 
@@ -66,32 +78,32 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let selection = app.selection();
 
-    // Bucket rows by repo in first-appearance order, keeping each row's flat
-    // index (the selection space) so the highlight lands on the right line.
-    let mut groups: Vec<(String, Vec<(usize, &Row)>)> = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
-        match groups.iter_mut().find(|(name, _)| name == &row.repo_name) {
-            Some((_, items)) => items.push((i, row)),
-            None => groups.push((row.repo_name.clone(), vec![(i, row)])),
-        }
-    }
-
+    // Render rows in the App's flat order (the selection space) and emit a repo
+    // header whenever the repo changes, so the on-screen order matches the
+    // navigation order — `j`/`k` always move one displayed row. A repo whose
+    // rows are non-contiguous in the flat order gets its header again, which is
+    // an honest label for the priority-sorted run beneath it.
     let mut lines: Vec<Line> = Vec::new();
     // The rendered line index (headers included) of the selected row, so the
     // list can be scrolled to keep it on screen once it exceeds the area height.
     let mut selected_line: Option<usize> = None;
-    for (name, items) in &groups {
-        lines.push(Line::styled(format!("▸ {}", sanitize(name)), header_style));
-        for (i, row) in items {
-            let text = format!("  {}", format_row_body(row));
-            if selection == Some(*i) {
-                selected_line = Some(lines.len());
-                // Pad to the full width so the reversed highlight fills the row.
-                let padded = format!("{text:<width$}", width = area.width as usize);
-                lines.push(Line::styled(padded, selected_style));
-            } else {
-                lines.push(Line::from(text));
-            }
+    let mut current_repo: Option<&str> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if current_repo != Some(row.repo_name.as_str()) {
+            lines.push(Line::styled(
+                format!("▸ {}", sanitize(&row.repo_name)),
+                header_style,
+            ));
+            current_repo = Some(row.repo_name.as_str());
+        }
+        let text = format!("  {}", format_row_body(row));
+        if selection == Some(i) {
+            selected_line = Some(lines.len());
+            // Pad to the full width so the reversed highlight fills the row.
+            let padded = format!("{text:<width$}", width = area.width as usize);
+            lines.push(Line::styled(padded, selected_style));
+        } else {
+            lines.push(Line::from(text));
         }
     }
 
@@ -319,6 +331,55 @@ mod tests {
         assert!(
             find_line(&buf, EMPTY_HINT).is_none(),
             "loading is not the empty state"
+        );
+    }
+
+    #[test]
+    fn navigation_follows_display_order() {
+        // Interleaved repos in flat (priority) order: the rendered order must
+        // match the flat order so selection index N is the Nth displayed row.
+        let app = app_with(
+            vec![
+                row("repo-a", "ra-0", 0, "a first"),
+                row("repo-b", "rb-0", 0, "b first"),
+                row("repo-a", "ra-1", 1, "a second"),
+            ],
+            vec![],
+        );
+        let buf = render(&app, at(1000));
+
+        let y0 = find_line(&buf, "ra-0").expect("ra-0 present");
+        let y1 = find_line(&buf, "rb-0").expect("rb-0 present");
+        let y2 = find_line(&buf, "ra-1").expect("ra-1 present");
+        assert!(
+            y0 < y1 && y1 < y2,
+            "rows keep flat order on screen: ra-0@{y0} rb-0@{y1} ra-1@{y2}"
+        );
+        // repo-a's run is split by repo-b, so its header is drawn twice.
+        let repo_a_headers = (0..H)
+            .filter(|&y| line_text(&buf, y).contains("▸ repo-a"))
+            .count();
+        assert_eq!(
+            repo_a_headers, 2,
+            "a non-contiguous repo re-emits its header"
+        );
+    }
+
+    #[test]
+    fn filtered_empty_shows_filter_hint() {
+        // Rows exist but the priority filter hides them all: the user must be
+        // told it is a filter, not an unconfigured roster.
+        let mut app = app_with(vec![row("repo-a", "ra-2", 2, "low prio")], vec![]);
+        app.reduce(Msg::TogglePriorityFilter); // HighOnly -> hides the P2 row
+        let buf = render(&app, at(1000));
+
+        assert!(
+            find_line(&buf, NO_MATCH_HINT).is_some(),
+            "filtered-empty shows the filter hint"
+        );
+        assert!(
+            find_line(&buf, EMPTY_HINT).is_none(),
+            "filtered-empty is not misreported as an unconfigured roster"
         );
     }
 

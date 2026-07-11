@@ -25,7 +25,7 @@ use crate::bd::{BdCli, BdClient};
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ensure_hub, hub_dir};
-use crate::refresh::{self, PrefixMap, RefreshError};
+use crate::refresh::{self, RefreshError};
 use crate::snapshot::{self, Snapshot};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
@@ -174,12 +174,13 @@ pub(crate) fn gather_snapshot(
             }
             (outcome.prefix_map, outcome.synced_at)
         }
-        // Another fbd holds the lock: show the last synced data (unattributed,
-        // since we did not build a fresh prefix map this cycle).
+        // Another fbd holds the lock: keep the current view intact rather than
+        // fetching a snapshot with no prefix map (which would re-attribute every
+        // row to `unknown`, reset the age, and empty an active repo filter).
+        // Returning `None` makes `reduce` retain the last-good rows.
         Err(RefreshError::AlreadyRefreshing) => {
-            warnings
-                .push("another fbd is refreshing this hub; showing the last synced data".into());
-            (PrefixMap::default(), SystemTime::now())
+            warnings.push("another fbd is refreshing this hub; keeping the current view".into());
+            return (None, warnings);
         }
         Err(fatal) => {
             warnings.push(sanitize(&format!("refresh failed: {fatal}")));
@@ -251,11 +252,15 @@ fn setup_terminal() -> io::Result<Tui> {
 }
 
 /// Leave the alternate screen, disable raw mode, and show the cursor.
+///
+/// Best-effort: every step is attempted even if an earlier one fails (cleanup
+/// matters most precisely when a terminal op is failing), and the first error is
+/// returned once all three have run.
 fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+    let raw = disable_raw_mode();
+    let screen = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let cursor = terminal.show_cursor();
+    raw.and(screen).and(cursor)
 }
 
 /// Chain a terminal-restoring step before the default panic hook, so a panic
@@ -274,6 +279,7 @@ mod tests {
     use super::*;
     use crate::bd::{BdError, BdErrorKind, FakeBdClient, Issue};
     use crate::config::RepoEntry;
+    use crate::refresh::HubLock;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -396,6 +402,34 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("refresh failed")),
             "the fatal refresh is surfaced: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn gather_snapshot_none_when_refresh_declined() {
+        // Another fbd holds the lock: gather must NOT fetch a mis-attributed
+        // snapshot; it returns None so the caller keeps its last-good rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        let _held = HubLock::try_acquire(&hub)
+            .unwrap()
+            .expect("acquired the lock");
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-1", 1, "t")]);
+
+        let (snapshot, warnings) = gather_snapshot(&bd, &roster(&[&ra]), &paths);
+
+        assert!(
+            snapshot.is_none(),
+            "a declined refresh yields no snapshot, so last-good rows are kept"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("refreshing")),
+            "the lock contention is surfaced: {warnings:?}"
         );
     }
 }
