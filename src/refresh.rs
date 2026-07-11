@@ -294,13 +294,16 @@ struct IssueLine {
 /// `id_prefix.replace('-', "_") == dolt_database`.
 ///
 /// That sanitization is many-to-one (`a_b-c` and `a-b_c` both map to `a_b_c`),
-/// so a foreign hydrated id could validate against this repo's `dolt_database`
-/// too. Rather than trust the *first* validating id (order-dependent, and it
-/// could be that foreign id), we return the *most frequent* validating prefix:
-/// the repo's own issues always dominate its export, so a stray foreign id of a
-/// same-sanitizing prefix cannot flip the result. When no id validates (an empty
-/// repo or a missing `issues.jsonl`), fall back to `dolt_database`: such a repo
-/// has no ids of its own in the hub, so its prefix is never queried anyway.
+/// so more than one distinct prefix could validate against the same
+/// `dolt_database` if a repo's export carried a same-sanitizing foreign id. We
+/// therefore accept an id-derived prefix only when it is *unambiguous* — exactly
+/// one distinct validating prefix. When zero validate (an empty repo or a
+/// missing `issues.jsonl`) or two or more validate (a genuinely ambiguous export
+/// we refuse to guess about), fall back to `dolt_database` rather than risk
+/// attributing a repo's issues to the wrong checkout. On that fallback the
+/// repo's hyphenated ids simply land in the unknown bucket instead of being
+/// misattributed, and any same-sanitizing sibling still in the roster claims its
+/// own ids via its own unambiguous prefix.
 ///
 /// `metadata.json` remains required (a missing or unparseable one is an error),
 /// preserving the attribution contract.
@@ -315,16 +318,14 @@ pub fn read_prefix(repo: &Path) -> Result<String, String> {
     Ok(derive_prefix_from_ids(repo, &meta.dolt_database).unwrap_or(meta.dolt_database))
 }
 
-/// Return the most frequent prefix among `<repo>/.beads/issues.jsonl`'s issue
-/// ids whose derived prefix matches `dolt_database` under bd's `-`→`_`
-/// sanitization. `None` when the file is absent/unreadable or no id validates —
-/// the caller then falls back to `dolt_database`. Ties (astronomically rare —
-/// two same-sanitizing prefixes with equal counts) break by first appearance,
-/// keeping the result deterministic.
+/// Return the sole prefix among `<repo>/.beads/issues.jsonl`'s issue ids whose
+/// derived prefix matches `dolt_database` under bd's `-`→`_` sanitization.
+/// `None` when the file is absent/unreadable, no id validates, or two or more
+/// *distinct* prefixes validate (ambiguous) — in every such case the caller
+/// falls back to `dolt_database` rather than guess which repo owns the ids.
 fn derive_prefix_from_ids(repo: &Path, dolt_database: &str) -> Option<String> {
     let file = File::open(repo.join(".beads").join("issues.jsonl")).ok()?;
-    let mut order: Vec<String> = Vec::new();
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut distinct: Vec<String> = Vec::new();
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -337,23 +338,20 @@ fn derive_prefix_from_ids(repo: &Path, dolt_database: &str) -> Option<String> {
             continue;
         }
         // Ids are `<prefix>-<hash>`; the prefix may itself contain `-`, so split
-        // on the last one. Only this repo's own prefix sanitizes to dolt_database.
+        // on the last one, then keep only prefixes that sanitize to dolt_database.
         let Some((prefix, _)) = record.id.as_deref().and_then(|id| id.rsplit_once('-')) else {
             continue;
         };
-        if prefix.replace('-', "_") != dolt_database {
-            continue;
+        if prefix.replace('-', "_") == dolt_database && !distinct.iter().any(|p| p == prefix) {
+            distinct.push(prefix.to_string());
+            // A second distinct validating prefix makes attribution ambiguous;
+            // stop and let the caller fall back rather than guess.
+            if distinct.len() > 1 {
+                return None;
+            }
         }
-        if !counts.contains_key(prefix) {
-            order.push(prefix.to_string());
-        }
-        *counts.entry(prefix.to_string()).or_default() += 1;
     }
-    // Reduce keeps the earlier prefix on ties (only switches on strictly greater),
-    // so first-seen order is the deterministic tie-break.
-    order
-        .into_iter()
-        .reduce(|best, p| if counts[&p] > counts[&best] { p } else { best })
+    distinct.into_iter().next()
 }
 
 #[cfg(test)]
@@ -700,29 +698,19 @@ mod tests {
     }
 
     #[test]
-    fn read_prefix_disambiguates_same_sanitizing_prefixes_by_frequency() {
+    fn read_prefix_falls_back_when_two_prefixes_sanitize_identically() {
         // bd's `-`→`_` DB sanitization is many-to-one: `a_b-c` and `a-b_c` both
-        // sanitize to `a_b_c`, so a foreign hydrated id can validate against this
-        // repo's dolt_database. The repo's own issues dominate its export, so the
-        // most-frequent validating prefix wins — regardless of file order, and
-        // even when the foreign id appears first.
+        // sanitize to `a_b_c`, so both validate against dolt_database `a_b_c`. We
+        // must not guess which repo owns the ids (count-based or first-seen); the
+        // ambiguous result falls back to dolt_database, so neither prefix's ids
+        // are misattributed (they land in the unknown bucket instead).
         let tmp = tempfile::tempdir().unwrap();
-        let repo = seed_repo_with_ids(
-            tmp.path(),
-            "r",
-            "a_b_c",
-            &[
-                "a-b_c-foreign", // a foreign hydrated id, same sanitized form, first
-                "a_b-c-1",       // this repo's own ids (majority)
-                "a_b-c-2",
-                "a_b-c-3",
-            ],
-        );
+        let repo = seed_repo_with_ids(tmp.path(), "r", "a_b_c", &["a_b-c-1", "a-b_c-2", "a_b-c-3"]);
 
         assert_eq!(
             read_prefix(&repo).unwrap(),
-            "a_b-c",
-            "the repo's own (majority) prefix wins over a same-sanitizing foreign id"
+            "a_b_c",
+            "two same-sanitizing prefixes are ambiguous -> fall back, never guess"
         );
     }
 
