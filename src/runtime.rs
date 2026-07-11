@@ -5,7 +5,7 @@
 //! [`crate::app::view::draw`]. Terminal setup/teardown installs a panic hook that
 //! restores the terminal (the session-tui pattern). See `plans/slices/slice-9.md`.
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -20,7 +20,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, Effect, Msg, keys, view};
+use crate::app::{App, Effect, Msg, context, keys, view};
 use crate::bd::{BdCli, BdClient, IssueDetail};
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
@@ -35,6 +35,10 @@ const INPUT_POLL: Duration = Duration::from_millis(100);
 /// How long the UI thread waits for a message before redrawing anyway, so the
 /// status bar's last-refreshed age advances while the user is idle.
 const TICK: Duration = Duration::from_secs(1);
+
+/// The most characters of a copied command/block shown in the status-bar
+/// confirmation before it is truncated with an ellipsis.
+const COPY_SUMMARY_MAX: usize = 72;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -175,6 +179,14 @@ fn execute_effect(
         Effect::Refresh => spawn_refresh(tx, paths, roster),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
         Effect::Search { query, token } => spawn_search(tx, paths, roster, query, token),
+        Effect::Copy { row, markdown } => spawn_copy(tx, paths, roster, *row, markdown),
+        // Not a worker: write the OSC 52 escape here, on the UI thread that owns
+        // the tty, so it can never interleave with a ratatui draw. Returns without
+        // a handle to track.
+        Effect::WriteClipboard(payload) => {
+            write_clipboard(&payload);
+            return;
+        }
     };
     worker_handles.push(handle);
 }
@@ -304,6 +316,75 @@ pub(crate) fn gather_search(
         .map_err(|e| sanitize(&format!("search failed: {e}")))?;
     let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
     Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
+}
+
+/// Spawn a background copy worker that reports over `tx`, returning its join
+/// handle so the event loop can wait for it on shutdown. Clones the roster and
+/// paths into the thread and builds a fresh [`BdCli`] (stateless).
+fn spawn_copy(
+    tx: &Sender<Incoming>,
+    paths: &Paths,
+    roster: &Config,
+    row: Row,
+    markdown: bool,
+) -> thread::JoinHandle<()> {
+    let tx = tx.clone();
+    let paths = paths.clone();
+    let roster = roster.clone();
+    thread::spawn(move || copy_worker(BdCli::new(), roster, paths, row, markdown, tx))
+}
+
+/// The copy worker body: build the clipboard payload + status summary off the UI
+/// thread (the id→repo-path resolution runs `bd`), then send exactly one
+/// [`Msg::Copied`]. `reduce` turns that into the UI-thread [`Effect::WriteClipboard`]
+/// so the escape write never races a draw. Owned args so it moves cleanly into a
+/// thread; unit-tested directly with a [`crate::bd::FakeBdClient`] and a channel.
+pub(crate) fn copy_worker(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    row: Row,
+    markdown: bool,
+    tx: Sender<Incoming>,
+) {
+    let (payload, summary) = build_copy(&bd, &roster, &paths, &row, markdown);
+    let _ = tx.send(Msg::Copied { payload, summary }.into());
+}
+
+/// Build the clipboard payload and its status-bar summary for `row`.
+///
+/// The command form (`markdown == false`) resolves the row's source-repo path
+/// from its issue id via [`refresh::attribution_map`] — the **same** prefix map
+/// search uses — and falls back to the hub (`bd -C <hub> show <id>`) for an
+/// unattributed id. The markdown form needs no path, so it skips the (subprocess)
+/// prefix read entirely. All bd-sourced text is sanitized inside [`context`].
+fn build_copy(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    row: &Row,
+    markdown: bool,
+) -> (String, String) {
+    let payload = if markdown {
+        context::markdown_block(&row.issue, &row.repo_name)
+    } else {
+        let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
+        let repo = prefix_map.repo_for(&row.issue.id).map(|e| e.path.clone());
+        context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id)
+    };
+    let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
+    (payload, summary)
+}
+
+/// Write `payload` to the terminal clipboard via an OSC 52 escape. Called only on
+/// the UI thread (which owns the tty), so the sequence can never interleave with
+/// a ratatui draw. Best-effort: a terminal that ignores OSC 52 simply drops it,
+/// and a write failure is non-fatal (the status bar still confirms the attempt).
+fn write_clipboard(payload: &str) {
+    let seq = context::osc52(payload);
+    let mut out = io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 /// Run `ensure_hub → refresh → fetch` and return the fresh snapshot (or `None`
@@ -708,6 +789,91 @@ mod tests {
             }
             other => panic!("expected SearchResults, got {other:?}"),
         }
+        handle.join().unwrap();
+    }
+
+    /// The single `Msg::Copied` a copy worker sends, unwrapping payload + summary.
+    fn recv_copied(rx: &Receiver<Incoming>) -> (String, String) {
+        match recv_msg(rx) {
+            Msg::Copied { payload, summary } => (payload, summary),
+            other => panic!("expected Copied, got {other:?}"),
+        }
+    }
+
+    fn copy_row(repo_name: &str, id: &str) -> Row {
+        Row {
+            issue: issue(id, 1, "Ready one"),
+            repo_name: repo_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn copy_worker_builds_cd_for_attributed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new();
+        let (tx, rx) = mpsc::channel();
+
+        let row = copy_row("ra", "ra-1");
+        let paths2 = paths.clone();
+        let ra2 = ra.clone();
+        let handle =
+            thread::spawn(move || copy_worker(bd, roster(&[&ra2]), paths2, row, false, tx));
+
+        let (payload, summary) = recv_copied(&rx);
+        assert_eq!(
+            payload,
+            format!("cd {} && bd show ra-1", ra.display()),
+            "attributed id resolves to its repo path"
+        );
+        assert!(
+            summary.starts_with("cd ") && summary.chars().count() <= COPY_SUMMARY_MAX,
+            "summary is the truncated command form: {summary}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn copy_worker_falls_back_to_hub_for_unattributed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new();
+        let (tx, rx) = mpsc::channel();
+
+        // An id whose prefix (`zz`) matches no roster repo → hub fallback.
+        let row = copy_row("unknown", "zz-9");
+        let paths2 = paths.clone();
+        let handle = thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths2, row, false, tx));
+
+        let (payload, _) = recv_copied(&rx);
+        assert_eq!(
+            payload,
+            format!("bd -C {} show zz-9", hub_dir(&paths).display()),
+            "an unattributed id uses the always-correct hub form"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn copy_worker_markdown_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new();
+        let (tx, rx) = mpsc::channel();
+
+        let row = copy_row("session-tui", "ra-1");
+        let handle = thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths, row, true, tx));
+
+        let (payload, _) = recv_copied(&rx);
+        assert!(payload.contains("Ready one"), "markdown title: {payload:?}");
+        assert!(payload.contains("ra-1"), "markdown id: {payload:?}");
+        assert!(
+            payload.contains("session-tui"),
+            "markdown repo: {payload:?}"
+        );
         handle.join().unwrap();
     }
 

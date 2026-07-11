@@ -377,6 +377,10 @@ fn status_line(app: &App, now: SystemTime) -> String {
     if app.is_stale() && app.fetched_at().is_some() {
         status.push_str(" · refreshing…");
     }
+    // A recent copy confirmation, ahead of any warnings so it is not clipped.
+    if let Some(flash) = app.copy_flash() {
+        status.push_str(&format!(" · copied: {}", sanitize(flash)));
+    }
     let warnings = app.status_warnings();
     if let Some(first) = warnings.first() {
         // Sanitize at the render boundary: warnings embed bd stderr / paths and
@@ -1160,6 +1164,21 @@ mod tests {
         assert!(
             err_title.contains("esc edit"),
             "error hint keeps the active esc: {err_title:?}"
+        );
+    }
+
+    #[test]
+    fn renders_copy_confirmation() {
+        // After a copy worker reports back, the status bar confirms it.
+        let mut app = app_with(vec![row("megaclock", "mc-abc", 1, "task")], vec![]);
+        app.reduce(Msg::Copied {
+            payload: "cd /dev/megaclock && bd show mc-abc".into(),
+            summary: "cd /dev/megaclock && bd show mc-abc".into(),
+        });
+        let status = line_text(&render(&app, at(1000)), H - 1);
+        assert!(
+            status.contains("copied: cd /dev/megaclock && bd show mc-abc"),
+            "the status bar confirms the copy: {status:?}"
         );
     }
 

@@ -34,6 +34,7 @@ pub fn map_key(event: KeyEvent, editing: bool) -> Option<Msg> {
         KeyCode::Char('/') => Some(Msg::OpenSearch),
         KeyCode::Char('r') => Some(Msg::Refresh),
         KeyCode::Char('y') => Some(Msg::CopyContext),
+        KeyCode::Char('Y') => Some(Msg::CopyMarkdown),
         KeyCode::Char('f') => Some(Msg::CycleRepoFilter),
         KeyCode::Char('p') => Some(Msg::TogglePriorityFilter),
         KeyCode::Char('j') | KeyCode::Down => Some(Msg::SelectNext),
@@ -68,6 +69,11 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('y')), false),
             Some(Msg::CopyContext)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('Y')), false),
+            Some(Msg::CopyMarkdown),
+            "shifted Y copies the markdown block"
         );
         assert_eq!(map_key(press(KeyCode::Enter), false), Some(Msg::OpenDetail));
         assert_eq!(map_key(press(KeyCode::Esc), false), Some(Msg::Back));
@@ -112,6 +118,11 @@ mod tests {
             map_key(press(KeyCode::Char('q')), true),
             Some(Msg::SearchInput('q')),
             "a command key is literal text while editing"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('Y')), true),
+            Some(Msg::SearchInput('Y')),
+            "a shifted copy key is literal text while editing"
         );
         assert_eq!(
             map_key(press(KeyCode::Backspace), true),
