@@ -98,7 +98,11 @@ impl PrefixMap {
     /// Build the map from `(prefix, repo)` pairs. A prefix claimed by more than
     /// one repo becomes a [`Collision`] and a `None` entry; a unique prefix maps
     /// to its repo. First-seen order is preserved for deterministic reporting.
-    fn build(pairs: Vec<(String, RepoEntry)>) -> PrefixMap {
+    ///
+    /// Public so consumers (e.g. `snapshot`'s tests) can construct a populated
+    /// map without running a whole refresh; `run` builds it from the prefixes it
+    /// reads from each repo's metadata.
+    pub fn from_pairs(pairs: Vec<(String, RepoEntry)>) -> PrefixMap {
         let mut order: Vec<String> = Vec::new();
         let mut grouped: HashMap<String, Vec<RepoEntry>> = HashMap::new();
         for (prefix, repo) in pairs {
@@ -135,14 +139,23 @@ impl PrefixMap {
     /// of `id`. `None` when nothing matches, or when the longest matching prefix
     /// is a collided (ambiguous) one.
     pub fn repo_for(&self, id: &str) -> Option<&RepoEntry> {
-        self.entries
+        self.attribution(id).map(|(_, repo)| repo)
+    }
+
+    /// Like [`repo_for`](Self::repo_for) but also yields the matched prefix. The
+    /// prefix is a unique, short, non-sensitive repo identity (a collided prefix
+    /// resolves to `None` here), useful to disambiguate repos that share a
+    /// directory basename without exposing a filesystem path.
+    pub fn attribution(&self, id: &str) -> Option<(&str, &RepoEntry)> {
+        let (prefix, repo) = self
+            .entries
             .iter()
             .filter(|(prefix, _)| {
                 id.strip_prefix(prefix.as_str())
                     .is_some_and(|rest| rest.starts_with('-'))
             })
-            .max_by_key(|(prefix, _)| prefix.len())
-            .and_then(|(_, repo)| repo.as_ref())
+            .max_by_key(|(prefix, _)| prefix.len())?;
+        repo.as_ref().map(|repo| (prefix.as_str(), repo))
     }
 
     /// Prefixes claimed by more than one roster repo.
@@ -241,7 +254,7 @@ pub fn run(
     bd.repo_sync(&hub).map_err(RefreshError::Sync)?;
 
     Ok(RefreshOutcome {
-        prefix_map: PrefixMap::build(pairs),
+        prefix_map: PrefixMap::from_pairs(pairs),
         errors,
         synced_at: SystemTime::now(),
     })
