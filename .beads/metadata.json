@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "federated_beads",
+  "project_id": "a8d0bb4d-c9ea-48b6-b9b7-06fac6f7eaea"
+}
