@@ -171,7 +171,13 @@ impl Default for App {
 }
 
 impl App {
-    /// A fresh app: `Loading`, no rows, no selection, not done.
+    /// A fresh app: `Loading`, no rows, no selection, not done — and already
+    /// **in-flight**. Construction is always part of launch, which immediately
+    /// initiates the first refresh (the Slice 9 runtime spawns it), so the app is
+    /// born `stale`: this reserves the refresh in-flight slot from the very first
+    /// event, deduping an `r` keypress that races the initial worker's
+    /// `RefreshStarted`. The flag clears when that first refresh concludes with a
+    /// `RefreshCompleted`, like any other cycle.
     pub fn new() -> App {
         App {
             rows: Vec::new(),
@@ -179,7 +185,7 @@ impl App {
             selection: 0,
             filter: FilterSet::default(),
             view_mode: ViewMode::Loading,
-            stale: false,
+            stale: true,
             status_warnings: Vec::new(),
             fetched_at: None,
             done: false,
@@ -629,6 +635,26 @@ mod tests {
             Vec::new(),
             "the second cycle is still deduped"
         );
+    }
+
+    #[test]
+    fn startup_refresh_holds_the_in_flight_slot() {
+        // The runtime spawns an initial refresh at launch without going through
+        // `Msg::Refresh`, so a brand-new app must already be in-flight: an `r`
+        // that races the initial worker's `RefreshStarted` is deduped, not a
+        // second worker.
+        let mut app = App::new();
+        assert!(app.is_stale(), "a fresh app is born in-flight");
+        assert_eq!(
+            app.reduce(Msg::Refresh),
+            Vec::new(),
+            "an immediate r is deduped against the startup refresh"
+        );
+
+        // When the initial refresh concludes, the slot frees and r works again.
+        app.reduce(completed(vec![row("ra", "ra-1", 1)]));
+        assert!(!app.is_stale());
+        assert_eq!(app.reduce(Msg::Refresh), vec![Effect::Refresh]);
     }
 
     #[test]

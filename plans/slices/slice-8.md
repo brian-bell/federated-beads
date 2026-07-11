@@ -82,6 +82,14 @@ them.
    completion could clobber a newer snapshot. Setting `stale` synchronously at
    request time (before any async `RefreshStarted`) makes the guard race-free.
 
+   2b. **A fresh `App` is born in-flight (`stale = true`).** Construction is
+   always part of launch, which immediately initiates the first refresh (the
+   Slice 9 runtime spawns it *without* going through `Msg::Refresh`). Starting
+   `stale` reserves the in-flight slot from the very first event, so an `r` that
+   races the initial worker's `RefreshStarted` is deduped rather than spawning a
+   second startup worker. The flag clears when that first refresh concludes with
+   a `RefreshCompleted`, like any cycle. (Also revised after autoreview.)
+
 5. **`selection` indexes `filtered_ix`, not `rows`.** `filtered_ix: Vec<usize>`
    holds the indices of rows passing the current `FilterSet`, in display order.
    `selection: usize` is an offset into `filtered_ix`. **Invariant (enforced
@@ -264,6 +272,15 @@ hazard originates:
    warnings }` (decision 3), so `stale` clears exactly once per cycle. Regression
    tests `success_with_warnings_completes_atomically` and
    `fatal_refresh_keeps_rows_and_surfaces_warning`.
-3. **Round 3: clean** — helper exited 0 with no accepted/actionable findings.
+3. **Startup refresh bypassed the guard (round 3).** The guard covered
+   `Msg::Refresh`-initiated refreshes, but the runtime's *initial* launch refresh
+   is spawned directly, so a brand-new `App` had `stale == false` and an `r`
+   pressed before the initial worker's `RefreshStarted` landed could spawn a
+   second overlapping worker. **Fixed:** an `App` is born in-flight (`stale =
+   true`, decision 2b) since construction is always immediately followed by the
+   launch refresh, so the slot is reserved from the first event. Regression test
+   `startup_refresh_holds_the_in_flight_slot`.
+4. **Round 4: clean** — helper exited 0 with no accepted/actionable findings.
 
-No findings were rejected.
+No findings were rejected; all three were the same overlapping-refresh bug class,
+fixed at the pure-state layer where it originates.
