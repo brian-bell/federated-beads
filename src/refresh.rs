@@ -6,7 +6,7 @@
 //! across concurrent fbd instances so two cannot run `repo sync` against the
 //! same embedded-Dolt hub at once. See `plans/slices/slice-4.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -82,19 +82,22 @@ pub struct Collision {
 }
 
 /// Maps an issue id to its source repo by longest configured prefix followed by
-/// `-`. Colliding prefixes are excluded from lookup and recorded separately.
+/// `-`. A prefix claimed by more than one repo resolves to `None` (ambiguous)
+/// but stays in the lookup table so it can still win the longest-match contest —
+/// a shorter unique prefix must never mask a longer, collided one.
 #[derive(Debug, Default, Clone)]
 pub struct PrefixMap {
-    /// Unique-prefix → repo, sorted-agnostic; lookup scans for the longest match.
-    entries: Vec<(String, RepoEntry)>,
-    /// Prefixes claimed by more than one repo.
+    /// Every configured prefix → its resolution: `Some(repo)` when a single repo
+    /// claims it, `None` when it collided. Lookup scans for the longest match.
+    entries: Vec<(String, Option<RepoEntry>)>,
+    /// Prefixes claimed by more than one repo, for surfacing to the user.
     collisions: Vec<Collision>,
 }
 
 impl PrefixMap {
-    /// Build the map from `(prefix, repo)` pairs, splitting off any prefix
-    /// claimed by more than one repo into [`Collision`]s (excluded from lookup).
-    /// First-seen order is preserved for deterministic collision reporting.
+    /// Build the map from `(prefix, repo)` pairs. A prefix claimed by more than
+    /// one repo becomes a [`Collision`] and a `None` entry; a unique prefix maps
+    /// to its repo. First-seen order is preserved for deterministic reporting.
     fn build(pairs: Vec<(String, RepoEntry)>) -> PrefixMap {
         let mut order: Vec<String> = Vec::new();
         let mut grouped: HashMap<String, Vec<RepoEntry>> = HashMap::new();
@@ -110,12 +113,16 @@ impl PrefixMap {
         for prefix in order {
             let mut repos = grouped.remove(&prefix).expect("prefix was inserted");
             if repos.len() == 1 {
-                entries.push((prefix, repos.pop().expect("length checked to be 1")));
+                entries.push((prefix, Some(repos.pop().expect("length checked to be 1"))));
             } else {
                 collisions.push(Collision {
-                    prefix,
+                    prefix: prefix.clone(),
                     repos: repos.into_iter().map(|r| r.path).collect(),
                 });
+                // Keep the collided prefix in the lookup table (as `None`) so it
+                // still participates in longest-match; otherwise a shorter unique
+                // prefix could wrongly claim an id under the longer collided one.
+                entries.push((prefix, None));
             }
         }
         PrefixMap {
@@ -125,7 +132,8 @@ impl PrefixMap {
     }
 
     /// The repo whose configured prefix, followed by `-`, is the longest prefix
-    /// of `id`. `None` when nothing matches or the matching prefix collided.
+    /// of `id`. `None` when nothing matches, or when the longest matching prefix
+    /// is a collided (ambiguous) one.
     pub fn repo_for(&self, id: &str) -> Option<&RepoEntry> {
         self.entries
             .iter()
@@ -134,7 +142,7 @@ impl PrefixMap {
                     .is_some_and(|rest| rest.starts_with('-'))
             })
             .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, repo)| repo)
+            .and_then(|(_, repo)| repo.as_ref())
     }
 
     /// Prefixes claimed by more than one roster repo.
@@ -198,8 +206,15 @@ pub fn run(
 
     let mut errors = Vec::new();
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
+    // Canonical paths already handled, so an aliased/duplicate roster entry is
+    // exported once and never mistaken for a prefix collision with itself
+    // (mirrors ensure_hub's roster dedupe).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for entry in &roster.repos {
+        if !seen.insert(normalize(&entry.path)) {
+            continue;
+        }
         // Export refreshes the repo's passive JSONL. A failure is recorded but
         // never aborts the run — the hub still syncs and other repos hydrate.
         if entry.path.exists()
@@ -238,6 +253,12 @@ pub fn run(
 #[derive(Debug, Deserialize)]
 struct Metadata {
     dolt_database: String,
+}
+
+/// Canonicalize `p` if it exists on disk; otherwise return it unchanged. Used to
+/// dedupe roster entries that name the same repo via different (aliased) paths.
+fn normalize(p: &Path) -> PathBuf {
+    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Read a repo's id prefix from `<repo>/.beads/metadata.json`.
@@ -444,6 +465,57 @@ mod tests {
         let err = run(&fake, &roster(&[&a]), &paths).unwrap_err();
 
         assert!(matches!(err, RefreshError::Sync(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn collided_longer_prefix_is_not_masked_by_shorter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // A unique short prefix `app`, plus two repos both claiming `app-foo`.
+        let a = seed_repo(tmp.path(), "a", "app");
+        let b = seed_repo(tmp.path(), "b", "app-foo");
+        let c = seed_repo(tmp.path(), "c", "app-foo");
+        let fake = FakeBdClient::new();
+
+        let outcome = run(&fake, &roster(&[&a, &b, &c]), &paths).unwrap();
+        let map = outcome.prefix_map;
+
+        // The longest match for `app-foo-123` is the collided `app-foo`, so it is
+        // ambiguous — the shorter unique `app` must not claim it.
+        assert!(
+            map.repo_for("app-foo-123").is_none(),
+            "a collided longer prefix must not fall through to a shorter one"
+        );
+        // The unique `app` still resolves ids that only it matches.
+        assert_eq!(map.repo_for("app-xyz").map(|r| &r.path), Some(&a));
+    }
+
+    #[test]
+    fn duplicate_roster_entry_is_not_a_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let a = seed_repo(tmp.path(), "a", "ra");
+        let fake = FakeBdClient::new();
+
+        // The same repo listed twice must dedupe, not self-collide.
+        let outcome = run(&fake, &roster(&[&a, &a]), &paths).unwrap();
+
+        assert!(
+            outcome.prefix_map.collisions().is_empty(),
+            "an aliased duplicate is not a collision: {:?}",
+            outcome.prefix_map.collisions()
+        );
+        assert_eq!(
+            outcome.prefix_map.repo_for("ra-1").map(|r| &r.path),
+            Some(&a),
+            "the deduped repo still attributes its ids"
+        );
+        let exports = fake
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Export(_)))
+            .count();
+        assert_eq!(exports, 1, "a duplicate roster entry exports once");
     }
 
     #[test]
