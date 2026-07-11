@@ -275,7 +275,10 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 /// Read a repo's id prefix from `<repo>/.beads/metadata.json`.
-fn read_prefix(repo: &Path) -> Result<String, String> {
+///
+/// Public so `doctor` can report each roster repo's prefix without re-running a
+/// whole refresh; `run` uses it to build the attribution map.
+pub fn read_prefix(repo: &Path) -> Result<String, String> {
     let path = repo.join(".beads").join("metadata.json");
     let text = fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let meta: Metadata =

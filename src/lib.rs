@@ -5,6 +5,7 @@
 //! is testable without touching the environment or a real `bd`.
 
 pub mod bd;
+pub mod cli;
 pub mod config;
 pub mod hub;
 pub mod refresh;
