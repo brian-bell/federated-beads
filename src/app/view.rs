@@ -16,9 +16,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{App, ViewMode};
+use super::{App, DetailState, ViewMode};
+use crate::bd::{Dependency, IssueDetail};
 use crate::cli::{format_row_body, sanitize};
 
 /// Shown when the roster has no rows at all (no repos configured / nothing
@@ -29,25 +30,132 @@ const EMPTY_HINT: &str = "no repos configured — run: fbd repos discover ~/dev"
 /// is not misdirected to reconfigure the roster.
 const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p to change";
 
-/// One-line key hints shown along the top. Only keys that act in this slice are
-/// advertised; `/` search (Slice 11) and Enter detail (Slice 10) are omitted
-/// until they do something, so the UI never promises an inert command.
-const KEY_HINTS: &str = "fbd · q quit · r refresh · f repo · p prio · j/k move";
+/// One-line key hints for the list view. Only keys that act are advertised, so
+/// the UI never promises an inert command; `/` search (Slice 11) stays omitted
+/// until it does something. `enter detail` is live as of Slice 10.
+const LIST_HINTS: &str = "fbd · q quit · r refresh · f repo · p prio · j/k move · enter detail";
 
-/// Render the whole ready screen for the current [`App`] state and clock `now`.
+/// One-line key hints for the detail pane: the keys that act there.
+const DETAIL_HINTS: &str = "fbd · esc back · q quit";
+
+/// Render the whole screen for the current [`App`] state and clock `now`: a title
+/// hint row, the mode-specific content (ready list or list+detail split), and the
+/// status bar.
 pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title / key hints
-            Constraint::Min(0),    // the ready list
+            Constraint::Min(0),    // content (list, or list + detail)
             Constraint::Length(1), // status bar
         ])
         .split(frame.area());
 
-    frame.render_widget(Paragraph::new(KEY_HINTS), chunks[0]);
-    draw_list(frame, app, chunks[1]);
+    let hints = if app.view_mode() == ViewMode::Detail {
+        DETAIL_HINTS
+    } else {
+        LIST_HINTS
+    };
+    frame.render_widget(Paragraph::new(hints), chunks[0]);
+    if app.view_mode() == ViewMode::Detail {
+        draw_detail_split(frame, app, chunks[1]);
+    } else {
+        draw_list(frame, app, chunks[1]);
+    }
     frame.render_widget(Paragraph::new(status_line(app, now)), chunks[2]);
+}
+
+/// Split the content area for the detail view: the list keeps its full rendering
+/// in one half and the detail pane fills the other. Side by side (list left,
+/// detail right) on a wide terminal (≥ 100 cols, the frame width unchanged by the
+/// vertical title/status split); stacked (list top, detail bottom) when narrower,
+/// so neither pane is squeezed below usefulness.
+fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) {
+    let direction = if area.width >= 100 {
+        Direction::Horizontal
+    } else {
+        Direction::Vertical
+    };
+    let parts = Layout::default()
+        .direction(direction)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    draw_list(frame, app, parts[0]);
+    draw_detail(frame, app, parts[1]);
+}
+
+/// Render the detail pane for the app's current [`DetailState`]: a loading line, a
+/// fetch-error message, or the loaded issue (title, meta, wrapped description,
+/// blocker dependencies). All bd-sourced text is [`sanitize`]d at the boundary and
+/// wrapped to the pane width.
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = match app.detail() {
+        Some(DetailState::Loading { id }) => {
+            vec![Line::from(format!("Loading {}…", sanitize(id)))]
+        }
+        Some(DetailState::Error { id, message }) => vec![
+            Line::styled(sanitize(id), Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(""),
+            Line::from(sanitize(message)),
+        ],
+        Some(DetailState::Loaded(detail)) => detail_lines(detail),
+        // Unreachable while `view_mode == Detail` (they are set together), but
+        // rendering nothing is a safe fallback rather than a panic.
+        None => Vec::new(),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Build the wrapped-text lines for a loaded issue detail.
+fn detail_lines(detail: &IssueDetail) -> Vec<Line<'static>> {
+    let issue = &detail.issue;
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+
+    let mut lines = vec![Line::styled(
+        format!("{}  {}", sanitize(&issue.id), sanitize(&issue.title)),
+        bold,
+    )];
+
+    // Meta line: status · priority · type · comment count (present fields only).
+    let mut meta = format!("{} · P{}", sanitize(&issue.status), issue.priority);
+    if let Some(t) = &issue.issue_type {
+        meta.push_str(&format!(" · {}", sanitize(t)));
+    }
+    if let Some(n) = issue.comment_count {
+        meta.push_str(&format!(" · {n} comments"));
+    }
+    lines.push(Line::from(meta));
+
+    if let Some(desc) = &issue.description {
+        lines.push(Line::from(""));
+        lines.push(Line::from(sanitize(desc)));
+    }
+
+    if !detail.dependencies.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Dependencies:".to_string(), bold));
+        for d in &detail.dependencies {
+            lines.push(Line::from(dependency_line(d)));
+        }
+    }
+
+    lines
+}
+
+/// Format one dependency as `⛔ <type>: <id> <title> (<status>)`, defaulting the
+/// fields bd may omit so a partial `bd show` payload still renders a line. All
+/// bd-sourced fields are [`sanitize`]d.
+fn dependency_line(d: &Dependency) -> String {
+    let kind = d.dependency_type.as_deref().unwrap_or("depends on");
+    let title = d.title.as_deref().unwrap_or("");
+    let status = d.status.as_deref().unwrap_or("?");
+    format!(
+        "⛔ {}: {} {} ({})",
+        sanitize(kind),
+        sanitize(&d.id),
+        sanitize(title),
+        sanitize(status),
+    )
 }
 
 /// Build and render the middle list area: the loading placeholder, the empty
@@ -208,7 +316,7 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::app::Msg;
-    use crate::bd::Issue;
+    use crate::bd::{Dependency, Issue, IssueDetail};
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -514,6 +622,212 @@ mod tests {
         assert!(
             line_text(&buf, H - 1).contains("hub sync failed"),
             "the failure text is surfaced in the status bar"
+        );
+    }
+
+    // ---- Detail pane (Slice 10) ----
+
+    fn dep(id: &str, title: &str, status: &str, kind: &str) -> Dependency {
+        Dependency {
+            id: id.into(),
+            title: Some(title.into()),
+            status: Some(status.into()),
+            dependency_type: Some(kind.into()),
+        }
+    }
+
+    /// Build an `IssueDetail` for `id` with a chosen title/description and deps.
+    fn issue_detail(id: &str, title: &str, desc: &str, deps: Vec<Dependency>) -> IssueDetail {
+        IssueDetail {
+            issue: Issue {
+                id: id.into(),
+                title: title.into(),
+                status: "open".into(),
+                priority: 2,
+                description: Some(desc.into()),
+                issue_type: Some("task".into()),
+                owner: None,
+                created_at: None,
+                created_by: None,
+                updated_at: None,
+                dependency_count: Some(deps.len() as i64),
+                dependent_count: None,
+                comment_count: Some(0),
+            },
+            dependencies: deps,
+        }
+    }
+
+    /// An app in `Detail` on the (single) row `id`, with the pane advanced to the
+    /// given detail via the real reduce path. `None` leaves it `Loading`.
+    fn app_in_detail(id: &str, ready: Option<Result<IssueDetail, String>>) -> App {
+        let mut app = app_with(vec![row("session-tui", id, 2, "Blocked task")], vec![]);
+        app.reduce(Msg::OpenDetail);
+        if let Some(detail) = ready {
+            app.reduce(Msg::DetailReady {
+                id: id.into(),
+                detail: detail.map(Box::new),
+            });
+        }
+        app
+    }
+
+    /// Render at a chosen size (detail split needs width variety).
+    fn render_sized(app: &App, now: SystemTime, w: u16, h: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app, now)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The row `y` and starting column of the first buffer cell where `needle`
+    /// begins (searching within the given width).
+    fn find_at(buf: &Buffer, needle: &str, w: u16, h: u16) -> Option<(u16, usize)> {
+        (0..h).find_map(|y| {
+            let text: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
+            text.find(needle).map(|col| (y, col))
+        })
+    }
+
+    #[test]
+    fn renders_detail_pane() {
+        let app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail(
+                "ra-4zf",
+                "Blocked task",
+                "This one is blocked by the blocker",
+                vec![dep("ra-z70", "Blocker task", "open", "blocks")],
+            ))),
+        );
+        let (w, h) = (120, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        assert!(find_at(&buf, "Blocked task", w, h).is_some(), "issue title");
+        assert!(
+            find_at(&buf, "blocked by the blocker", w, h).is_some(),
+            "description text"
+        );
+        let (dep_y, _) = find_at(&buf, "blocks:", w, h).expect("dependency line");
+        let dep_row: String = (0..w)
+            .map(|x| buf.cell((x, dep_y)).unwrap().symbol())
+            .collect();
+        assert!(dep_row.contains("ra-z70"), "dep id: {dep_row:?}");
+        assert!(dep_row.contains("Blocker task"), "dep title: {dep_row:?}");
+        assert!(dep_row.contains("(open)"), "dep status: {dep_row:?}");
+        assert!(dep_row.contains('⛔'), "blocker glyph: {dep_row:?}");
+    }
+
+    #[test]
+    fn detail_pane_splits_right_when_wide() {
+        let app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail(
+                "ra-4zf",
+                "Blocked task",
+                "desc",
+                vec![dep("ra-z70", "Blocker task", "open", "blocks")],
+            ))),
+        );
+        let (w, h) = (120, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        // The detail-only dependency line sits in the right half.
+        let (_, dep_col) = find_at(&buf, "blocks:", w, h).expect("dependency line");
+        assert!(dep_col >= 60, "detail is in the right half: col {dep_col}");
+        // A list-only marker (the repo header) sits in the left half.
+        let (_, hdr_col) = find_at(&buf, "▸ ", w, h).expect("repo header");
+        assert!(hdr_col < 60, "list is in the left half: col {hdr_col}");
+    }
+
+    #[test]
+    fn detail_pane_stacks_below_when_narrow() {
+        let app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail(
+                "ra-4zf",
+                "Blocked task",
+                "desc",
+                vec![dep("ra-z70", "Blocker task", "open", "blocks")],
+            ))),
+        );
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        let (hdr_y, _) = find_at(&buf, "▸ ", w, h).expect("repo header");
+        let (dep_y, dep_col) = find_at(&buf, "blocks:", w, h).expect("dependency line");
+        assert!(
+            dep_col < 40,
+            "detail spans full width when stacked: col {dep_col}"
+        );
+        assert!(
+            dep_y > hdr_y,
+            "detail is stacked below the list: {dep_y} > {hdr_y}"
+        );
+    }
+
+    #[test]
+    fn renders_detail_loading() {
+        let app = app_in_detail("ra-4zf", None); // opened, no DetailReady yet
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        let (y, _) = find_at(&buf, "Loading", w, h).expect("loading placeholder");
+        let line: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
+        assert!(line.contains("ra-4zf"), "loading names the id: {line:?}");
+    }
+
+    #[test]
+    fn renders_detail_error_message() {
+        let app = app_in_detail("ra-4zf", Some(Err("couldn't load ra-4zf: boom".into())));
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        assert!(find_at(&buf, "boom", w, h).is_some(), "error message shown");
+        // The list is still present behind/above the pane.
+        assert!(
+            find_at(&buf, "ra-4zf", w, h).is_some(),
+            "list row still rendered"
+        );
+    }
+
+    #[test]
+    fn wraps_long_description() {
+        let long = "word ".repeat(60); // far wider than an 80-col pane
+        let app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail("ra-4zf", "T", long.trim(), vec![]))),
+        );
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        // The repeated word appears on two or more distinct rows (it wrapped).
+        let rows_with_word = (0..h)
+            .filter(|&y| {
+                let line: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
+                line.contains("word")
+            })
+            .count();
+        assert!(
+            rows_with_word >= 2,
+            "long description wraps: {rows_with_word} rows"
+        );
+    }
+
+    #[test]
+    fn key_hints_are_mode_aware() {
+        let list = app_with(vec![row("ra", "ra-1", 1, "t")], vec![]);
+        let (w, h) = (80, 24);
+        let list_title = line_text(&render_sized(&list, at(1000), w, h), 0);
+        assert!(
+            list_title.contains("enter"),
+            "list advertises enter: {list_title:?}"
+        );
+
+        let detail = app_in_detail("ra-1", None);
+        let detail_title = line_text(&render_sized(&detail, at(1000), w, h), 0);
+        assert!(
+            detail_title.contains("esc"),
+            "detail advertises esc: {detail_title:?}"
         );
     }
 
