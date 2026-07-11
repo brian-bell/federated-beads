@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 
 use fbd::bd::BdCli;
 use fbd::cli::{self, CliError};
-use fbd::config::{Config, Paths};
+use fbd::config::Paths;
 
 #[derive(Parser)]
 #[command(
@@ -54,18 +54,21 @@ fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
 
     let paths = Paths::resolve().map_err(|e| CliError::Io(io::Error::other(e)))?;
-    let roster = load_roster(&paths)?;
     let bd = BdCli::new();
 
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
 
+    // Load the roster per command, not up front: `reset` needs only `Paths`, and
+    // `doctor` loads it itself so it can report a bad config instead of aborting.
+    // Only `snapshot` treats a malformed config as fatal.
     match cli.command {
         Some(Command::Snapshot { json }) => {
+            let roster = cli::load_roster(&paths)?;
             cli::run_snapshot(&roster, &bd, &paths, json, &mut stdout, &mut stderr)
         }
         Some(Command::Reset) => cli::run_reset(&paths, &mut stdout),
-        Some(Command::Doctor) => cli::run_doctor(&roster, &bd, &paths, &mut stdout),
+        Some(Command::Doctor) => cli::run_doctor(&bd, &paths, &mut stdout),
         // Bare `fbd` is reserved for launching the TUI (Slice 9). Until then,
         // orient the user toward the working subcommands rather than erroring.
         None => {
@@ -80,16 +83,5 @@ fn run() -> Result<(), CliError> {
             )?;
             Ok(())
         }
-    }
-}
-
-/// Load the roster from `config.toml`, or an empty roster when the file does not
-/// exist yet (first run). A present-but-invalid file is a real error.
-fn load_roster(paths: &Paths) -> Result<Config, CliError> {
-    let config_file = paths.config_file();
-    if config_file.exists() {
-        Config::load(config_file).map_err(|e| CliError::Io(io::Error::other(e)))
-    } else {
-        Ok(Config::default())
     }
 }

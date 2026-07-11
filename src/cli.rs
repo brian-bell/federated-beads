@@ -74,14 +74,16 @@ pub fn version_gate(v: &BdVersion) -> Result<(), String> {
 }
 
 /// Parse the leading `major.minor.patch` of a version string into a comparable
-/// tuple, ignoring any `-pre`/`+build` suffix. `None` when the major component is
-/// not numeric — such a version fails the gate rather than being trusted.
+/// tuple, ignoring any `-pre`/`+build` suffix. Requires all three numeric
+/// components — an incomplete or non-numeric version (`1.1`, `2`, `x`) yields
+/// `None` and fails the gate closed, since the gate exists to refuse a bd whose
+/// schema fbd cannot vouch for.
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let core = s.split(['-', '+']).next().unwrap_or(s);
     let mut parts = core.split('.');
     let major = parts.next()?.trim().parse().ok()?;
-    let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
-    let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
+    let minor = parts.next()?.trim().parse().ok()?;
+    let patch = parts.next()?.trim().parse().ok()?;
     Some((major, minor, patch))
 }
 
@@ -152,12 +154,12 @@ pub fn run_snapshot(
 
 /// Report environment health: bd version + gate status, config/hub paths, and
 /// per-repo roster existence + prefix. Deliberately **not** version-gated.
-pub fn run_doctor(
-    roster: &Config,
-    bd: &impl BdClient,
-    paths: &Paths,
-    out: &mut impl Write,
-) -> Result<(), CliError> {
+///
+/// Doctor loads the roster itself (rather than being handed one) precisely so a
+/// malformed config becomes a *reported* diagnostic instead of an error that
+/// aborts the command before it can diagnose anything — the config being broken
+/// is one of the things you run doctor to discover.
+pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
     // Doctor is the diagnostic you run *because* something is wrong, so it never
     // gates: it reports the version and whether the gate would pass, and tolerates
     // bd being absent entirely.
@@ -176,7 +178,8 @@ pub fn run_doctor(
         Err(e) => writeln!(out, "bd version: ERROR {e}")?,
     }
 
-    writeln!(out, "config: {}", paths.config_file().display())?;
+    let config_file = paths.config_file();
+    writeln!(out, "config: {}", config_file.display())?;
     let hub = hub_dir(paths);
     let initialized = hub.join(".beads").join("embeddeddolt").is_dir();
     writeln!(
@@ -190,16 +193,37 @@ pub fn run_doctor(
         },
     )?;
 
-    writeln!(out, "roster ({} repos):", roster.repos.len())?;
-    for entry in &roster.repos {
-        if entry.path.exists() {
-            let prefix = refresh::read_prefix(&entry.path).unwrap_or_else(|_| "?".to_string());
-            writeln!(out, "  {}  OK  [prefix: {}]", entry.path.display(), prefix)?;
-        } else {
-            writeln!(out, "  {}  MISSING", entry.path.display())?;
+    // Load the roster here so a missing or malformed config is a reported line,
+    // not a failure that would defeat doctor's whole purpose.
+    match load_roster(paths) {
+        Ok(roster) => {
+            writeln!(out, "roster ({} repos):", roster.repos.len())?;
+            for entry in &roster.repos {
+                if entry.path.exists() {
+                    let prefix =
+                        refresh::read_prefix(&entry.path).unwrap_or_else(|_| "?".to_string());
+                    writeln!(out, "  {}  OK  [prefix: {}]", entry.path.display(), prefix)?;
+                } else {
+                    writeln!(out, "  {}  MISSING", entry.path.display())?;
+                }
+            }
         }
+        Err(e) => writeln!(out, "roster: ERROR reading {}: {e}", config_file.display())?,
     }
     Ok(())
+}
+
+/// Load the roster from `<config>/config.toml`, treating an absent file as an
+/// empty roster (first run) while surfacing a present-but-invalid file as an
+/// error. Shared by `main`'s snapshot path (where a bad config is fatal) and
+/// `run_doctor` (where it is reported, not fatal).
+pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
+    let config_file = paths.config_file();
+    if config_file.exists() {
+        Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e)))
+    } else {
+        Ok(Config::default())
+    }
 }
 
 /// Delete the hub dir (rebuilt on the next snapshot/launch) and report.
@@ -311,6 +335,18 @@ mod tests {
             msg.to_lowercase().contains("schema"),
             "message mentions schema: {msg}"
         );
+    }
+
+    #[test]
+    fn version_gate_rejects_incomplete_version() {
+        // Fail closed: an incomplete or non-numeric version must not be trusted
+        // even though its numeric prefix would compare >= the minimum.
+        for bad in ["1.1", "2", "1.x.0", "", "v1.1.0"] {
+            assert!(
+                version_gate(&version(bad, 1)).is_err(),
+                "incomplete/non-numeric version {bad:?} must fail the gate"
+            );
+        }
     }
 
     #[test]
@@ -458,10 +494,12 @@ mod tests {
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
         let gone = tmp.path().join("gone");
+        // Doctor loads the roster from the config file itself, so persist one.
+        roster(&[&ra, &gone]).save(paths.config_file()).unwrap();
         let bd = FakeBdClient::new(); // default version 1.1.0 / schema 1
         let mut out = Vec::new();
 
-        run_doctor(&roster(&[&ra, &gone]), &bd, &paths, &mut out).expect("ok");
+        run_doctor(&bd, &paths, &mut out).expect("ok");
 
         let stdout = String::from_utf8(out).unwrap();
         assert!(stdout.contains("1.1.0"), "bd version reported: {stdout}");
@@ -490,18 +528,40 @@ mod tests {
         let ok = FakeBdClient::new().with_version(version("1.1.0", 1));
         let bad = FakeBdClient::new().with_version(version("1.0.0", 1));
 
+        // No config file present: doctor loads an empty roster and still runs.
         let mut out_ok = Vec::new();
-        run_doctor(&Config::default(), &ok, &paths, &mut out_ok).expect("ok");
+        run_doctor(&ok, &paths, &mut out_ok).expect("ok");
         assert!(
             String::from_utf8(out_ok).unwrap().contains("gate: OK"),
             "supported bd shows gate: OK"
         );
 
         let mut out_bad = Vec::new();
-        run_doctor(&Config::default(), &bad, &paths, &mut out_bad).expect("ok");
+        run_doctor(&bad, &paths, &mut out_bad).expect("ok");
         assert!(
             String::from_utf8(out_bad).unwrap().contains("gate: FAIL"),
             "old bd shows gate: FAIL"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_malformed_config_without_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        // A present-but-invalid config must be reported, not abort doctor.
+        let config_file = paths.config_file();
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        fs::write(config_file, "this is not = valid toml [[[").unwrap();
+        let bd = FakeBdClient::new();
+        let mut out = Vec::new();
+
+        run_doctor(&bd, &paths, &mut out).expect("doctor still succeeds");
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(stdout.contains("1.1.0"), "version still reported: {stdout}");
+        assert!(
+            stdout.contains("roster: ERROR"),
+            "malformed config surfaced as a reported line: {stdout}"
         );
     }
 
