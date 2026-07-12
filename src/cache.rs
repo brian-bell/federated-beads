@@ -34,9 +34,8 @@ pub fn load(path: &Path, now: SystemTime) -> Option<Snapshot> {
 }
 
 /// Persist `snapshot` to `path` as JSON, creating parent directories as
-/// needed and overwriting any previous cache. Best-effort: the caller treats a
-/// write failure (e.g. a read-only data dir) as non-fatal to the refresh cycle
-/// that produced the snapshot.
+/// needed. Best-effort: the caller treats a write failure (e.g. a read-only
+/// data dir) as non-fatal to the refresh cycle that produced the snapshot.
 ///
 /// Writes to a same-directory temp file and renames it over `path`, so a
 /// reader (or a second fbd instance's own cache write racing this one) always
@@ -44,7 +43,20 @@ pub fn load(path: &Path, now: SystemTime) -> Option<Snapshot> {
 /// write — the same atomic-replace pattern [`crate::config::Config::save`]
 /// uses for `config.toml`. The pid keeps concurrent writers from colliding on
 /// the temp name.
+///
+/// A no-op, `Ok(())` skip when an existing on-disk cache's `fetched_at` is
+/// already at or after `snapshot`'s: two fbd instances can each hold the hub
+/// lock only during their own sync (see `refresh::run`), so their later,
+/// lock-free `bd ready` reads and cache writes can finish out of order. This
+/// keeps the cache monotonic in `fetched_at` without serializing the writes
+/// themselves.
 pub fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    if let Some(existing) = raw_fetched_at(path)
+        && existing >= snapshot.fetched_at
+    {
+        return Ok(());
+    }
+
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
@@ -63,6 +75,15 @@ pub fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
 
     fs::write(&tmp_path, bytes)?;
     fs::rename(&tmp_path, path)
+}
+
+/// The `fetched_at` embedded in whatever is currently at `path`, ignoring
+/// [`MAX_AGE`] (unlike [`load`]) — [`save`]'s monotonicity check needs the
+/// raw timestamp regardless of staleness. `None` for a missing/corrupt file.
+fn raw_fetched_at(path: &Path) -> Option<SystemTime> {
+    let bytes = fs::read(path).ok()?;
+    let snapshot: Snapshot = serde_json::from_slice(&bytes).ok()?;
+    Some(snapshot.fetched_at)
 }
 
 /// Remove the cache file at `path`, if present. A missing file is not an
@@ -191,6 +212,26 @@ mod tests {
             entries,
             vec![path.file_name().unwrap().to_os_string()],
             "only the final cache file remains, no leftover .tmp file"
+        );
+    }
+
+    #[test]
+    fn save_never_regresses_a_newer_cache() {
+        // Simulates two fbd instances whose syncs finish in one order but
+        // whose (lock-free) `bd ready` reads and cache writes land in the
+        // other: the older snapshot's write must not clobber the newer one.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        let newer = snapshot_at(at(2_000_000));
+        let older = snapshot_at(at(1_000_000));
+
+        save(&path, &newer).expect("save ok");
+        save(&path, &older).expect("save ok (no-op)");
+
+        let on_disk = load(&path, at(2_000_000)).expect("still a hit");
+        assert_eq!(
+            on_disk, newer,
+            "the older write did not overwrite the newer cache"
         );
     }
 
