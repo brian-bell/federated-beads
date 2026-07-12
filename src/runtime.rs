@@ -94,16 +94,14 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     let mut app = App::new();
     // A fresh (<12h) on-disk cache paints instantly, before the real refresh
     // below has a chance to land, so launch never sits in `Loading` behind a
-    // slow `bd ready` when yesterday's rows would do. Routed through the same
-    // `RefreshCompleted` reduction a live refresh uses, so cache hydration gets
-    // the same rows/fetched_at/view_mode handling for free — no bespoke
-    // "seed from cache" branch in `App`. A stale/missing/corrupt cache is a
-    // silent no-op: the app stays `Loading` exactly as before this existed.
+    // slow `bd ready` when yesterday's rows would do. `hydrate_from_cache`
+    // (unlike `reduce(Msg::RefreshCompleted { .. })`) leaves `stale` alone,
+    // so the born-stale in-flight guard `App::new` reserves for the launch
+    // refresh below stays armed the whole time. A stale/missing/corrupt
+    // cache is a silent no-op: the app stays `Loading` exactly as before
+    // this existed.
     if let Some(snapshot) = cache::load(paths.cache_file(), SystemTime::now()) {
-        app.reduce(Msg::RefreshCompleted {
-            snapshot: Some(snapshot),
-            warnings: Vec::new(),
-        });
+        app.hydrate_from_cache(snapshot);
     }
     // In-flight background workers (refresh *and* detail), tracked so shutdown can
     // wait for the running bd subprocess to finish and release the hub lock —

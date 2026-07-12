@@ -495,6 +495,21 @@ impl App {
         }
     }
 
+    /// Seed a freshly-constructed app with a snapshot loaded from the on-disk
+    /// cache, so launch can paint immediately instead of sitting in `Loading`
+    /// until the real refresh lands. Deliberately **not** routed through
+    /// `reduce(Msg::RefreshCompleted { .. })`: that message's terminal
+    /// `self.stale = false` would clear the in-flight guard `App::new`
+    /// reserves for the launch refresh the runtime spawns right after this
+    /// call, opening a window where a fast `r` keypress dedups against the
+    /// wrong (already-cleared) flag and spawns a second, overlapping refresh
+    /// worker. Call this only before the app has processed any other
+    /// message — `apply_snapshot`'s open-detail relocation is a no-op then
+    /// anyway, since neither `detail` nor `search` can yet be set.
+    pub fn hydrate_from_cache(&mut self, snapshot: Snapshot) {
+        self.apply_snapshot(snapshot);
+    }
+
     /// Apply a message, returning the effects the runtime must perform.
     ///
     /// Pure: given the same starting state and message, the resulting state and
@@ -510,37 +525,7 @@ impl App {
             }
             Msg::RefreshCompleted { snapshot, warnings } => {
                 if let Some(snapshot) = snapshot {
-                    // With a detail opened *from the ready list*, remember the
-                    // opened issue so the refresh's re-sort does not move the
-                    // selection to a *different* row: the pane pins one issue, and
-                    // `Esc` must return to it. (Slice 8 decision 5 otherwise
-                    // preserves only the selection index; this narrower rule applies
-                    // just while a ready-list detail is open.) A detail opened from
-                    // a *search* result must NOT relocate the hidden ready selection
-                    // — its id may also be a ready row, and moving to it would
-                    // corrupt the ready selection `Esc` restores. So relocate only
-                    // when no search is active (`search.is_none()`).
-                    let opened_id = if self.search.is_none() {
-                        self.detail.as_ref().map(|d| d.id().to_string())
-                    } else {
-                        None
-                    };
-                    // A refresh always updates the ready list, even under a search
-                    // or detail overlay; `set_rows` keeps the active filter and
-                    // re-clamps the selection. (`None` keeps the last-good rows.)
-                    self.ready.set_rows(snapshot.rows);
-                    self.fetched_at = Some(snapshot.fetched_at);
-                    // Only promote the first-snapshot transition; a refresh landing
-                    // under an open `Detail`/`Search` overlay must not slam it shut
-                    // (the 1s cadence would otherwise eject the reader).
-                    if self.view_mode == ViewMode::Loading {
-                        self.view_mode = ViewMode::List;
-                    }
-                    // Relocate the ready selection onto the opened ready issue if it
-                    // survived the refresh; otherwise the clamped index stands.
-                    if let Some(id) = opened_id {
-                        self.ready.select_id(&id);
-                    }
+                    self.apply_snapshot(snapshot);
                 }
                 // The runtime sends the full warning set per cycle, so replace.
                 self.status_warnings = warnings;
@@ -951,6 +936,42 @@ impl App {
     /// The selected row, or `None` when nothing is visible.
     pub fn selected_row(&self) -> Option<&Row> {
         self.active().selected_row()
+    }
+
+    /// Install a fresh snapshot's rows: shared by `Msg::RefreshCompleted` and
+    /// [`App::hydrate_from_cache`]. Does not touch `stale`/`status_warnings`/
+    /// `copy_flash` — each caller owns those per its own semantics.
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        // With a detail opened *from the ready list*, remember the opened
+        // issue so the refresh's re-sort does not move the selection to a
+        // *different* row: the pane pins one issue, and `Esc` must return to
+        // it. (Slice 8 decision 5 otherwise preserves only the selection
+        // index; this narrower rule applies just while a ready-list detail is
+        // open.) A detail opened from a *search* result must NOT relocate the
+        // hidden ready selection — its id may also be a ready row, and moving
+        // to it would corrupt the ready selection `Esc` restores. So relocate
+        // only when no search is active (`search.is_none()`).
+        let opened_id = if self.search.is_none() {
+            self.detail.as_ref().map(|d| d.id().to_string())
+        } else {
+            None
+        };
+        // A refresh always updates the ready list, even under a search or
+        // detail overlay; `set_rows` keeps the active filter and re-clamps
+        // the selection. (`None` keeps the last-good rows.)
+        self.ready.set_rows(snapshot.rows);
+        self.fetched_at = Some(snapshot.fetched_at);
+        // Only promote the first-snapshot transition; a refresh landing under
+        // an open `Detail`/`Search` overlay must not slam it shut (the 1s
+        // cadence would otherwise eject the reader).
+        if self.view_mode == ViewMode::Loading {
+            self.view_mode = ViewMode::List;
+        }
+        // Relocate the ready selection onto the opened ready issue if it
+        // survived the refresh; otherwise the clamped index stands.
+        if let Some(id) = opened_id {
+            self.ready.select_id(&id);
+        }
     }
 
     /// Whether a refresh is in flight over the shown rows.
@@ -2181,6 +2202,33 @@ mod tests {
         assert_eq!(app.selection(), Some(1), "selection preserved");
         assert_eq!(app.view_mode(), ViewMode::List);
         assert!(app.is_stale(), "stale flag set while refreshing");
+    }
+
+    #[test]
+    fn hydrate_from_cache_paints_rows_without_clearing_the_launch_refresh_guard() {
+        // A cache hit must not clear `App::new`'s born-`stale` in-flight guard:
+        // the runtime spawns the real launch refresh right after hydrating, and
+        // if `stale` were cleared in between, a quick `r` would slip past the
+        // `Msg::Refresh` dedup check and spawn a second, overlapping worker
+        // (federated-beads review finding: hydrating via
+        // `reduce(Msg::RefreshCompleted { .. })` had exactly this bug).
+        let mut app = App::new();
+        assert!(
+            app.is_stale(),
+            "born stale, reserving the launch refresh slot"
+        );
+
+        app.hydrate_from_cache(snapshot(vec![row("ra", "ra-1", 1)]));
+
+        assert_eq!(app.rows().len(), 1, "cached rows are shown");
+        assert_eq!(app.view_mode(), ViewMode::List, "Loading promotes to List");
+        assert!(
+            app.is_stale(),
+            "the in-flight guard survives cache hydration"
+        );
+        // With the guard still armed, a racing `r` dedups to nothing, exactly
+        // as it would against the real launch refresh's own `RefreshStarted`.
+        assert!(app.reduce(Msg::Refresh).is_empty());
     }
 
     #[test]
