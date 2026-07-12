@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::bd::{BdClient, BdError, BdVersion};
+use crate::cache;
 use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::{self, HubError, hub_dir};
 use crate::refresh::{self, PrefixMap, RefreshError};
@@ -272,6 +273,10 @@ pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
 }
 
 /// Delete the hub dir (rebuilt on the next snapshot/launch) and report.
+///
+/// Also clears the on-disk snapshot cache: a reset discards the hub's state,
+/// and a cache left behind would otherwise let the very next launch paint
+/// rows from the just-discarded hub for up to [`cache::MAX_AGE`].
 pub fn run_reset(paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
     let hub = hub_dir(paths);
     // Mirror `hub::reset`'s own `symlink_metadata` test rather than `Path::exists`:
@@ -279,6 +284,7 @@ pub fn run_reset(paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
     // reset nonetheless removes, which would misreport it as "nothing to remove".
     let existed = std::fs::symlink_metadata(&hub).is_ok();
     hub::reset(paths)?;
+    cache::clear(paths.cache_file())?;
     if existed {
         writeln!(out, "hub reset: removed {}", hub.display())?;
     } else {
@@ -915,6 +921,33 @@ mod tests {
         assert!(
             stdout.contains(&hub.display().to_string()),
             "reset reports the removed path: {stdout}"
+        );
+    }
+
+    #[test]
+    fn reset_clears_the_snapshot_cache() {
+        // A launch right after `fbd reset` must not paint rows from the
+        // just-discarded hub, so reset clears the cache alongside it
+        // (federated-beads review finding: cache survived reset otherwise).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        crate::cache::save(
+            paths.cache_file(),
+            &crate::snapshot::Snapshot {
+                rows: Vec::new(),
+                fetched_at: SystemTime::now(),
+            },
+        )
+        .expect("seed cache");
+        let mut out = Vec::new();
+
+        run_reset(&paths, &mut out).expect("ok");
+
+        assert!(
+            !paths.cache_file().exists(),
+            "reset removes the snapshot cache along with the hub"
         );
     }
 

@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::snapshot::Snapshot;
@@ -37,12 +37,44 @@ pub fn load(path: &Path, now: SystemTime) -> Option<Snapshot> {
 /// needed and overwriting any previous cache. Best-effort: the caller treats a
 /// write failure (e.g. a read-only data dir) as non-fatal to the refresh cycle
 /// that produced the snapshot.
+///
+/// Writes to a same-directory temp file and renames it over `path`, so a
+/// reader (or a second fbd instance's own cache write racing this one) always
+/// sees either the old or the new cache in full, never a partial/interleaved
+/// write — the same atomic-replace pattern [`crate::config::Config::save`]
+/// uses for `config.toml`. The pid keeps concurrent writers from colliding on
+/// the temp name.
 pub fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec(snapshot)?;
-    fs::write(path, bytes)
+
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "snapshot_cache.json".to_string());
+    let tmp_name = format!(".{}.tmp.{}", file_name, std::process::id());
+    let tmp_path = match parent {
+        Some(parent) => parent.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+
+    fs::write(&tmp_path, bytes)?;
+    fs::rename(&tmp_path, path)
+}
+
+/// Remove the cache file at `path`, if present. A missing file is not an
+/// error — `reset` calls this unconditionally alongside deleting the hub, so
+/// a launch just after `fbd reset` never paints rows from the discarded hub
+/// (see [`crate::hub::reset`]).
+pub fn clear(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +175,39 @@ mod tests {
 
         save(&path, &snapshot).expect("save creates parent dirs");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        save(&path, &snapshot_at(at(0))).expect("save ok");
+
+        let entries: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![path.file_name().unwrap().to_os_string()],
+            "only the final cache file remains, no leftover .tmp file"
+        );
+    }
+
+    #[test]
+    fn clear_removes_an_existing_cache_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        save(&path, &snapshot_at(at(0))).expect("save ok");
+
+        clear(&path).expect("clear ok");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn clear_is_a_silent_no_op_when_the_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.json");
+        clear(&path).expect("missing file is not an error");
     }
 }
