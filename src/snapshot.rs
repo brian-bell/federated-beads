@@ -46,8 +46,9 @@ pub struct Snapshot {
 
 /// Fetch the hub's ready issues, attribute each to its source repo via
 /// `prefix_map`, and sort for display: priority ascending (0 = highest, first),
-/// then `updated_at` descending (newest first, absent last), then id ascending
-/// (a total, deterministic order for the serialized output).
+/// then `dependent_count` descending (unblocks-the-most-work first, absent
+/// last), then `updated_at` descending (newest first, absent last), then id
+/// ascending (a total, deterministic order for the serialized output).
 ///
 /// `fetched_at` is supplied by the caller (typically `RefreshOutcome::synced_at`
 /// or a real `now`) so this stays a pure, deterministic transform of `bd ready`.
@@ -109,6 +110,11 @@ pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemT
         a.issue
             .priority
             .cmp(&b.issue.priority)
+            // Within a priority tier, the issue that unblocks the most other
+            // work (highest dependent_count) goes first: finishing it frees up
+            // the most downstream work. Reversed operands => descending;
+            // `None` (bd omitted the count) sorts last, same as updated_at.
+            .then_with(|| b.issue.dependent_count.cmp(&a.issue.dependent_count))
             // `updated_at` is bd's RFC3339 UTC-`Z`, whole-second timestamp, and
             // every row in one `bd ready` call shares that format, so a lexical
             // string compare orders them chronologically. Reversed operands =>
@@ -201,6 +207,18 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
+    fn issue_with_dependents(
+        id: &str,
+        priority: i64,
+        updated_at: Option<&str>,
+        dependent_count: Option<i64>,
+    ) -> Issue {
+        Issue {
+            dependent_count,
+            ..issue(id, priority, updated_at)
+        }
+    }
+
     #[test]
     fn merges_ready_with_attribution() {
         let bd = FakeBdClient::new().with_ready(ready_fixture());
@@ -239,6 +257,29 @@ mod tests {
             order,
             vec!["rb-p0", "rb-new", "rb-old"],
             "P0 first, then P1s newest-updated first"
+        );
+    }
+
+    #[test]
+    fn sorts_by_priority_then_dependents_then_updated() {
+        // Same priority tier: the issue that unblocks the most other work
+        // (highest dependent_count) sorts first even when it's the oldest;
+        // a missing count sorts last, same as a missing updated_at.
+        let issues = vec![
+            issue_with_dependents("rb-fewer-newer", 1, Some("2026-07-11T12:41:27Z"), Some(1)),
+            issue_with_dependents("rb-more-older", 1, Some("2026-07-11T12:41:25Z"), Some(3)),
+            issue_with_dependents("rb-none", 1, Some("2026-07-11T12:41:26Z"), None),
+        ];
+        let bd = FakeBdClient::new().with_ready(issues);
+        let map = prefix_map(&[("rb", "/dev/repo-b")]);
+
+        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+
+        let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["rb-more-older", "rb-fewer-newer", "rb-none"],
+            "higher dependent_count (unblocks more work) sorts first within a priority tier"
         );
     }
 
