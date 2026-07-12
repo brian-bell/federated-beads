@@ -31,6 +31,9 @@ cargo test                                     # quality gate: unit + render tes
 cargo test --test bd_integration               # quality gate: gated e2e (skips per-test without bd)
 ```
 
+A `Makefile` wraps these (`make check`, `make test-all`, `make install`, ...);
+run `make help` for the full target list. Keep it in sync with this section.
+
 The four quality-gate commands are the project's constant verification suite.
 Unit tests never touch real XDG paths or a real `bd` — they use
 `Paths::with_base` and `FakeBdClient`. The integration suite builds real
