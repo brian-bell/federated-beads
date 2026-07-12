@@ -61,7 +61,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
         .constraints([
             Constraint::Length(1), // title / key hints
             Constraint::Min(0),    // content (list, or list + detail)
-            Constraint::Length(1), // status bar
+            Constraint::Length(2), // separator + status bar
         ])
         .split(frame.area());
 
@@ -83,7 +83,15 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
         ViewMode::Search => draw_search(frame, app, chunks[1]),
         ViewMode::List | ViewMode::Loading => draw_list(frame, app, chunks[1]),
     }
-    frame.render_widget(Paragraph::new(status_line(app, now)), chunks[2]);
+    let status_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().add_modifier(Modifier::DIM));
+    let status_area = status_block.inner(chunks[2]);
+    frame.render_widget(status_block, chunks[2]);
+    frame.render_widget(
+        Paragraph::new(status_line(app, now)).style(Style::default().add_modifier(Modifier::DIM)),
+        status_area,
+    );
 }
 
 /// Split the content area for the detail view: the list keeps its full rendering
