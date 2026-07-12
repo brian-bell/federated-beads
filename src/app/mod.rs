@@ -61,9 +61,18 @@ pub enum Msg {
 
     // ---- Navigation ----
     /// Move the selection one row down (`j` / `Down`). Clamps at the last row.
+    /// With the detail pane open, moves through the list behind the pane and
+    /// refetches the detail for the newly selected bead.
     SelectNext,
     /// Move the selection one row up (`k` / `Up`). Clamps at the first row.
+    /// With the detail pane open, moves through the list behind the pane.
     SelectPrev,
+    /// Scroll the open detail pane one row down (`J`). No-op outside
+    /// [`ViewMode::Detail`].
+    DetailScrollDown,
+    /// Scroll the open detail pane one row up (`K`). No-op outside
+    /// [`ViewMode::Detail`].
+    DetailScrollUp,
 
     // ---- Filters ----
     /// Cycle the repo filter `All → repo₀ → … → All` (`f`).
@@ -541,22 +550,36 @@ impl App {
                 self.stale = false;
             }
             // `j`/`k` move the selection of the active browsing list (ready in
-            // `List`, the results in `Search`+`Results`), but scroll the pane in
-            // `Detail`. While a detail or the search editor is up, the ready
-            // selection never moves. The view clamps the scroll to the wrapped
-            // content height, so keep `reduce` dimension-free.
+            // `List`, the results in `Search`+`Results`). With the detail pane
+            // open they move through the list *behind* the pane, refetching the
+            // detail for each newly selected bead (`J`/`K` scroll the pane
+            // instead). While the search editor is up, the selection never moves.
             Msg::SelectNext => {
                 if self.view_mode == ViewMode::Detail {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
-                } else if let Some(list) = self.browsing_list_mut() {
+                    return self.detail_nav(true);
+                }
+                if let Some(list) = self.browsing_list_mut() {
                     list.select_next();
                 }
             }
             Msg::SelectPrev => {
                 if self.view_mode == ViewMode::Detail {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                } else if let Some(list) = self.browsing_list_mut() {
+                    return self.detail_nav(false);
+                }
+                if let Some(list) = self.browsing_list_mut() {
                     list.select_prev();
+                }
+            }
+            // `J`/`K` scroll the open detail pane. The view clamps the offset to
+            // the wrapped content height, so `reduce` stays dimension-free.
+            Msg::DetailScrollDown => {
+                if self.view_mode == ViewMode::Detail {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
+            }
+            Msg::DetailScrollUp => {
+                if self.view_mode == ViewMode::Detail {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
                 }
             }
             // Filters act on the active browsing list; inert while a pane/editor is up.
@@ -764,6 +787,38 @@ impl App {
             Msg::Quit => self.done = true,
         }
         Vec::new()
+    }
+
+    /// Move the selection of the list behind the open detail pane (`j`/`k` in
+    /// `Detail`) and refetch the pane for the newly selected bead, so the pane
+    /// tracks the list without a `Esc`+`Enter` round trip. At a clamped edge the
+    /// selection — and therefore the pane — is unchanged, so no duplicate fetch
+    /// is issued; the old fetch's token is superseded on every real move.
+    fn detail_nav(&mut self, next: bool) -> Vec<Effect> {
+        // The list the pane was opened from: the search results while a search is
+        // live (a detail opened from a result keeps `search` intact), else ready.
+        let list = match &mut self.search {
+            Some(s) => &mut s.list,
+            None => &mut self.ready,
+        };
+        if next {
+            list.select_next();
+        } else {
+            list.select_prev();
+        }
+        let Some(row) = list.selected_row().cloned() else {
+            return Vec::new();
+        };
+        if self.detail_row.as_ref().map(|r| &r.issue.id) == Some(&row.issue.id) {
+            return Vec::new(); // clamped at an edge: the pane already shows it
+        }
+        self.detail_seq += 1;
+        let token = self.detail_seq;
+        let id = row.issue.id.clone();
+        self.detail = Some(DetailState::Loading { id: id.clone() });
+        self.detail_row = Some(row);
+        self.detail_scroll = 0;
+        vec![Effect::FetchDetail { id, token }]
     }
 
     /// Emit an [`Effect::Copy`] for the selected row of the active list, or no
@@ -1229,40 +1284,125 @@ mod tests {
     }
 
     #[test]
-    fn navigation_inert_while_detail_open() {
-        // With the pane open, j/k must not move the underlying list selection (they
-        // scroll the pane instead) and f/p are inert — otherwise Esc would return
-        // to a different row than it was opened from.
+    fn filters_inert_while_detail_open() {
+        // With the pane open, f/p are inert — the visible row set behind the
+        // pane must not shift under the reader.
         let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
         app.reduce(Msg::OpenDetail); // Detail, bound to ra-1, selection 0
 
-        app.reduce(Msg::SelectNext);
         app.reduce(Msg::CycleRepoFilter);
         app.reduce(Msg::TogglePriorityFilter);
-        assert_eq!(app.selection(), Some(0), "selection frozen under the pane");
-        assert_eq!(app.filter().repo(), &RepoFilter::All, "filters frozen too");
+        assert_eq!(app.filter().repo(), &RepoFilter::All, "filters frozen");
+        assert_eq!(app.selection(), Some(0), "selection untouched by filters");
 
         app.reduce(Msg::Back);
         assert_eq!(app.selection(), Some(0), "returns to the original row");
     }
 
     #[test]
+    fn detail_nav_moves_through_beads() {
+        // With the pane open, j/k move the selection through the list behind it
+        // and refetch the pane for each newly selected bead.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
+        let token = open(&mut app); // pane on ra-1
+        app.reduce(Msg::DetailReady {
+            token,
+            detail: Ok(detail("ra-1", vec![])),
+        });
+
+        let effects = app.reduce(Msg::SelectNext);
+        assert_eq!(
+            app.selection(),
+            Some(1),
+            "selection follows j under the pane"
+        );
+        match effects.as_slice() {
+            [Effect::FetchDetail { id, token: t }] => {
+                assert_eq!(id, "ra-2", "the pane fetches the newly selected bead");
+                assert!(*t > token, "a fresh token supersedes the old fetch");
+            }
+            other => panic!("expected one FetchDetail, got {other:?}"),
+        }
+        assert!(
+            matches!(app.detail(), Some(DetailState::Loading { id }) if id == "ra-2"),
+            "the pane reloads for the newly selected bead: {:?}",
+            app.detail()
+        );
+        assert_eq!(app.view_mode(), ViewMode::Detail, "the pane stays open");
+
+        // k moves back up and refetches ra-1.
+        match app.reduce(Msg::SelectPrev).as_slice() {
+            [Effect::FetchDetail { id, .. }] => assert_eq!(id, "ra-1"),
+            other => panic!("expected one FetchDetail, got {other:?}"),
+        }
+
+        // Clamped at the first row: no movement, no duplicate fetch.
+        assert_eq!(app.reduce(Msg::SelectPrev), Vec::new());
+        assert_eq!(app.selection(), Some(0));
+    }
+
+    #[test]
+    fn detail_nav_in_search_moves_results_not_ready() {
+        // A detail opened from a search result navigates the results list; the
+        // hidden ready selection is untouched, so leaving search restores it.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
+        app.reduce(Msg::SelectNext); // ready selection -> ra-2
+        let token = submit(&mut app, "foo");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![row("mc", "mc-1", 1), row("mc", "mc-2", 1)]),
+        });
+        open(&mut app); // detail on mc-1
+
+        match app.reduce(Msg::SelectNext).as_slice() {
+            [Effect::FetchDetail { id, .. }] => assert_eq!(id, "mc-2"),
+            other => panic!("expected one FetchDetail, got {other:?}"),
+        }
+        assert_eq!(app.selection(), Some(1), "the results selection moved");
+
+        app.reduce(Msg::Back); // Detail -> Search results
+        app.reduce(Msg::Back); // Results -> Editing
+        app.reduce(Msg::Back); // Editing -> List
+        assert_eq!(
+            app.selected_row().map(|r| r.issue.id.as_str()),
+            Some("ra-2"),
+            "the ready selection survives detail navigation under a search"
+        );
+    }
+
+    #[test]
     fn detail_scroll_moves_and_resets() {
-        // In Detail mode j/k scroll the pane; the offset resets on open and close.
-        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        // In Detail mode J/K scroll the pane; the offset resets on open, close,
+        // and whenever j/k move the pane to another bead.
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
         open(&mut app);
         assert_eq!(app.detail_scroll(), 0, "opens at the top");
 
-        app.reduce(Msg::SelectNext);
-        app.reduce(Msg::SelectNext);
-        assert_eq!(app.detail_scroll(), 2, "j scrolls down");
-        app.reduce(Msg::SelectPrev);
-        assert_eq!(app.detail_scroll(), 1, "k scrolls up");
+        app.reduce(Msg::DetailScrollDown);
+        app.reduce(Msg::DetailScrollDown);
+        assert_eq!(app.detail_scroll(), 2, "J scrolls down");
+        app.reduce(Msg::DetailScrollUp);
+        assert_eq!(app.detail_scroll(), 1, "K scrolls up");
+        // Saturates at the top rather than wrapping.
+        app.reduce(Msg::DetailScrollUp);
+        app.reduce(Msg::DetailScrollUp);
+        assert_eq!(app.detail_scroll(), 0, "clamps at the top");
 
+        app.reduce(Msg::DetailScrollDown);
+        app.reduce(Msg::SelectNext); // move the pane to ra-2
+        assert_eq!(app.detail_scroll(), 0, "reset when moving to another bead");
+
+        app.reduce(Msg::DetailScrollDown);
         app.reduce(Msg::Back);
         assert_eq!(app.detail_scroll(), 0, "reset on close");
         open(&mut app);
         assert_eq!(app.detail_scroll(), 0, "reset on reopen");
+
+        // Outside the pane, the scroll keys are inert.
+        app.reduce(Msg::Back);
+        app.reduce(Msg::DetailScrollDown);
+        assert_eq!(app.detail_scroll(), 0, "no pane, no scroll");
+        assert_eq!(app.selection(), Some(1), "and the selection does not move");
     }
 
     #[test]

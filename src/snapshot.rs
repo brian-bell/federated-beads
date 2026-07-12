@@ -19,6 +19,11 @@ use crate::refresh::PrefixMap;
 /// group.
 pub const UNKNOWN_REPO: &str = "unknown";
 
+/// Repos whose rows are hidden from every attributed list (ready and search
+/// alike): the bd tool's own checkout carries the upstream beads backlog, which
+/// is noise in a federated view of *this* user's work.
+const HIDDEN_REPOS: &[&str] = &["beads"];
+
 /// One ready issue plus the source repo it was attributed to. `repo_name` is the
 /// repo directory's basename, or `"basename (prefix)"` when another attributed
 /// repo shares that basename (so grouping/filtering never conflates two repos —
@@ -95,6 +100,10 @@ pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemT
             Row { issue, repo_name }
         })
         .collect();
+
+    // Drop rows attributed to a hidden repo before sorting, so they reach
+    // neither the UI nor the serialized snapshot.
+    rows.retain(|row| !HIDDEN_REPOS.contains(&row.repo_name.as_str()));
 
     rows.sort_by(|a, b| {
         a.issue
@@ -314,6 +323,22 @@ mod tests {
             !name("ra-1").contains('/') && !name("rb-1").contains('/'),
             "display labels never contain a filesystem path"
         );
+    }
+
+    #[test]
+    fn hides_the_beads_repo_itself() {
+        // The bd tool's own checkout (basename `beads`) is excluded from the
+        // attributed rows; every other repo is untouched.
+        let issues = vec![
+            issue("bd-1", 0, Some("2026-07-11T00:00:01Z")),
+            issue("ra-1", 1, Some("2026-07-11T00:00:02Z")),
+        ];
+        let map = prefix_map(&[("bd", "/dev/beads"), ("ra", "/dev/repo-a")]);
+
+        let snap = attribute(issues, &map, at(0));
+
+        let ids: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["ra-1"], "beads-attributed rows are dropped");
     }
 
     #[test]

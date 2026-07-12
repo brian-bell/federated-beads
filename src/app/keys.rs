@@ -39,6 +39,8 @@ pub fn map_key(event: KeyEvent, editing: bool) -> Option<Msg> {
         KeyCode::Char('p') => Some(Msg::TogglePriorityFilter),
         KeyCode::Char('j') | KeyCode::Down => Some(Msg::SelectNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Msg::SelectPrev),
+        KeyCode::Char('J') => Some(Msg::DetailScrollDown),
+        KeyCode::Char('K') => Some(Msg::DetailScrollUp),
         KeyCode::Enter => Some(Msg::OpenDetail),
         KeyCode::Esc => Some(Msg::Back),
         _ => None,
@@ -91,6 +93,20 @@ mod tests {
             Some(Msg::SelectPrev)
         );
         assert_eq!(map_key(press(KeyCode::Up), false), Some(Msg::SelectPrev));
+        // Shifted j/k scroll the detail pane rather than moving the selection.
+        assert_eq!(
+            map_key(press(KeyCode::Char('J')), false),
+            Some(Msg::DetailScrollDown)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('K')), false),
+            Some(Msg::DetailScrollUp)
+        );
+        // While editing a query the same keys are literal text.
+        assert_eq!(
+            map_key(press(KeyCode::Char('J')), true),
+            Some(Msg::SearchInput('J'))
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 use super::{App, DetailState, Row, SearchPhase, ViewMode};
 use crate::bd::{Dependency, IssueDetail};
@@ -36,8 +36,9 @@ const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p t
 const LIST_HINTS: &str =
     "fbd · q quit · r refresh · / search · f repo · p prio · j/k move · enter detail";
 
-/// One-line key hints for the detail pane: the keys that act there.
-const DETAIL_HINTS: &str = "fbd · esc back · q quit";
+/// One-line key hints for the detail pane: the keys that act there (`j`/`k`
+/// move through the beads behind the pane; `J`/`K` scroll the pane itself).
+const DETAIL_HINTS: &str = "fbd · esc back · j/k move · J/K scroll · q quit";
 
 /// One-line key hints while editing the search query: the keys that act there.
 const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc cancel";
@@ -89,9 +90,12 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
 /// in one half and the detail pane fills the other. Side by side (list left,
 /// detail right) on a wide terminal (≥ 100 cols, the frame width unchanged by the
 /// vertical title/status split); stacked (list top, detail bottom) when narrower,
-/// so neither pane is squeezed below usefulness.
+/// so neither pane is squeezed below usefulness. The pane gets a faint (dim)
+/// rule on the edge it shares with the list plus one column of left padding, so
+/// it reads as its own region without a heavy full frame.
 fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) {
-    let direction = if area.width >= 100 {
+    let horizontal = area.width >= 100;
+    let direction = if horizontal {
         Direction::Horizontal
     } else {
         Direction::Vertical
@@ -101,7 +105,17 @@ fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
     draw_list(frame, app, parts[0]);
-    draw_detail(frame, app, parts[1]);
+    let divider = Block::default()
+        .borders(if horizontal {
+            Borders::LEFT
+        } else {
+            Borders::TOP
+        })
+        .border_style(Style::default().add_modifier(Modifier::DIM))
+        .padding(Padding::left(1));
+    let inner = divider.inner(parts[1]);
+    frame.render_widget(divider, parts[1]);
+    draw_detail(frame, app, inner);
 }
 
 /// Render the detail pane for the app's current [`DetailState`]: a loading line, a
@@ -875,6 +889,62 @@ mod tests {
     }
 
     #[test]
+    fn detail_pane_divider_and_padding_when_wide() {
+        let app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail("ra-4zf", "Blocked task", "desc", vec![]))),
+        );
+        let (w, h) = (120, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        // The split column carries a faint (dim) vertical rule between the panes.
+        let cell = buf.cell((60, 1)).unwrap();
+        assert_eq!(cell.symbol(), "│", "a vertical rule separates the panes");
+        assert!(cell.modifier.contains(Modifier::DIM), "the rule is faint");
+        // The pane's text is inset past the rule plus one column of padding.
+        // (Checked cell-by-cell: `find_at` reports byte offsets, and the row
+        // holds multi-byte glyphs — `▸`, `│` — before the title.)
+        assert_eq!(
+            buf.cell((61, 1)).unwrap().symbol(),
+            " ",
+            "a padding column follows the rule"
+        );
+        let inset: String = (62..70)
+            .map(|x| buf.cell((x, 1)).unwrap().symbol())
+            .collect();
+        assert_eq!(
+            inset, "ra-4zf  ",
+            "detail text starts after the rule and padding"
+        );
+    }
+
+    #[test]
+    fn detail_pane_divider_and_padding_when_stacked() {
+        let app = app_in_detail(
+            "ra-4zf",
+            Some(Ok(issue_detail("ra-4zf", "Blocked task", "desc", vec![]))),
+        );
+        let (w, h) = (80, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        // A faint horizontal rule tops the stacked pane…
+        let rule_y = (0..h)
+            .find(|&y| buf.cell((0, y)).unwrap().symbol() == "─")
+            .expect("horizontal rule between the panes");
+        assert!(
+            buf.cell((0, rule_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::DIM),
+            "the rule is faint"
+        );
+        // …and the pane's text below it is left-padded by one column.
+        let (y, col) = find_at(&buf, "ra-4zf  Blocked task", w, h).expect("detail title");
+        assert!(y > rule_y, "detail sits below the rule");
+        assert_eq!(col, 1, "one column of left padding");
+    }
+
+    #[test]
     fn renders_detail_loading() {
         let app = app_in_detail("ra-4zf", None); // opened, no DetailReady yet
         let (w, h) = (80, 24);
@@ -924,7 +994,7 @@ mod tests {
 
         // Scroll down enough to reach the end (clamped by the view).
         for _ in 0..100 {
-            app.reduce(Msg::SelectNext);
+            app.reduce(Msg::DetailScrollDown);
         }
         let buf = render_sized(&app, at(1000), w, h);
         assert!(
