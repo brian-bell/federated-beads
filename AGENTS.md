@@ -1,27 +1,87 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+> **Note:** This repository intentionally maintains **separate `CLAUDE.md` and
+> `AGENTS.md` files** (not symlinked) to support the beads (`bd`) integration:
+> bd's setup recipes write and verify their own managed blocks in each file
+> (`bd setup claude` targets `CLAUDE.md`, `bd setup codex` targets `AGENTS.md`),
+> and they must remain independently editable by bd. `CLAUDE.md` is a thin
+> pointer back to this file for everything project-specific.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+## Project Overview
 
-## Quick Reference
+**fbd (Federated Beads)** is a read-only Rust terminal UI (ratatui + crossterm)
+that federates N beads repositories into one persistent `bd` hub workspace and
+answers "what's ready to work on across all my repos?" It shows a cross-repo
+ready list with a detail pane, cross-repo search (`/`), repo/priority filters,
+and a copy-context action (`y`/`Y` via OSC 52). fbd never writes issue data;
+its only source-repo write is `bd export` refreshing `.beads/issues.jsonl`.
+
+Requires `bd` >= 1.1.0 with `schema_version == 1` on `PATH` at runtime (gated
+at startup; constants in `src/cli.rs`). Rust edition 2024.
+
+## Build, Test, Run
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+cargo build                                    # build
+cargo run                                      # launch the TUI (bare fbd)
+cargo run -- snapshot                          # headless ready list
+cargo fmt --check                              # quality gate: formatting
+cargo clippy --all-targets -- -D warnings      # quality gate: lints
+cargo test                                     # quality gate: unit + render tests (green without bd)
+cargo test --test bd_integration               # quality gate: gated e2e (skips per-test without bd)
 ```
+
+The four quality-gate commands are the project's constant verification suite.
+Unit tests never touch real XDG paths or a real `bd` — they use
+`Paths::with_base` and `FakeBdClient`. The integration suite builds real
+fixture repos with `bd` in tempdirs and prints an explicit `SKIP` line per test
+when `bd` is missing.
+
+## Architecture
+
+- **Hub, not custom store**: aggregation is a `bd` hub workspace under
+  `<data_dir>/federated-beads/hub` using bd's multi-repo hydration
+  (`bd repo add` + `bd repo sync`). Every read goes through `bd … --json`
+  subprocess calls against the hub; fbd never reimplements ready/blocked
+  semantics.
+- **Repo attribution**: bd's JSON has no source-repo field, so fbd maps issue
+  ids to repos by longest id prefix (from each repo's effective `bd` prefix),
+  flagging collisions.
+- **Refresh**: async and TUI-owned — export each repo + one hub sync on a
+  worker thread; an advisory lock on `<hub>/.fbd.lock` serializes concurrent
+  fbd instances.
+- **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with
+  no I/O, clock, or threads inside; the runtime performs effects. `view::draw`
+  is pure over `(App, now)` and tested with ratatui's `TestBackend`.
+
+Module map (`src/`):
+
+| Module | Responsibility |
+| --- | --- |
+| `config` | Roster (`config.toml`) load/save (atomic), XDG `Paths` |
+| `bd/` | `BdClient` trait, real `BdCli` subprocess impl, `FakeBdClient` test double, serde types |
+| `hub` | Hub lifecycle: create on first run, reconcile roster, guarded `reset` |
+| `refresh` | Export-all + sync + prefix→repo attribution map, advisory lock |
+| `snapshot` | Read model: `bd ready` → attributed, sorted rows (also `fbd snapshot --json`) |
+| `app/` | `mod` (pure `reduce` core), `view` (renderer), `keys` (crossterm→`Msg`, only file importing crossterm), `context` (copy builders + OSC 52) |
+| `runtime` | Event loop: event + refresh worker threads feed one mpsc channel |
+| `cli` | Headless runners (`snapshot`, `doctor`, `reset`, `repos`), version gate |
+
+## Conventions & Gotchas
+
+- Development is TDD in vertical slices; `plans/fbd-v1-implementation-plan.md`
+  is the master design and `plans/slices/` the per-slice history (module doc
+  comments cite them).
+- serde forward-compatibility: any key bd omits when empty is
+  `Option`/`#[serde(default)]`; never add `#[serde(deny_unknown_fields)]`.
+- `bd repo list --json` is broken in bd 1.1.0 (ignores `--json`), so the hub's
+  roster is read from `<hub>/.beads/config.yaml` `repos.additional` instead.
+- ratatui is pinned with the `unstable-rendered-line-info` feature for
+  `Paragraph::line_count` (detail-pane scroll clamping); stay within 0.30.x.
+- Only `main.rs` resolves real paths, spawns the real `bd`, and wires
+  stdout/stderr; everything else takes injected `BdClient`/`Paths`/writers.
+- Clippy warnings are errors in the gate; keep `cargo clippy --all-targets
+  -- -D warnings` clean.
 
 ## Non-Interactive Shell Commands
 

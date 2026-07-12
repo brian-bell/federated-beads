@@ -1,6 +1,14 @@
-# Project Instructions for AI Agents
+# Project Instructions for AI Agents (Claude)
 
-This file provides instructions and context for AI coding agents working on this project.
+> **Note:** This repository intentionally maintains **separate `CLAUDE.md` and
+> `AGENTS.md` files** (not symlinked) to support the beads (`bd`) integration:
+> bd's setup recipes write and verify their own managed blocks in each file
+> (`bd setup claude` targets `CLAUDE.md`, `bd setup codex` targets `AGENTS.md`),
+> and they must remain independently editable by bd.
+
+Project-specific guidance — overview, build/test/run commands, architecture,
+module map, and conventions — lives in **`AGENTS.md`**. Read that file for
+anything beyond beads task-tracking workflow.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
@@ -56,22 +64,3 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - Do not commit or push without clear authority from the active profile or the current user request.
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
-
-
-## Build & Test
-
-_Add your build and test commands here_
-
-```bash
-# Example:
-# npm install
-# npm test
-```
-
-## Architecture Overview
-
-_Add a brief overview of your project architecture_
-
-## Conventions & Patterns
-
-_Add your project-specific conventions here_

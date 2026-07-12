@@ -75,15 +75,17 @@ fbd repos list          # print the roster
 fbd repos discover <dir> [--add]   # scan <dir>/*/.beads one level deep
 ```
 
-The roster's source of truth is `~/.config/federated-beads/config.toml`; the
-`repos` subcommands edit it. Missing paths warn, never fail.
+The roster's source of truth is `federated-beads/config.toml` under your
+platform config dir (`~/.config` on Linux, `~/Library/Application Support` on
+macOS); the `repos` subcommands edit it, and `fbd doctor` prints the exact
+paths in use. Missing paths warn, never fail.
 
 ## Architecture
 
 ```
 Source repos            fbd                              Hub (bd workspace)
 ──────────────   ──────────────────────────────   ─────────────────────────
-~/dev/megaclock  refresh:  bd export per repo  →   ~/.local/share/
+~/dev/megaclock  refresh:  bd export per repo  →   <XDG data dir>/
 ~/dev/reading-…            bd repo sync (once)  →     federated-beads/hub/
      …           read:     bd ready/show/search --json (all through the hub)
 ```
