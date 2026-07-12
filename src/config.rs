@@ -70,6 +70,7 @@ impl Config {
 /// The application's subdirectory / file name under the XDG roots.
 const APP_DIR: &str = "federated-beads";
 const CONFIG_FILE_NAME: &str = "config.toml";
+const CACHE_FILE_NAME: &str = "snapshot_cache.json";
 
 /// Resolved filesystem locations fbd uses. Constructed either from real XDG
 /// roots (`resolve`, only at the process edge) or from an injected base
@@ -79,6 +80,7 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 pub struct Paths {
     config_file: PathBuf,
     data_dir: PathBuf,
+    cache_file: PathBuf,
 }
 
 impl Paths {
@@ -92,12 +94,21 @@ impl Paths {
         &self.data_dir
     }
 
+    /// Path to the cached [`crate::snapshot::Snapshot`] JSON file
+    /// (`<data_root>/federated-beads/snapshot_cache.json`), read at launch by
+    /// [`crate::cache::load`] and written after every successful refresh by
+    /// [`crate::cache::save`].
+    pub fn cache_file(&self) -> &Path {
+        &self.cache_file
+    }
+
     /// Derive paths from explicit config and data roots. Single source of the
     /// app-dir / file-name join convention.
     fn from_roots(config_root: &Path, data_root: &Path) -> Paths {
         Paths {
             config_file: config_root.join(APP_DIR).join(CONFIG_FILE_NAME),
             data_dir: data_root.join(APP_DIR),
+            cache_file: data_root.join(APP_DIR).join(CACHE_FILE_NAME),
         }
     }
 

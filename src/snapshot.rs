@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::bd::{BdClient, BdError, Issue};
 use crate::refresh::PrefixMap;
@@ -29,7 +29,7 @@ const HIDDEN_REPOS: &[&str] = &["beads"];
 /// repo shares that basename (so grouping/filtering never conflates two repos —
 /// see [`fetch`]), or [`UNKNOWN_REPO`] when unattributed. Never a filesystem
 /// path: the serialized snapshot must not leak local layout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub issue: Issue,
     pub repo_name: String,
@@ -38,7 +38,7 @@ pub struct Row {
 /// Everything the ready screen needs: attributed, display-sorted rows plus the
 /// time the underlying data was fetched (injected, never read from a hidden
 /// clock — see the module/slice notes on determinism).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub rows: Vec<Row>,
     pub fetched_at: SystemTime,

@@ -22,6 +22,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, Msg, context, keys, view};
 use crate::bd::{BdCli, BdClient, IssueDetail};
+use crate::cache;
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ensure_hub, hub_dir};
@@ -91,6 +92,19 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     };
 
     let mut app = App::new();
+    // A fresh (<12h) on-disk cache paints instantly, before the real refresh
+    // below has a chance to land, so launch never sits in `Loading` behind a
+    // slow `bd ready` when yesterday's rows would do. Routed through the same
+    // `RefreshCompleted` reduction a live refresh uses, so cache hydration gets
+    // the same rows/fetched_at/view_mode handling for free — no bespoke
+    // "seed from cache" branch in `App`. A stale/missing/corrupt cache is a
+    // silent no-op: the app stays `Loading` exactly as before this existed.
+    if let Some(snapshot) = cache::load(paths.cache_file(), SystemTime::now()) {
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(snapshot),
+            warnings: Vec::new(),
+        });
+    }
     // In-flight background workers (refresh *and* detail), tracked so shutdown can
     // wait for the running bd subprocess to finish and release the hub lock —
     // never orphaning a child that would keep mutating the hub after fbd's lock
@@ -213,9 +227,11 @@ fn spawn_refresh(tx: &Sender<Incoming>, paths: &Paths, roster: &Config) -> threa
     thread::spawn(move || refresh_worker(BdCli::new(), roster, paths, tx))
 }
 
-/// The refresh worker body: announce the start, run the pipeline, then send
-/// exactly one atomic completion. Owned args so it moves cleanly into a thread;
-/// unit-tested directly with a [`crate::bd::FakeBdClient`] and a channel.
+/// The refresh worker body: announce the start, run the pipeline, cache a
+/// successful snapshot to disk (best-effort — a write failure never blocks
+/// delivery), then send exactly one atomic completion. Owned args so it moves
+/// cleanly into a thread; unit-tested directly with a [`crate::bd::FakeBdClient`]
+/// and a channel.
 pub(crate) fn refresh_worker(
     bd: impl BdClient,
     roster: Config,
@@ -224,6 +240,9 @@ pub(crate) fn refresh_worker(
 ) {
     let _ = tx.send(Msg::RefreshStarted.into());
     let (snapshot, warnings) = gather_snapshot(&bd, &roster, &paths);
+    if let Some(snapshot) = &snapshot {
+        let _ = cache::save(paths.cache_file(), snapshot);
+    }
     let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings }.into());
 }
 
@@ -649,6 +668,30 @@ mod tests {
             "exactly one completion, then the channel closes"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn refresh_task_caches_a_successful_snapshot_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let cache_file = paths.cache_file().to_path_buf();
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-1", 1, "Ready one")]);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || refresh_worker(bd, roster(&[&ra]), paths, tx));
+        assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
+        let snapshot = match recv_msg(&rx) {
+            Msg::RefreshCompleted { snapshot, .. } => snapshot.expect("a snapshot on success"),
+            other => panic!("expected RefreshCompleted, got {other:?}"),
+        };
+        handle.join().unwrap();
+
+        let cached = crate::cache::load(&cache_file, SystemTime::now()).expect("a fresh cache hit");
+        assert_eq!(
+            cached, snapshot,
+            "the cached snapshot matches what shipped over the channel"
+        );
     }
 
     #[test]
