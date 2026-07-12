@@ -100,7 +100,7 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     // refresh below stays armed the whole time. A stale/missing/corrupt
     // cache is a silent no-op: the app stays `Loading` exactly as before
     // this existed.
-    if let Some(snapshot) = cache::load(paths.cache_file(), SystemTime::now()) {
+    if let Some(snapshot) = cache::load(paths.cache_file(), SystemTime::now(), roster) {
         app.hydrate_from_cache(snapshot);
     }
     // In-flight background workers (refresh *and* detail), tracked so shutdown can
@@ -239,7 +239,7 @@ pub(crate) fn refresh_worker(
     let _ = tx.send(Msg::RefreshStarted.into());
     let (snapshot, warnings) = gather_snapshot(&bd, &roster, &paths);
     if let Some(snapshot) = &snapshot {
-        let _ = cache::save(paths.cache_file(), snapshot);
+        let _ = cache::save(paths.cache_file(), snapshot, &roster);
     }
     let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings }.into());
 }
@@ -675,9 +675,10 @@ mod tests {
         let cache_file = paths.cache_file().to_path_buf();
         let ra = seed_repo(tmp.path(), "ra", "ra");
         let bd = FakeBdClient::new().with_ready(vec![issue("ra-1", 1, "Ready one")]);
+        let cfg = roster(&[&ra]);
         let (tx, rx) = mpsc::channel();
 
-        let handle = thread::spawn(move || refresh_worker(bd, roster(&[&ra]), paths, tx));
+        let handle = thread::spawn(move || refresh_worker(bd, cfg, paths, tx));
         assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
         let snapshot = match recv_msg(&rx) {
             Msg::RefreshCompleted { snapshot, .. } => snapshot.expect("a snapshot on success"),
@@ -685,7 +686,8 @@ mod tests {
         };
         handle.join().unwrap();
 
-        let cached = crate::cache::load(&cache_file, SystemTime::now()).expect("a fresh cache hit");
+        let cached = crate::cache::load(&cache_file, SystemTime::now(), &roster(&[&ra]))
+            .expect("a fresh cache hit");
         assert_eq!(
             cached, snapshot,
             "the cached snapshot matches what shipped over the channel"

@@ -939,6 +939,7 @@ mod tests {
                 rows: Vec::new(),
                 fetched_at: SystemTime::now(),
             },
+            &Config::default(),
         )
         .expect("seed cache");
         let mut out = Vec::new();

@@ -4,64 +4,94 @@
 //!
 //! Freshness is judged by the snapshot's own embedded `fetched_at`, not the
 //! file's mtime, so the cache and the "last refreshed" age the UI renders
-//! always agree. A cache miss (missing file, corrupt JSON, or stale data) is
-//! never an error to the caller — it just means the ordinary `Loading` boot
-//! runs, exactly as if no cache module existed.
+//! always agree. A cache miss (missing file, corrupt JSON, stale data, or a
+//! roster mismatch) is never an error to the caller — it just means the
+//! ordinary `Loading` boot runs, exactly as if no cache module existed.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
 use crate::snapshot::Snapshot;
 
 /// A cached snapshot older than this is not loaded at startup — better to wait
 /// for one real refresh than paint a half-day-stale ready list.
 pub const MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 
-/// Load the snapshot cached at `path` if it exists, parses, and its embedded
-/// `fetched_at` is within [`MAX_AGE`] of `now`. Any failure — missing file,
-/// corrupt JSON, or a `fetched_at` more than `MAX_AGE` before (or after,
-/// guarding against clock skew) `now` — yields `None` silently.
-pub fn load(path: &Path, now: SystemTime) -> Option<Snapshot> {
-    let bytes = fs::read(path).ok()?;
-    let snapshot: Snapshot = serde_json::from_slice(&bytes).ok()?;
-    let age = now.duration_since(snapshot.fetched_at).ok()?;
+/// The on-disk cache payload: the snapshot plus the roster it was fetched
+/// under. `roster` lets [`load`] reject a cache written before a `repos add`/
+/// `remove` — otherwise a cache from before a removed repo's entry would show
+/// that repo's rows for up to [`MAX_AGE`] regardless of the roster change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheFile {
+    roster: Config,
+    snapshot: Snapshot,
+}
+
+/// Load the snapshot cached at `path` if it exists, parses, was written under
+/// `roster` (bytewise `==`, so a `repos add`/`remove`/reorder invalidates it),
+/// and its embedded `fetched_at` is within [`MAX_AGE`] of `now`. Any failure —
+/// missing file, corrupt JSON, a roster mismatch, or a `fetched_at` more than
+/// `MAX_AGE` before (or after, guarding against clock skew) `now` — yields
+/// `None` silently.
+pub fn load(path: &Path, now: SystemTime, roster: &Config) -> Option<Snapshot> {
+    let cached = read(path)?;
+    if &cached.roster != roster {
+        return None;
+    }
+    let age = now.duration_since(cached.snapshot.fetched_at).ok()?;
     if age > MAX_AGE {
         return None;
     }
-    Some(snapshot)
+    Some(cached.snapshot)
 }
 
-/// Persist `snapshot` to `path` as JSON, creating parent directories as
-/// needed. Best-effort: the caller treats a write failure (e.g. a read-only
-/// data dir) as non-fatal to the refresh cycle that produced the snapshot.
+/// Persist `snapshot` (fetched under `roster`) to `path` as JSON, creating
+/// parent directories as needed. Best-effort: the caller treats a write
+/// failure (e.g. a read-only data dir) as non-fatal to the refresh cycle that
+/// produced the snapshot.
 ///
 /// Writes to a same-directory temp file and renames it over `path`, so a
-/// reader (or a second fbd instance's own cache write racing this one) always
-/// sees either the old or the new cache in full, never a partial/interleaved
-/// write — the same atomic-replace pattern [`crate::config::Config::save`]
-/// uses for `config.toml`. The pid keeps concurrent writers from colliding on
-/// the temp name.
+/// reader always sees either the old or the new cache in full, never a
+/// partial/interleaved write — the same atomic-replace pattern
+/// [`crate::config::Config::save`] uses for `config.toml`.
 ///
-/// A no-op, `Ok(())` skip when an existing on-disk cache's `fetched_at` is
-/// already at or after `snapshot`'s: two fbd instances can each hold the hub
-/// lock only during their own sync (see `refresh::run`), so their later,
-/// lock-free `bd ready` reads and cache writes can finish out of order. This
-/// keeps the cache monotonic in `fetched_at` without serializing the writes
-/// themselves.
-pub fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
-    if let Some(existing) = raw_fetched_at(path)
-        && existing >= snapshot.fetched_at
-    {
-        return Ok(());
-    }
-
+/// Two fbd instances can each hold the hub lock only during their own sync
+/// (see `refresh::run`), so their later, lock-free `bd ready` reads and cache
+/// writes can finish out of order. An exclusive OS lock (mirroring
+/// `refresh::HubLock`, but blocking rather than declining) is held across the
+/// read-compare-write sequence below, and the write is skipped as a no-op
+/// when an existing on-disk cache's `fetched_at` is already at or after
+/// `snapshot`'s, so the cache stays monotonic in `fetched_at` even under a
+/// racing writer.
+pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec(snapshot)?;
+
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(path))?;
+    lock_file.lock_exclusive()?;
+
+    if let Some(existing) = read(path)
+        && existing.snapshot.fetched_at >= snapshot.fetched_at
+    {
+        return Ok(());
+    }
+
+    let bytes = serde_json::to_vec(&CacheFile {
+        roster: roster.clone(),
+        snapshot: snapshot.clone(),
+    })?;
 
     let file_name = path
         .file_name()
@@ -75,15 +105,31 @@ pub fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
 
     fs::write(&tmp_path, bytes)?;
     fs::rename(&tmp_path, path)
+    // `lock_file` drops here, releasing the flock.
 }
 
-/// The `fetched_at` embedded in whatever is currently at `path`, ignoring
-/// [`MAX_AGE`] (unlike [`load`]) — [`save`]'s monotonicity check needs the
-/// raw timestamp regardless of staleness. `None` for a missing/corrupt file.
-fn raw_fetched_at(path: &Path) -> Option<SystemTime> {
+/// Parse whatever is currently at `path` into a [`CacheFile`], ignoring
+/// [`MAX_AGE`]/roster matching (unlike [`load`]) — [`save`]'s monotonicity
+/// check needs the raw stored snapshot regardless of staleness or roster.
+/// `None` for a missing/corrupt file.
+fn read(path: &Path) -> Option<CacheFile> {
     let bytes = fs::read(path).ok()?;
-    let snapshot: Snapshot = serde_json::from_slice(&bytes).ok()?;
-    Some(snapshot.fetched_at)
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The sibling lock file [`save`] holds across its read-compare-write
+/// sequence, named after `path` so concurrent writers to different cache
+/// paths (e.g. under different injected test roots) never contend.
+fn lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "snapshot_cache.json".to_string());
+    let lock_name = format!("{file_name}.lock");
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.join(lock_name),
+        None => PathBuf::from(lock_name),
+    }
 }
 
 /// Remove the cache file at `path`, if present. A missing file is not an
@@ -101,6 +147,7 @@ pub fn clear(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RepoEntry;
     use crate::snapshot::Row;
     use std::time::UNIX_EPOCH;
 
@@ -133,14 +180,22 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
+    fn roster(paths: &[&str]) -> Config {
+        Config {
+            repos: paths.iter().map(|p| RepoEntry { path: p.into() }).collect(),
+        }
+    }
+
     #[test]
     fn round_trips_a_fresh_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
         let snapshot = snapshot_at(at(1_000_000));
+        let roster = roster(&["/dev/repo-a"]);
 
-        save(&path, &snapshot).expect("save ok");
-        let loaded = load(&path, at(1_000_000) + Duration::from_secs(60)).expect("fresh load");
+        save(&path, &snapshot, &roster).expect("save ok");
+        let loaded =
+            load(&path, at(1_000_000) + Duration::from_secs(60), &roster).expect("fresh load");
 
         assert_eq!(loaded, snapshot);
     }
@@ -150,14 +205,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
         let snapshot = snapshot_at(at(1_000_000));
-        save(&path, &snapshot).expect("save ok");
+        let roster = roster(&["/dev/repo-a"]);
+        save(&path, &snapshot, &roster).expect("save ok");
 
         let just_stale = at(1_000_000) + MAX_AGE + Duration::from_secs(1);
-        assert!(load(&path, just_stale).is_none(), "past MAX_AGE is a miss");
+        assert!(
+            load(&path, just_stale, &roster).is_none(),
+            "past MAX_AGE is a miss"
+        );
 
         let just_fresh = at(1_000_000) + MAX_AGE;
         assert!(
-            load(&path, just_fresh).is_some(),
+            load(&path, just_fresh, &roster).is_some(),
             "exactly MAX_AGE is a hit"
         );
     }
@@ -168,16 +227,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
         let snapshot = snapshot_at(at(1_000_000));
-        save(&path, &snapshot).expect("save ok");
+        let roster = roster(&["/dev/repo-a"]);
+        save(&path, &snapshot, &roster).expect("save ok");
 
-        assert!(load(&path, at(999_999)).is_none());
+        assert!(load(&path, at(999_999), &roster).is_none());
+    }
+
+    #[test]
+    fn rejects_a_cache_written_under_a_different_roster() {
+        // A `repos add`/`remove` between the write and the load must miss,
+        // so a launch never shows rows from a repo the roster no longer has.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        let snapshot = snapshot_at(at(1_000_000));
+        save(&path, &snapshot, &roster(&["/dev/repo-a"])).expect("save ok");
+
+        let now = at(1_000_000) + Duration::from_secs(60);
+        assert!(
+            load(&path, now, &roster(&["/dev/repo-a", "/dev/repo-b"])).is_none(),
+            "an added repo invalidates the cache"
+        );
+        assert!(
+            load(&path, now, &roster(&["/dev/repo-b"])).is_none(),
+            "a swapped repo invalidates the cache"
+        );
+        assert!(
+            load(&path, now, &roster(&["/dev/repo-a"])).is_some(),
+            "an unchanged roster still hits"
+        );
     }
 
     #[test]
     fn missing_file_is_a_silent_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("does-not-exist.json");
-        assert!(load(&path, at(0)).is_none());
+        assert!(load(&path, at(0), &roster(&["/dev/repo-a"])).is_none());
     }
 
     #[test]
@@ -185,7 +269,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
         fs::write(&path, b"not json").unwrap();
-        assert!(load(&path, at(0)).is_none());
+        assert!(load(&path, at(0), &roster(&["/dev/repo-a"])).is_none());
     }
 
     #[test]
@@ -194,24 +278,24 @@ mod tests {
         let path = tmp.path().join("nested").join("snapshot_cache.json");
         let snapshot = snapshot_at(at(0));
 
-        save(&path, &snapshot).expect("save creates parent dirs");
+        save(&path, &snapshot, &roster(&["/dev/repo-a"])).expect("save creates parent dirs");
         assert!(path.exists());
     }
 
     #[test]
-    fn save_leaves_no_temp_file_behind() {
+    fn save_leaves_no_leftover_temp_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
-        save(&path, &snapshot_at(at(0))).expect("save ok");
+        let roster = roster(&["/dev/repo-a"]);
+        save(&path, &snapshot_at(at(0)), &roster).expect("save ok");
 
         let entries: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
-            .map(|e| e.unwrap().file_name())
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            entries,
-            vec![path.file_name().unwrap().to_os_string()],
-            "only the final cache file remains, no leftover .tmp file"
+        assert!(
+            entries.iter().all(|n| !n.contains(".tmp.")),
+            "no leftover .tmp file: {entries:?}"
         );
     }
 
@@ -222,13 +306,14 @@ mod tests {
         // other: the older snapshot's write must not clobber the newer one.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
+        let roster = roster(&["/dev/repo-a"]);
         let newer = snapshot_at(at(2_000_000));
         let older = snapshot_at(at(1_000_000));
 
-        save(&path, &newer).expect("save ok");
-        save(&path, &older).expect("save ok (no-op)");
+        save(&path, &newer, &roster).expect("save ok");
+        save(&path, &older, &roster).expect("save ok (no-op)");
 
-        let on_disk = load(&path, at(2_000_000)).expect("still a hit");
+        let on_disk = load(&path, at(2_000_000), &roster).expect("still a hit");
         assert_eq!(
             on_disk, newer,
             "the older write did not overwrite the newer cache"
@@ -239,7 +324,7 @@ mod tests {
     fn clear_removes_an_existing_cache_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot_cache.json");
-        save(&path, &snapshot_at(at(0))).expect("save ok");
+        save(&path, &snapshot_at(at(0)), &roster(&["/dev/repo-a"])).expect("save ok");
 
         clear(&path).expect("clear ok");
         assert!(!path.exists());
