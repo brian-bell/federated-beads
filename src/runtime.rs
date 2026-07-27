@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, Msg, context, keys, view};
-use crate::bd::{BdCli, BdClient, IssueDetail};
+use crate::bd::{BdCli, BdClient};
 use crate::cache;
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
@@ -208,10 +208,17 @@ fn execute_effect(
 }
 
 /// Render the current state with a fresh `now` for the staleness age.
-fn draw(terminal: &mut Tui, app: &App) -> Result<(), CliError> {
+fn draw(terminal: &mut Tui, app: &mut App) -> Result<(), CliError> {
+    let mut detail_max_scroll = None;
     terminal
-        .draw(|frame| view::draw(frame, app, SystemTime::now()))
+        .draw(|frame| {
+            detail_max_scroll = view::draw(frame, app, SystemTime::now());
+        })
         .map_err(CliError::Io)?;
+    if let Some(max_scroll) = detail_max_scroll {
+        let effects = app.reduce(Msg::DetailScrollBounds { max_scroll });
+        debug_assert!(effects.is_empty());
+    }
     Ok(())
 }
 
@@ -269,19 +276,15 @@ pub(crate) fn detail_worker(
     token: u64,
     tx: Sender<Incoming>,
 ) {
-    let detail = gather_detail(&bd, &paths, &id).map(Box::new);
+    let detail = gather_detail(&bd, &paths, &id);
     let _ = tx.send(Msg::DetailReady { token, detail }.into());
 }
 
-/// Run `bd show <id> --json` against the hub, mapping a [`BdError`] to a
+/// Run `bd show <id>` against the hub, mapping a [`BdError`] to a
 /// pre-formatted, [`sanitize`]d message for the pane. No version gate or
 /// `ensure_hub`: the detail pane is reachable only from the list, i.e. after a
 /// snapshot already hydrated the hub.
-pub(crate) fn gather_detail(
-    bd: &impl BdClient,
-    paths: &Paths,
-    id: &str,
-) -> Result<IssueDetail, String> {
+pub(crate) fn gather_detail(bd: &impl BdClient, paths: &Paths, id: &str) -> Result<String, String> {
     bd.show(&hub_dir(paths), id)
         .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
 }
@@ -386,8 +389,11 @@ pub(crate) fn copy_worker(
 /// The command form (`markdown == false`) resolves the row's source-repo path
 /// from its issue id via [`refresh::attribution_map`] — the **same** prefix map
 /// search uses — and falls back to the hub (`bd -C <hub> show <id>`) for an
-/// unattributed id. The markdown form needs no path, so it skips the (subprocess)
-/// prefix read entirely. All bd-sourced text is sanitized inside [`context`].
+/// unattributed id. The Markdown form refreshes the issue with one structured
+/// `bd show --json` call when copied, falling back to the pinned row if that
+/// refresh fails. This keeps detail navigation to one native `bd show` while
+/// avoiding stale copied metadata. All bd-sourced text is sanitized inside
+/// [`context`].
 fn build_copy(
     bd: &impl BdClient,
     roster: &Config,
@@ -396,7 +402,10 @@ fn build_copy(
     markdown: bool,
 ) -> (String, String) {
     let payload = if markdown {
-        context::markdown_block(&row.issue, &row.repo_name)
+        let issue = bd
+            .show_issue(&hub_dir(paths), &row.issue.id)
+            .unwrap_or_else(|_| row.issue.clone());
+        context::markdown_block(&issue, &row.repo_name)
     } else {
         let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
         let repo = prefix_map.repo_for(&row.issue.id).map(|e| e.path.clone());
@@ -570,7 +579,7 @@ fn set_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bd::{BdError, BdErrorKind, Dependency, FakeBdClient, Issue};
+    use crate::bd::{BdError, BdErrorKind, FakeBdClient, Issue};
     use crate::config::RepoEntry;
     use crate::refresh::HubLock;
     use std::fs;
@@ -734,16 +743,8 @@ mod tests {
         );
     }
 
-    fn detail() -> IssueDetail {
-        IssueDetail {
-            issue: issue("ra-1", 2, "Blocked task"),
-            dependencies: vec![Dependency {
-                id: "ra-z70".into(),
-                title: Some("Blocker task".into()),
-                status: Some("open".into()),
-                dependency_type: Some("blocks".into()),
-            }],
-        }
+    fn detail() -> String {
+        "○ ra-1 [TASK] · Blocked task\n\nDEPENDENCIES\n  → ra-z70: Blocker task".into()
     }
 
     #[test]
@@ -759,8 +760,7 @@ mod tests {
             Msg::DetailReady { token, detail } => {
                 assert_eq!(token, 7, "the request token is echoed back");
                 let d = detail.expect("a detail on success");
-                assert_eq!(d.issue.id, "ra-1");
-                assert_eq!(d.dependencies.len(), 1);
+                assert!(d.contains("ra-z70"));
             }
             other => panic!("expected DetailReady, got {other:?}"),
         }
@@ -923,15 +923,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        let bd = FakeBdClient::new();
+        let mut fresh = issue("ra-1", 2, "Renamed after snapshot");
+        fresh.description = Some("Current description from bd show --json".into());
+        let bd = FakeBdClient::new().with_show_issue(fresh);
         let (tx, rx) = mpsc::channel();
 
+        // The row intentionally carries stale cached metadata. Markdown copy
+        // refreshes it when requested instead of disagreeing with a freshly
+        // loaded native detail pane.
         let row = copy_row("session-tui", "ra-1");
         let handle =
             thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths, row, true, 1, tx));
 
         let (_, payload, _) = recv_copied(&rx);
-        assert!(payload.contains("Ready one"), "markdown title: {payload:?}");
+        assert!(
+            payload.contains("Renamed after snapshot"),
+            "fresh markdown title: {payload:?}"
+        );
+        assert!(
+            payload.contains("Current description from bd show --json"),
+            "fresh markdown description: {payload:?}"
+        );
         assert!(payload.contains("ra-1"), "markdown id: {payload:?}");
         assert!(
             payload.contains("session-tui"),
