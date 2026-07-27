@@ -667,7 +667,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         ui_state::save(
             paths.ui_state_file(),
-            &crate::app::RepoFilter::Only("repo-b".into()),
+            &crate::app::RepoFilter::Only("rb".into()),
         )
         .unwrap();
         cache::save(
@@ -676,12 +676,12 @@ mod tests {
                 rows: vec![
                     Row {
                         issue: issue("a-1", 1, "A"),
-                        repo_id: None,
+                        repo_id: Some("ra".into()),
                         repo_name: "repo-a".into(),
                     },
                     Row {
                         issue: issue("b-1", 1, "B"),
-                        repo_id: None,
+                        repo_id: Some("rb".into()),
                         repo_name: "repo-b".into(),
                     },
                 ],
@@ -693,10 +693,7 @@ mod tests {
 
         let app = initial_app(&paths, &roster, now);
 
-        assert_eq!(
-            app.repo_view(),
-            &crate::app::RepoFilter::Only("repo-b".into())
-        );
+        assert_eq!(app.repo_view(), &crate::app::RepoFilter::Only("rb".into()));
         assert_eq!(
             app.filtered_rows()
                 .iter()

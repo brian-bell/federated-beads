@@ -640,6 +640,9 @@ impl App {
                     self.apply_repo_view(selected.clone());
                     return vec![Effect::PersistRepoView(selected)];
                 }
+                if self.persistence_warning.is_some() {
+                    return vec![Effect::PersistRepoView(selected)];
+                }
             }
             Msg::TogglePriorityFilter => {
                 let repo_view = self.repo_view.clone();
@@ -916,6 +919,22 @@ impl App {
                 .or_insert_with(|| identity.clone());
         }
         let mut repositories: Vec<(String, String)> = labels_by_identity.into_iter().collect();
+        loop {
+            let mut label_counts = HashMap::<String, usize>::new();
+            for (_, label) in &repositories {
+                *label_counts.entry(label.clone()).or_default() += 1;
+            }
+            let mut changed = false;
+            for (identity, label) in &mut repositories {
+                if label_counts.get(label.as_str()).copied().unwrap_or(0) > 1 {
+                    *label = format!("{label} ({identity})");
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         repositories.sort_by(|(left_id, left_label), (right_id, right_label)| {
             left_label
                 .to_lowercase()
@@ -1428,6 +1447,65 @@ mod tests {
     }
 
     #[test]
+    fn picker_disambiguates_duplicate_labels_merged_from_ready_and_search() {
+        let mut app = app_with(vec![attributed_row("ra", "api", "ra-ready", 1)]);
+        let token = submit(&mut app, "work");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![attributed_row("rb", "api", "rb-search", 1)]),
+        });
+
+        app.reduce(Msg::OpenRepoPicker);
+
+        assert_eq!(
+            app.repo_picker_choices(),
+            Some(
+                [
+                    RepoFilter::All,
+                    RepoFilter::Only("ra".into()),
+                    RepoFilter::Only("rb".into()),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            app.repo_picker_labels(),
+            Some(
+                [
+                    "All repos".to_string(),
+                    "api (ra)".to_string(),
+                    "api (rb)".to_string(),
+                ]
+                .as_slice()
+            ),
+            "identical cross-list labels include their stable identities"
+        );
+    }
+
+    #[test]
+    fn picker_disambiguation_cannot_create_a_second_label_collision() {
+        let mut app = app_with(vec![
+            attributed_row("ra", "api", "ra-ready", 1),
+            attributed_row("rc", "api (ra)", "rc-ready", 1),
+        ]);
+        let token = submit(&mut app, "work");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![attributed_row("rb", "api", "rb-search", 1)]),
+        });
+
+        app.reduce(Msg::OpenRepoPicker);
+
+        let labels = app.repo_picker_labels().expect("picker is open");
+        let unique: std::collections::HashSet<&str> = labels.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "every distinct repository identity has a visually unique label"
+        );
+    }
+
+    #[test]
     fn persistence_warning_tracks_only_the_current_repo_view() {
         let mut app = app_with(vec![row("repo-a", "a-1", 1), row("repo-b", "b-1", 1)]);
         choose_repo(&mut app, RepoFilter::Only("repo-b".into()));
@@ -1456,6 +1534,34 @@ mod tests {
             result: Ok(()),
         });
         assert_eq!(app.persistence_warning(), None);
+    }
+
+    #[test]
+    fn confirming_unchanged_repo_retries_after_persistence_failure() {
+        let mut app = app_with(vec![row("repo-a", "a-1", 1), row("repo-b", "b-1", 1)]);
+        let repo_b = RepoFilter::Only("repo-b".into());
+        choose_repo(&mut app, repo_b.clone());
+        app.reduce(Msg::RepoViewPersisted {
+            repo: repo_b.clone(),
+            result: Err("couldn't save repository view: denied".into()),
+        });
+
+        assert_eq!(
+            choose_repo(&mut app, repo_b.clone()),
+            vec![Effect::PersistRepoView(repo_b.clone())],
+            "confirming the unchanged choice retries the failed write"
+        );
+        assert_eq!(app.repo_view(), &repo_b);
+
+        app.reduce(Msg::RepoViewPersisted {
+            repo: repo_b,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.persistence_warning(),
+            None,
+            "a successful retry clears the warning"
+        );
     }
 
     #[test]
