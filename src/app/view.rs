@@ -527,7 +527,7 @@ mod tests {
                 dependent_count: None,
                 comment_count: None,
             },
-            repo_id: None,
+            repo_id: Some(repo.to_string()),
             repo_name: repo.to_string(),
         }
     }

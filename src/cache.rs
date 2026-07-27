@@ -35,6 +35,7 @@ struct CacheFile {
     version: u64,
     roster: Config,
     snapshot: Snapshot,
+    repo_ids: Vec<Option<String>>,
 }
 
 /// Load the snapshot cached at `path` if it exists, parses, was written under
@@ -109,6 +110,11 @@ pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()>
         version: CACHE_VERSION,
         roster: roster.clone(),
         snapshot: snapshot.clone(),
+        repo_ids: snapshot
+            .rows
+            .iter()
+            .map(|row| row.repo_id.clone())
+            .collect(),
     })?;
 
     let file_name = path
@@ -132,7 +138,14 @@ pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()>
 /// `None` for a missing/corrupt file.
 fn read(path: &Path) -> Option<CacheFile> {
     let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut cached: CacheFile = serde_json::from_slice(&bytes).ok()?;
+    if cached.repo_ids.len() != cached.snapshot.rows.len() {
+        return None;
+    }
+    for (row, repo_id) in cached.snapshot.rows.iter_mut().zip(&cached.repo_ids) {
+        row.repo_id = repo_id.clone();
+    }
+    Some(cached)
 }
 
 /// The sibling lock file [`save`] holds across its read-compare-write

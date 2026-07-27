@@ -368,15 +368,18 @@ struct RepoPickerState {
     cursor: usize,
 }
 
-/// The repo-attribution axis of the filter, matched against
-/// [`Row::repo_identity`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The repo-attribution axis of the filter. Attributed prefixes and the
+/// unattributed bucket are separate variants, so a real prefix such as
+/// `unknown` cannot collide with the bucket.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RepoFilter {
     /// Show every repo.
     #[default]
     All,
-    /// Show only rows whose `repo_name` equals this.
+    /// Show only rows attributed to this stable repository prefix.
     Only(String),
+    /// Show only unattributed or ambiguously attributed rows.
+    Unknown,
 }
 
 /// The priority axis of the filter.
@@ -401,7 +404,8 @@ impl FilterSet {
     pub fn matches(&self, repo_view: &RepoFilter, row: &Row) -> bool {
         let repo_ok = match repo_view {
             RepoFilter::All => true,
-            RepoFilter::Only(identity) => row.repo_identity() == identity,
+            RepoFilter::Only(identity) => row.repo_id.as_deref() == Some(identity),
+            RepoFilter::Unknown => row.repo_id.is_none(),
         };
         let priority_ok = match self.priority {
             PriorityFilter::All => true,
@@ -893,14 +897,17 @@ impl App {
     /// Snapshot deterministic picker choices from every unfiltered list known to
     /// the app. The confirmed stale choice remains visible even with no rows.
     fn build_repo_picker(&self) -> RepoPickerState {
-        let mut labels_by_identity = HashMap::<String, String>::new();
+        let mut labels_by_identity = HashMap::<RepoFilter, String>::new();
         for row in self.ready.rows.iter().chain(
             self.search
                 .as_ref()
                 .into_iter()
                 .flat_map(|search| search.list.rows.iter()),
         ) {
-            let identity = row.repo_identity().to_string();
+            let identity = match &row.repo_id {
+                Some(prefix) => RepoFilter::Only(prefix.clone()),
+                None => RepoFilter::Unknown,
+            };
             let candidate = row.repo_name.clone();
             labels_by_identity
                 .entry(identity)
@@ -913,12 +920,20 @@ impl App {
                 })
                 .or_insert(candidate);
         }
-        if let RepoFilter::Only(identity) = &self.repo_view {
-            labels_by_identity
-                .entry(identity.clone())
-                .or_insert_with(|| identity.clone());
+        match &self.repo_view {
+            RepoFilter::All => {}
+            RepoFilter::Only(identity) => {
+                labels_by_identity
+                    .entry(self.repo_view.clone())
+                    .or_insert_with(|| identity.clone());
+            }
+            RepoFilter::Unknown => {
+                labels_by_identity
+                    .entry(RepoFilter::Unknown)
+                    .or_insert_with(|| crate::snapshot::UNKNOWN_REPO.to_string());
+            }
         }
-        let mut repositories: Vec<(String, String)> = labels_by_identity.into_iter().collect();
+        let mut repositories: Vec<(RepoFilter, String)> = labels_by_identity.into_iter().collect();
         loop {
             let mut label_counts = HashMap::<String, usize>::new();
             for (_, label) in &repositories {
@@ -927,7 +942,12 @@ impl App {
             let mut changed = false;
             for (identity, label) in &mut repositories {
                 if label_counts.get(label.as_str()).copied().unwrap_or(0) > 1 {
-                    *label = format!("{label} ({identity})");
+                    let suffix = match identity {
+                        RepoFilter::Only(prefix) => format!("prefix {prefix}"),
+                        RepoFilter::Unknown => "unattributed".to_string(),
+                        RepoFilter::All => unreachable!("All is not a repository choice"),
+                    };
+                    *label = format!("{label} ({suffix})");
                     changed = true;
                 }
             }
@@ -948,7 +968,7 @@ impl App {
         choices.push(RepoFilter::All);
         labels.push("All repos".to_string());
         for (identity, label) in repositories {
-            choices.push(RepoFilter::Only(identity));
+            choices.push(identity);
             labels.push(label);
         }
         let cursor = choices
@@ -1275,9 +1295,15 @@ mod tests {
                 dependent_count: None,
                 comment_count: None,
             },
-            repo_id: None,
+            repo_id: Some(repo.to_string()),
             repo_name: repo.to_string(),
         }
+    }
+
+    fn unattributed_row(repo_name: &str, id: &str, priority: i64) -> Row {
+        let mut row = row(repo_name, id, priority);
+        row.repo_id = None;
+        row
     }
 
     fn attributed_row(repo_id: &str, repo_name: &str, id: &str, priority: i64) -> Row {
@@ -1447,6 +1473,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_unknown_prefix_is_distinct_from_unattributed_bucket() {
+        let mut app = app_with(vec![
+            attributed_row("unknown", "unknown", "unknown-1", 1),
+            unattributed_row("unknown", "zz-unattributed", 1),
+        ]);
+
+        app.reduce(Msg::OpenRepoPicker);
+        assert_eq!(
+            app.repo_picker_choices().unwrap().len(),
+            3,
+            "all, the configured prefix, and the unattributed bucket are distinct"
+        );
+        assert!(
+            app.repo_picker_choices()
+                .unwrap()
+                .contains(&RepoFilter::Unknown),
+            "the unattributed bucket has its own tagged choice"
+        );
+        let labels = app.repo_picker_labels().unwrap();
+        assert_ne!(
+            labels[1], labels[2],
+            "the configured prefix and unattributed bucket have distinct labels"
+        );
+        app.reduce(Msg::Back);
+
+        choose_repo(&mut app, RepoFilter::Only("unknown".into()));
+        assert_eq!(
+            ids(&app.filtered_rows()),
+            vec!["unknown-1"],
+            "selecting the configured prefix excludes unattributed rows"
+        );
+    }
+
+    #[test]
     fn picker_disambiguates_duplicate_labels_merged_from_ready_and_search() {
         let mut app = app_with(vec![attributed_row("ra", "api", "ra-ready", 1)]);
         let token = submit(&mut app, "work");
@@ -1473,8 +1533,8 @@ mod tests {
             Some(
                 [
                     "All repos".to_string(),
-                    "api (ra)".to_string(),
-                    "api (rb)".to_string(),
+                    "api (prefix ra)".to_string(),
+                    "api (prefix rb)".to_string(),
                 ]
                 .as_slice()
             ),

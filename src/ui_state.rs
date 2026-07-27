@@ -8,13 +8,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::RepoFilter;
 
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 #[derive(Deserialize, Serialize)]
 struct UiStateFile {
     version: u64,
     #[serde(default)]
+    repository: Option<StoredRepository>,
+}
+
+#[derive(Deserialize)]
+struct UiStateVersion {
+    version: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyUiStateFile {
+    #[serde(default)]
     repository: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+enum StoredRepository {
+    Prefix(String),
+    Unknown,
 }
 
 /// Atomically persist a confirmed repository view.
@@ -28,7 +45,8 @@ pub fn save(path: &Path, repo: &RepoFilter) -> Result<()> {
         version: VERSION,
         repository: match repo {
             RepoFilter::All => None,
-            RepoFilter::Only(name) => Some(name.clone()),
+            RepoFilter::Only(prefix) => Some(StoredRepository::Prefix(prefix.clone())),
+            RepoFilter::Unknown => Some(StoredRepository::Unknown),
         },
     };
     let bytes = serde_json::to_vec_pretty(&state).context("serializing UI state")?;
@@ -56,15 +74,30 @@ pub fn load(path: &Path) -> RepoFilter {
     let Ok(bytes) = fs::read(path) else {
         return RepoFilter::All;
     };
-    let Ok(state) = serde_json::from_slice::<UiStateFile>(&bytes) else {
+    let Ok(header) = serde_json::from_slice::<UiStateVersion>(&bytes) else {
         return RepoFilter::All;
     };
-    if state.version != VERSION {
-        return RepoFilter::All;
-    }
-    match state.repository {
-        Some(name) => RepoFilter::Only(name),
-        None => RepoFilter::All,
+    match header.version {
+        1 => {
+            let Ok(state) = serde_json::from_slice::<LegacyUiStateFile>(&bytes) else {
+                return RepoFilter::All;
+            };
+            match state.repository {
+                Some(prefix) if prefix != crate::snapshot::UNKNOWN_REPO => RepoFilter::Only(prefix),
+                _ => RepoFilter::All,
+            }
+        }
+        VERSION => {
+            let Ok(state) = serde_json::from_slice::<UiStateFile>(&bytes) else {
+                return RepoFilter::All;
+            };
+            match state.repository {
+                Some(StoredRepository::Prefix(prefix)) => RepoFilter::Only(prefix),
+                Some(StoredRepository::Unknown) => RepoFilter::Unknown,
+                None => RepoFilter::All,
+            }
+        }
+        _ => RepoFilter::All,
     }
 }
 
@@ -97,6 +130,9 @@ mod tests {
 
         save(&path, &RepoFilter::Only("repo-a".into())).unwrap();
         assert_eq!(load(&path), RepoFilter::Only("repo-a".into()));
+
+        save(&path, &RepoFilter::Unknown).unwrap();
+        assert_eq!(load(&path), RepoFilter::Unknown);
         assert_eq!(
             fs::read_dir(path.parent().unwrap())
                 .unwrap()
@@ -104,6 +140,22 @@ mod tests {
                 .count(),
             1,
             "atomic replacement leaves no temporary file"
+        );
+    }
+
+    #[test]
+    fn migrates_unambiguous_v1_repository_preferences() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui_state.json");
+
+        fs::write(&path, r#"{"version":1,"repository":"repo-a"}"#).unwrap();
+        assert_eq!(load(&path), RepoFilter::Only("repo-a".into()));
+
+        fs::write(&path, r#"{"version":1,"repository":"unknown"}"#).unwrap();
+        assert_eq!(
+            load(&path),
+            RepoFilter::All,
+            "legacy unknown could mean a real prefix or the unattributed bucket"
         );
     }
 }

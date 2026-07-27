@@ -33,17 +33,9 @@ const HIDDEN_REPOS: &[&str] = &["beads"];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub issue: Issue,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub repo_id: Option<String>,
     pub repo_name: String,
-}
-
-impl Row {
-    /// Stable repository identity used by persisted filters. Old cached rows did
-    /// not carry `repo_id`, so they fall back to their display label.
-    pub fn repo_identity(&self) -> &str {
-        self.repo_id.as_deref().unwrap_or(&self.repo_name)
-    }
 }
 
 /// Everything the ready screen needs: attributed, display-sorted rows plus the
@@ -426,10 +418,9 @@ mod tests {
             first.get("repo_name").and_then(|v| v.as_str()),
             Some("session-tui")
         );
-        assert_eq!(
-            first.get("repo_id").and_then(|v| v.as_str()),
-            Some("ra"),
-            "serialized rows expose the stable non-sensitive identity"
+        assert!(
+            first.get("repo_id").is_none(),
+            "the internal picker identity is not part of public snapshot JSON"
         );
         assert_eq!(
             first
