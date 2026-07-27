@@ -1,6 +1,6 @@
 [package]
 name = "fbd"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition = "2024"
 rust-version = "1.88.0"
 description = "Federated Beads: a read-only terminal UI over a bd multi-repo hub — one cross-repo ready-work list, detail pane, search, and copy-context."
@@ -18,6 +18,7 @@ exclude = [
     "/.gitignore",
     "/AGENTS.md",
     "/CLAUDE.md",
+    "/dist-workspace.toml",
     "/Makefile",
     "/tests/**",
 ]
@@ -41,3 +42,8 @@ toml = "1.1.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
