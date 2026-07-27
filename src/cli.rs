@@ -596,6 +596,7 @@ mod tests {
     fn row(repo_name: &str, id: &str, priority: i64, title: &str) -> Row {
         Row {
             issue: issue(id, priority, title),
+            repo_id: None,
             repo_name: repo_name.to_string(),
         }
     }
@@ -942,6 +943,11 @@ mod tests {
             &Config::default(),
         )
         .expect("seed cache");
+        crate::ui_state::save(
+            paths.ui_state_file(),
+            &crate::app::RepoFilter::Only("repo-a".into()),
+        )
+        .expect("seed UI state");
         let mut out = Vec::new();
 
         run_reset(&paths, &mut out).expect("ok");
@@ -949,6 +955,11 @@ mod tests {
         assert!(
             !paths.cache_file().exists(),
             "reset removes the snapshot cache along with the hub"
+        );
+        assert_eq!(
+            crate::ui_state::load(paths.ui_state_file()),
+            crate::app::RepoFilter::Only("repo-a".into()),
+            "reset preserves the user's repository preference"
         );
     }
 

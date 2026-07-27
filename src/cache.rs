@@ -17,11 +17,14 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, UNKNOWN_REPO};
 
 /// A cached snapshot older than this is not loaded at startup — better to wait
 /// for one real refresh than paint a half-day-stale ready list.
 pub const MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Cache schema carrying stable repository identities on attributed rows.
+const CACHE_VERSION: u64 = 1;
 
 /// The on-disk cache payload: the snapshot plus the roster it was fetched
 /// under. `roster` lets [`load`] reject a cache written before a `repos add`/
@@ -29,19 +32,33 @@ pub const MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 /// that repo's rows for up to [`MAX_AGE`] regardless of the roster change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheFile {
+    version: u64,
     roster: Config,
     snapshot: Snapshot,
+    repo_ids: Vec<Option<String>>,
 }
 
 /// Load the snapshot cached at `path` if it exists, parses, was written under
 /// `roster` (bytewise `==`, so a `repos add`/`remove`/reorder invalidates it),
 /// and its embedded `fetched_at` is within [`MAX_AGE`] of `now`. Any failure —
-/// missing file, corrupt JSON, a roster mismatch, or a `fetched_at` more than
-/// `MAX_AGE` before (or after, guarding against clock skew) `now` — yields
-/// `None` silently.
+/// missing file, corrupt JSON, a roster mismatch, a legacy attributed row that
+/// predates stable repository identities, or a `fetched_at` more than `MAX_AGE`
+/// before (or after, guarding against clock skew) `now` — yields `None`
+/// silently.
 pub fn load(path: &Path, now: SystemTime, roster: &Config) -> Option<Snapshot> {
     let cached = read(path)?;
+    if cached.version != CACHE_VERSION {
+        return None;
+    }
     if &cached.roster != roster {
+        return None;
+    }
+    if cached
+        .snapshot
+        .rows
+        .iter()
+        .any(|row| row.repo_id.is_none() && row.repo_name != UNKNOWN_REPO)
+    {
         return None;
     }
     let age = now.duration_since(cached.snapshot.fetched_at).ok()?;
@@ -83,14 +100,21 @@ pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()>
     lock_file.lock_exclusive()?;
 
     if let Some(existing) = read(path)
+        && existing.version == CACHE_VERSION
         && existing.snapshot.fetched_at >= snapshot.fetched_at
     {
         return Ok(());
     }
 
     let bytes = serde_json::to_vec(&CacheFile {
+        version: CACHE_VERSION,
         roster: roster.clone(),
         snapshot: snapshot.clone(),
+        repo_ids: snapshot
+            .rows
+            .iter()
+            .map(|row| row.repo_id.clone())
+            .collect(),
     })?;
 
     let file_name = path
@@ -114,7 +138,14 @@ pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()>
 /// `None` for a missing/corrupt file.
 fn read(path: &Path) -> Option<CacheFile> {
     let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut cached: CacheFile = serde_json::from_slice(&bytes).ok()?;
+    if cached.repo_ids.len() != cached.snapshot.rows.len() {
+        return None;
+    }
+    for (row, repo_id) in cached.snapshot.rows.iter_mut().zip(&cached.repo_ids) {
+        row.repo_id = repo_id.clone();
+    }
+    Some(cached)
 }
 
 /// The sibling lock file [`save`] holds across its read-compare-write
@@ -170,6 +201,7 @@ mod tests {
                     dependent_count: None,
                     comment_count: None,
                 },
+                repo_id: Some("ra".into()),
                 repo_name: "repo-a".into(),
             }],
             fetched_at,
@@ -198,6 +230,60 @@ mod tests {
             load(&path, at(1_000_000) + Duration::from_secs(60), &roster).expect("fresh load");
 
         assert_eq!(loaded, snapshot);
+    }
+
+    #[test]
+    fn rejects_legacy_attributed_rows_without_stable_repo_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        let mut snapshot = snapshot_at(at(1_000_000));
+        snapshot.rows[0].repo_id = None;
+        let roster = roster(&["/dev/repo-a"]);
+
+        save(&path, &snapshot, &roster).expect("save legacy-shaped cache");
+
+        assert!(
+            load(&path, at(1_000_000) + Duration::from_secs(60), &roster).is_none(),
+            "display-only attributed rows must not hydrate a persistable picker identity"
+        );
+    }
+
+    #[test]
+    fn rejects_versionless_legacy_cache_even_when_label_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        let mut snapshot = snapshot_at(at(1_000_000));
+        snapshot.rows[0].repo_id = None;
+        snapshot.rows[0].repo_name = UNKNOWN_REPO.into();
+        let roster = roster(&["/dev/unknown"]);
+        let legacy = serde_json::json!({
+            "roster": roster,
+            "snapshot": snapshot,
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert!(
+            load(&path, at(1_000_000) + Duration::from_secs(60), &roster).is_none(),
+            "the sentinel label cannot substitute for cache schema provenance"
+        );
+    }
+
+    #[test]
+    fn accepts_unattributed_unknown_rows_without_repo_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+        let mut snapshot = snapshot_at(at(1_000_000));
+        snapshot.rows[0].repo_id = None;
+        snapshot.rows[0].repo_name = UNKNOWN_REPO.into();
+        let roster = roster(&["/dev/repo-a"]);
+
+        save(&path, &snapshot, &roster).expect("save unknown row");
+
+        assert_eq!(
+            load(&path, at(1_000_000) + Duration::from_secs(60), &roster),
+            Some(snapshot),
+            "new snapshots legitimately omit identities for unattributed rows"
+        );
     }
 
     #[test]

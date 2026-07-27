@@ -12,6 +12,7 @@ pub mod context;
 pub mod keys;
 pub mod view;
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::bd::ShowDetail;
@@ -89,8 +90,14 @@ pub enum Msg {
     DetailScrollBounds { max_scroll: u16 },
 
     // ---- Filters ----
-    /// Cycle the repo filter `All → repo₀ → … → All` (`f`).
-    CycleRepoFilter,
+    /// Open the repository picker over a browsable ready/search list (`f`).
+    OpenRepoPicker,
+    /// Move the repository picker's pending cursor down, clamped at the end.
+    RepoPickerNext,
+    /// Move the repository picker's pending cursor up, clamped at the start.
+    RepoPickerPrev,
+    /// Confirm the pending repository choice.
+    ConfirmRepoPicker,
     /// Toggle the priority filter `All ↔ P0/P1-only` (`p`).
     TogglePriorityFilter,
 
@@ -130,6 +137,12 @@ pub enum Msg {
         token: u64,
         payload: String,
         summary: String,
+    },
+    /// Persistence of a confirmed repository view completed. Results for a
+    /// superseded view are ignored.
+    RepoViewPersisted {
+        repo: RepoFilter,
+        result: Result<(), String>,
     },
     /// Leave the current sub-mode back to the list (`Esc`). No-op in `List`;
     /// Slices 10/11 return from `Detail`/`Search`.
@@ -174,6 +187,8 @@ pub enum Effect {
     /// [`Msg::Copied`] follow-up). Performed on the UI thread, which owns the tty,
     /// so the escape can never interleave with a ratatui draw from a worker.
     WriteClipboard(String),
+    /// Persist one newly confirmed repository view.
+    PersistRepoView(RepoFilter),
 }
 
 /// Which screen the app is showing.
@@ -187,6 +202,15 @@ pub enum ViewMode {
     Detail,
     /// Cross-repo search: a query input and its results (opened with `/`).
     Search,
+}
+
+/// Live key-routing context. Picker input takes precedence over the underlying
+/// screen, then search editing, then normal commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputContext {
+    Normal,
+    SearchEditing,
+    RepoPicker,
 }
 
 /// The detail pane's state for one issue id.
@@ -226,22 +250,22 @@ struct RowList {
     filtered_ix: Vec<usize>,
     /// Offset into `filtered_ix` (never into `rows`).
     selection: usize,
-    /// The active filter across both axes.
+    /// The list-local priority filter. The repository view belongs to `App`.
     filter: FilterSet,
 }
 
 impl RowList {
     /// Replace the rows, keeping the active filter, then recompute + re-clamp.
-    fn set_rows(&mut self, rows: Vec<Row>) {
+    fn set_rows(&mut self, rows: Vec<Row>, repo_view: &RepoFilter) {
         self.rows = rows;
-        self.recompute();
+        self.recompute(repo_view);
     }
 
     /// Rebuild `filtered_ix` under the current filter and re-clamp `selection` —
     /// the one place the selection invariant is re-established.
-    fn recompute(&mut self) {
+    fn recompute(&mut self, repo_view: &RepoFilter) {
         self.filtered_ix = (0..self.rows.len())
-            .filter(|&i| self.filter.matches(&self.rows[i]))
+            .filter(|&i| self.filter.matches(repo_view, &self.rows[i]))
             .collect();
         if self.filtered_ix.is_empty() {
             self.selection = 0;
@@ -262,40 +286,13 @@ impl RowList {
         self.selection = self.selection.saturating_sub(1);
     }
 
-    /// Cycle the repo filter `All → repo₀ → … → All`, then recompute.
-    fn cycle_repo_filter(&mut self) {
-        self.filter.repo = self.next_repo_filter();
-        self.recompute();
-    }
-
     /// Toggle the priority filter `All ↔ P0/P1-only`, then recompute.
-    fn toggle_priority_filter(&mut self) {
+    fn toggle_priority_filter(&mut self, repo_view: &RepoFilter) {
         self.filter.priority = match self.filter.priority {
             PriorityFilter::All => PriorityFilter::HighOnly,
             PriorityFilter::HighOnly => PriorityFilter::All,
         };
-        self.recompute();
-    }
-
-    /// The next repo filter when cycling with `f`: `All → repo₀ → … → repoₙ₋₁ →
-    /// All`, over the distinct `repo_name`s in first-appearance (display) order.
-    fn next_repo_filter(&self) -> RepoFilter {
-        let mut names: Vec<&str> = Vec::new();
-        for row in &self.rows {
-            if !names.contains(&row.repo_name.as_str()) {
-                names.push(&row.repo_name);
-            }
-        }
-        match &self.filter.repo {
-            RepoFilter::All => match names.first() {
-                Some(name) => RepoFilter::Only((*name).to_string()),
-                None => RepoFilter::All,
-            },
-            RepoFilter::Only(current) => match names.iter().position(|&n| n == current.as_str()) {
-                Some(i) if i + 1 < names.len() => RepoFilter::Only(names[i + 1].to_string()),
-                _ => RepoFilter::All,
-            },
-        }
+        self.recompute(repo_view);
     }
 
     /// Relocate the selection onto the visible row whose issue id is `id`,
@@ -363,14 +360,26 @@ struct SearchState {
     list: RowList,
 }
 
-/// The repo-attribution axis of the filter, matched against [`Row::repo_name`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A snapshotted repository-picker option list and pending cursor.
+#[derive(Debug, Clone)]
+struct RepoPickerState {
+    choices: Vec<RepoFilter>,
+    labels: Vec<String>,
+    cursor: usize,
+}
+
+/// The repo-attribution axis of the filter. Attributed prefixes and the
+/// unattributed bucket are separate variants, so a real prefix such as
+/// `unknown` cannot collide with the bucket.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RepoFilter {
     /// Show every repo.
     #[default]
     All,
-    /// Show only rows whose `repo_name` equals this.
+    /// Show only rows attributed to this stable repository prefix.
     Only(String),
+    /// Show only unattributed or ambiguously attributed rows.
+    Unknown,
 }
 
 /// The priority axis of the filter.
@@ -383,31 +392,26 @@ pub enum PriorityFilter {
     HighOnly,
 }
 
-/// The active filter: an independent repo axis and priority axis, applied
-/// together by [`FilterSet::matches`].
+/// The list-local priority filter. [`App::repo_view`] supplies the independent
+/// repository axis when [`FilterSet::matches`] evaluates a row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FilterSet {
-    repo: RepoFilter,
     priority: PriorityFilter,
 }
 
 impl FilterSet {
-    /// Whether a row passes both filter axes.
-    pub fn matches(&self, row: &Row) -> bool {
-        let repo_ok = match &self.repo {
+    /// Whether a row passes the global repository and local priority axes.
+    pub fn matches(&self, repo_view: &RepoFilter, row: &Row) -> bool {
+        let repo_ok = match repo_view {
             RepoFilter::All => true,
-            RepoFilter::Only(name) => &row.repo_name == name,
+            RepoFilter::Only(identity) => row.repo_id.as_deref() == Some(identity),
+            RepoFilter::Unknown => row.repo_id.is_none(),
         };
         let priority_ok = match self.priority {
             PriorityFilter::All => true,
             PriorityFilter::HighOnly => row.issue.priority <= 1,
         };
         repo_ok && priority_ok
-    }
-
-    /// The active repo filter.
-    pub fn repo(&self) -> &RepoFilter {
-        &self.repo
     }
 
     /// The active priority filter.
@@ -420,6 +424,12 @@ impl FilterSet {
 /// selection invariant (see [`App::reduce`]); read through the accessors.
 #[derive(Debug, Clone)]
 pub struct App {
+    /// The application-wide repository view, shared by ready and search lists.
+    repo_view: RepoFilter,
+    /// Open picker overlay. Choices are frozen until it closes.
+    repo_picker: Option<RepoPickerState>,
+    /// Non-fatal warning from the latest relevant UI-state save failure.
+    persistence_warning: Option<String>,
     /// The cross-repo ready list (rows, filter, selection), always maintained by
     /// refresh even while a search overlays it.
     ready: RowList,
@@ -488,7 +498,16 @@ impl App {
     /// `RefreshStarted`. The flag clears when that first refresh concludes with a
     /// `RefreshCompleted`, like any other cycle.
     pub fn new() -> App {
+        App::with_repo_view(RepoFilter::All)
+    }
+
+    /// Construct an app with the repository view restored from persisted UI
+    /// state. The view is installed before cache or refresh rows can arrive.
+    pub fn with_repo_view(repo_view: RepoFilter) -> App {
         App {
+            repo_view,
+            repo_picker: None,
+            persistence_warning: None,
             ready: RowList::default(),
             search: None,
             search_seq: 0,
@@ -528,8 +547,14 @@ impl App {
     /// Pure: given the same starting state and message, the resulting state and
     /// effects are identical and nothing outside `self` is touched. Every branch
     /// that can change the row set or filter re-establishes the selection
-    /// invariant via [`App::recompute`].
+    /// invariant via [`RowList::recompute`].
     pub fn reduce(&mut self, msg: Msg) -> Vec<Effect> {
+        // Esc always cancels the topmost overlay before it can affect the
+        // underlying detail/search mode.
+        if self.repo_picker.is_some() && matches!(&msg, Msg::Back) {
+            self.repo_picker = None;
+            return Vec::new();
+        }
         match msg {
             Msg::RefreshStarted => {
                 // Keep the current rows on screen; mark them stale while the
@@ -595,15 +620,38 @@ impl App {
                     self.detail_scroll = self.detail_scroll.min(max_scroll);
                 }
             }
-            // Filters act on the active browsing list; inert while a pane/editor is up.
-            Msg::CycleRepoFilter => {
-                if let Some(list) = self.browsing_list_mut() {
-                    list.cycle_repo_filter();
+            Msg::OpenRepoPicker => {
+                if self.is_browsing() && self.repo_picker.is_none() {
+                    self.repo_picker = Some(self.build_repo_picker());
+                }
+            }
+            Msg::RepoPickerNext => {
+                if let Some(picker) = &mut self.repo_picker {
+                    picker.cursor = (picker.cursor + 1).min(picker.choices.len() - 1);
+                }
+            }
+            Msg::RepoPickerPrev => {
+                if let Some(picker) = &mut self.repo_picker {
+                    picker.cursor = picker.cursor.saturating_sub(1);
+                }
+            }
+            Msg::ConfirmRepoPicker => {
+                let Some(picker) = self.repo_picker.take() else {
+                    return Vec::new();
+                };
+                let selected = picker.choices[picker.cursor].clone();
+                if selected != self.repo_view {
+                    self.apply_repo_view(selected.clone());
+                    return vec![Effect::PersistRepoView(selected)];
+                }
+                if self.persistence_warning.is_some() {
+                    return vec![Effect::PersistRepoView(selected)];
                 }
             }
             Msg::TogglePriorityFilter => {
+                let repo_view = self.repo_view.clone();
                 if let Some(list) = self.browsing_list_mut() {
-                    list.toggle_priority_filter();
+                    list.toggle_priority_filter(&repo_view);
                 }
             }
             Msg::Refresh => {
@@ -757,6 +805,7 @@ impl App {
                 }
             }
             Msg::SearchResults { token, rows } => {
+                let repo_view = self.repo_view.clone();
                 // Accept only the response for the current, still-pending query; a
                 // superseded one (re-submitted, or `Esc`'d back to editing) is
                 // dropped by the token + `Loading`-phase guard.
@@ -766,11 +815,11 @@ impl App {
                 {
                     match rows {
                         Ok(rows) => {
-                            s.list.set_rows(rows);
+                            s.list.set_rows(rows, &repo_view);
                             s.phase = SearchPhase::Results;
                         }
                         Err(message) => {
-                            s.list.set_rows(Vec::new());
+                            s.list.set_rows(Vec::new(), &repo_view);
                             s.phase = SearchPhase::Error(message);
                         }
                     }
@@ -801,6 +850,11 @@ impl App {
                         effects.push(self.launch_copy(row, markdown));
                     }
                     return effects;
+                }
+            }
+            Msg::RepoViewPersisted { repo, result } => {
+                if repo == self.repo_view {
+                    self.persistence_warning = result.err();
                 }
             }
             Msg::Quit => self.done = true,
@@ -838,6 +892,106 @@ impl App {
         self.detail_row = Some(row);
         self.detail_scroll = 0;
         vec![Effect::FetchDetail { id, token }]
+    }
+
+    /// Snapshot deterministic picker choices from every unfiltered list known to
+    /// the app. The confirmed stale choice remains visible even with no rows.
+    fn build_repo_picker(&self) -> RepoPickerState {
+        let mut labels_by_identity = HashMap::<RepoFilter, String>::new();
+        for row in self.ready.rows.iter().chain(
+            self.search
+                .as_ref()
+                .into_iter()
+                .flat_map(|search| search.list.rows.iter()),
+        ) {
+            let identity = match &row.repo_id {
+                Some(prefix) => RepoFilter::Only(prefix.clone()),
+                None => RepoFilter::Unknown,
+            };
+            let candidate = row.repo_name.clone();
+            labels_by_identity
+                .entry(identity)
+                .and_modify(|label| {
+                    if candidate.len() > label.len()
+                        || (candidate.len() == label.len() && candidate < *label)
+                    {
+                        *label = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+        match &self.repo_view {
+            RepoFilter::All => {}
+            RepoFilter::Only(identity) => {
+                labels_by_identity
+                    .entry(self.repo_view.clone())
+                    .or_insert_with(|| identity.clone());
+            }
+            RepoFilter::Unknown => {
+                labels_by_identity
+                    .entry(RepoFilter::Unknown)
+                    .or_insert_with(|| crate::snapshot::UNKNOWN_REPO.to_string());
+            }
+        }
+        let mut repositories: Vec<(RepoFilter, String)> = labels_by_identity.into_iter().collect();
+        loop {
+            let mut label_counts = HashMap::<String, usize>::new();
+            for (_, label) in &repositories {
+                *label_counts.entry(label.clone()).or_default() += 1;
+            }
+            let mut changed = false;
+            for (identity, label) in &mut repositories {
+                if label_counts.get(label.as_str()).copied().unwrap_or(0) > 1 {
+                    let suffix = match identity {
+                        RepoFilter::Only(prefix) => format!("prefix {prefix}"),
+                        RepoFilter::Unknown => "unattributed".to_string(),
+                        RepoFilter::All => unreachable!("All is not a repository choice"),
+                    };
+                    *label = format!("{label} ({suffix})");
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        repositories.sort_by(|(left_id, left_label), (right_id, right_label)| {
+            left_label
+                .to_lowercase()
+                .cmp(&right_label.to_lowercase())
+                .then_with(|| left_label.cmp(right_label))
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        let mut choices = Vec::with_capacity(repositories.len() + 1);
+        let mut labels = Vec::with_capacity(repositories.len() + 1);
+        choices.push(RepoFilter::All);
+        labels.push("All repos".to_string());
+        for (identity, label) in repositories {
+            choices.push(identity);
+            labels.push(label);
+        }
+        let cursor = choices
+            .iter()
+            .position(|choice| choice == &self.repo_view)
+            .unwrap_or(0);
+        RepoPickerState {
+            choices,
+            labels,
+            cursor,
+        }
+    }
+
+    /// Apply one confirmed global repository view to every materialized list and
+    /// reset each affected selection to its first visible row.
+    fn apply_repo_view(&mut self, repo: RepoFilter) {
+        self.repo_view = repo.clone();
+        self.ready.selection = 0;
+        self.ready.recompute(&repo);
+        if let Some(search) = &mut self.search {
+            search.list.selection = 0;
+            search.list.recompute(&repo);
+        }
     }
 
     /// Emit an [`Effect::Copy`] for the selected row of the active list, or no
@@ -898,6 +1052,7 @@ impl App {
             };
             return Some(Row {
                 issue,
+                repo_id: opened.repo_id.clone(),
                 repo_name: opened.repo_name.clone(),
             });
         }
@@ -992,7 +1147,7 @@ impl App {
         // A refresh always updates the ready list, even under a search or
         // detail overlay; `set_rows` keeps the active filter and re-clamps
         // the selection. (`None` keeps the last-good rows.)
-        self.ready.set_rows(snapshot.rows);
+        self.ready.set_rows(snapshot.rows, &self.repo_view);
         self.fetched_at = Some(snapshot.fetched_at);
         // Only promote the first-snapshot transition; a refresh landing under
         // an open `Detail`/`Search` overlay must not slam it shut (the 1s
@@ -1027,6 +1182,40 @@ impl App {
         &self.active().filter
     }
 
+    /// The confirmed application-wide repository view.
+    pub fn repo_view(&self) -> &RepoFilter {
+        &self.repo_view
+    }
+
+    /// Whether the repository picker overlay is open.
+    pub fn repo_picker_open(&self) -> bool {
+        self.repo_picker.is_some()
+    }
+
+    /// The picker's snapshotted choices, when open.
+    pub fn repo_picker_choices(&self) -> Option<&[RepoFilter]> {
+        self.repo_picker
+            .as_ref()
+            .map(|picker| picker.choices.as_slice())
+    }
+
+    /// Presentation labels corresponding one-to-one with the picker's choices.
+    pub fn repo_picker_labels(&self) -> Option<&[String]> {
+        self.repo_picker
+            .as_ref()
+            .map(|picker| picker.labels.as_slice())
+    }
+
+    /// The picker's pending cursor, when open.
+    pub fn repo_picker_cursor(&self) -> Option<usize> {
+        self.repo_picker.as_ref().map(|picker| picker.cursor)
+    }
+
+    /// The current UI-state persistence warning, if any.
+    pub fn persistence_warning(&self) -> Option<&str> {
+        self.persistence_warning.as_deref()
+    }
+
     /// The current search query, if the search flow is live.
     pub fn search_query(&self) -> Option<&str> {
         self.search.as_ref().map(|s| s.query.as_str())
@@ -1041,6 +1230,17 @@ impl App {
     /// than acting as a command). Read by the runtime to route key mapping.
     pub fn search_editing(&self) -> bool {
         matches!(self.search_phase(), Some(SearchPhase::Editing))
+    }
+
+    /// The current key-routing context.
+    pub fn input_context(&self) -> InputContext {
+        if self.repo_picker.is_some() {
+            InputContext::RepoPicker
+        } else if self.search_editing() {
+            InputContext::SearchEditing
+        } else {
+            InputContext::Normal
+        }
     }
 
     /// The number of rows the current search returned (0 when not in results).
@@ -1095,8 +1295,21 @@ mod tests {
                 dependent_count: None,
                 comment_count: None,
             },
+            repo_id: Some(repo.to_string()),
             repo_name: repo.to_string(),
         }
+    }
+
+    fn unattributed_row(repo_name: &str, id: &str, priority: i64) -> Row {
+        let mut row = row(repo_name, id, priority);
+        row.repo_id = None;
+        row
+    }
+
+    fn attributed_row(repo_id: &str, repo_name: &str, id: &str, priority: i64) -> Row {
+        let mut row = row(repo_name, id, priority);
+        row.repo_id = Some(repo_id.to_string());
+        row
     }
 
     fn snapshot(rows: Vec<Row>) -> Snapshot {
@@ -1121,8 +1334,355 @@ mod tests {
         app
     }
 
+    #[test]
+    fn restored_repo_view_filters_cache_before_the_first_frame() {
+        let mut app = App::with_repo_view(RepoFilter::Only("repo-b".into()));
+
+        assert_eq!(app.repo_view(), &RepoFilter::Only("repo-b".into()));
+        app.hydrate_from_cache(snapshot(vec![
+            row("repo-a", "a-1", 1),
+            row("repo-b", "b-1", 2),
+        ]));
+
+        assert_eq!(ids(&app.filtered_rows()), vec!["b-1"]);
+        assert!(app.is_stale(), "cache hydration keeps the launch guard");
+    }
+
+    #[test]
+    fn repo_picker_opens_with_deterministic_choices_and_cancel_is_non_destructive() {
+        let mut app = app_with(vec![
+            row("zeta", "z-1", 1),
+            row("Alpha", "a-1", 2),
+            row("alpha", "a-2", 3),
+            row("zeta", "z-2", 4),
+        ]);
+        app.reduce(Msg::SelectNext);
+        let selected = app.selected_row().unwrap().issue.id.clone();
+
+        assert_eq!(app.reduce(Msg::OpenRepoPicker), Vec::new());
+        assert_eq!(
+            app.repo_picker_choices(),
+            Some(
+                [
+                    RepoFilter::All,
+                    RepoFilter::Only("Alpha".into()),
+                    RepoFilter::Only("alpha".into()),
+                    RepoFilter::Only("zeta".into()),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(app.repo_picker_cursor(), Some(0));
+        assert_eq!(app.repo_view(), &RepoFilter::All);
+
+        assert_eq!(app.reduce(Msg::RepoPickerNext), Vec::new());
+        assert_eq!(app.reduce(Msg::Back), Vec::new());
+        assert!(!app.repo_picker_open());
+        assert_eq!(app.repo_view(), &RepoFilter::All);
+        assert_eq!(app.selected_row().unwrap().issue.id, selected);
+    }
+
+    #[test]
+    fn confirmed_repo_view_recomputes_ready_and_search_and_persists_once() {
+        let mut app = app_with(vec![
+            row("repo-a", "a-ready", 1),
+            row("repo-b", "b-ready", 1),
+        ]);
+        let token = submit(&mut app, "work");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![
+                row("repo-a", "a-search", 1),
+                row("repo-b", "b-search", 1),
+            ]),
+        });
+        app.reduce(Msg::SelectNext);
+
+        assert_eq!(
+            choose_repo(&mut app, RepoFilter::Only("repo-b".into())),
+            vec![Effect::PersistRepoView(RepoFilter::Only("repo-b".into()))]
+        );
+        assert_eq!(ids(&app.filtered_rows()), vec!["b-search"]);
+        assert_eq!(app.selection(), Some(0));
+
+        app.reduce(Msg::Back);
+        app.reduce(Msg::Back);
+        assert_eq!(ids(&app.filtered_rows()), vec!["b-ready"]);
+        assert_eq!(app.selection(), Some(0));
+
+        assert_eq!(
+            choose_repo(&mut app, RepoFilter::Only("repo-b".into())),
+            Vec::new(),
+            "confirming the active view performs no write"
+        );
+    }
+
+    #[test]
+    fn persisted_repo_identity_survives_result_dependent_display_labels() {
+        let mut app = app_with(vec![
+            attributed_row("ra", "api (ra)", "ra-ready", 1),
+            attributed_row("rb", "api (rb)", "rb-ready", 1),
+        ]);
+        app.reduce(Msg::OpenRepoPicker);
+        assert_eq!(
+            app.repo_picker_choices(),
+            Some(
+                [
+                    RepoFilter::All,
+                    RepoFilter::Only("ra".into()),
+                    RepoFilter::Only("rb".into()),
+                ]
+                .as_slice()
+            ),
+            "picker values use stable attribution identities"
+        );
+        assert_eq!(
+            app.repo_picker_labels(),
+            Some(
+                [
+                    "All repos".to_string(),
+                    "api (ra)".to_string(),
+                    "api (rb)".to_string(),
+                ]
+                .as_slice()
+            ),
+            "picker labels remain presentation-only"
+        );
+        app.reduce(Msg::Back);
+        assert_eq!(
+            choose_repo(&mut app, RepoFilter::Only("ra".into())),
+            vec![Effect::PersistRepoView(RepoFilter::Only("ra".into()))],
+            "the persisted value is the stable identity"
+        );
+        assert_eq!(
+            ids(&app.filtered_rows()),
+            vec!["ra-ready"],
+            "the ready row matches the selected attribution identity"
+        );
+
+        let token = submit(&mut app, "work");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![attributed_row("ra", "api", "ra-search", 1)]),
+        });
+        assert_eq!(
+            ids(&app.filtered_rows()),
+            vec!["ra-search"],
+            "the same repository remains selected when its search label differs"
+        );
+    }
+
+    #[test]
+    fn configured_unknown_prefix_is_distinct_from_unattributed_bucket() {
+        let mut app = app_with(vec![
+            attributed_row("unknown", "unknown", "unknown-1", 1),
+            unattributed_row("unknown", "zz-unattributed", 1),
+        ]);
+
+        app.reduce(Msg::OpenRepoPicker);
+        assert_eq!(
+            app.repo_picker_choices().unwrap().len(),
+            3,
+            "all, the configured prefix, and the unattributed bucket are distinct"
+        );
+        assert!(
+            app.repo_picker_choices()
+                .unwrap()
+                .contains(&RepoFilter::Unknown),
+            "the unattributed bucket has its own tagged choice"
+        );
+        let labels = app.repo_picker_labels().unwrap();
+        assert_ne!(
+            labels[1], labels[2],
+            "the configured prefix and unattributed bucket have distinct labels"
+        );
+        app.reduce(Msg::Back);
+
+        choose_repo(&mut app, RepoFilter::Only("unknown".into()));
+        assert_eq!(
+            ids(&app.filtered_rows()),
+            vec!["unknown-1"],
+            "selecting the configured prefix excludes unattributed rows"
+        );
+    }
+
+    #[test]
+    fn picker_disambiguates_duplicate_labels_merged_from_ready_and_search() {
+        let mut app = app_with(vec![attributed_row("ra", "api", "ra-ready", 1)]);
+        let token = submit(&mut app, "work");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![attributed_row("rb", "api", "rb-search", 1)]),
+        });
+
+        app.reduce(Msg::OpenRepoPicker);
+
+        assert_eq!(
+            app.repo_picker_choices(),
+            Some(
+                [
+                    RepoFilter::All,
+                    RepoFilter::Only("ra".into()),
+                    RepoFilter::Only("rb".into()),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            app.repo_picker_labels(),
+            Some(
+                [
+                    "All repos".to_string(),
+                    "api (prefix ra)".to_string(),
+                    "api (prefix rb)".to_string(),
+                ]
+                .as_slice()
+            ),
+            "identical cross-list labels include their stable identities"
+        );
+    }
+
+    #[test]
+    fn picker_disambiguation_cannot_create_a_second_label_collision() {
+        let mut app = app_with(vec![
+            attributed_row("ra", "api", "ra-ready", 1),
+            attributed_row("rc", "api (ra)", "rc-ready", 1),
+        ]);
+        let token = submit(&mut app, "work");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![attributed_row("rb", "api", "rb-search", 1)]),
+        });
+
+        app.reduce(Msg::OpenRepoPicker);
+
+        let labels = app.repo_picker_labels().expect("picker is open");
+        let unique: std::collections::HashSet<&str> = labels.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "every distinct repository identity has a visually unique label"
+        );
+    }
+
+    #[test]
+    fn persistence_warning_tracks_only_the_current_repo_view() {
+        let mut app = app_with(vec![row("repo-a", "a-1", 1), row("repo-b", "b-1", 1)]);
+        choose_repo(&mut app, RepoFilter::Only("repo-b".into()));
+
+        app.reduce(Msg::RepoViewPersisted {
+            repo: RepoFilter::Only("repo-b".into()),
+            result: Err("couldn't save repository view: denied".into()),
+        });
+        assert_eq!(
+            app.persistence_warning(),
+            Some("couldn't save repository view: denied")
+        );
+
+        choose_repo(&mut app, RepoFilter::All);
+        app.reduce(Msg::RepoViewPersisted {
+            repo: RepoFilter::Only("repo-b".into()),
+            result: Err("stale failure".into()),
+        });
+        assert_eq!(
+            app.persistence_warning(),
+            Some("couldn't save repository view: denied"),
+            "stale completion cannot replace the warning"
+        );
+        app.reduce(Msg::RepoViewPersisted {
+            repo: RepoFilter::All,
+            result: Ok(()),
+        });
+        assert_eq!(app.persistence_warning(), None);
+    }
+
+    #[test]
+    fn confirming_unchanged_repo_retries_after_persistence_failure() {
+        let mut app = app_with(vec![row("repo-a", "a-1", 1), row("repo-b", "b-1", 1)]);
+        let repo_b = RepoFilter::Only("repo-b".into());
+        choose_repo(&mut app, repo_b.clone());
+        app.reduce(Msg::RepoViewPersisted {
+            repo: repo_b.clone(),
+            result: Err("couldn't save repository view: denied".into()),
+        });
+
+        assert_eq!(
+            choose_repo(&mut app, repo_b.clone()),
+            vec![Effect::PersistRepoView(repo_b.clone())],
+            "confirming the unchanged choice retries the failed write"
+        );
+        assert_eq!(app.repo_view(), &repo_b);
+
+        app.reduce(Msg::RepoViewPersisted {
+            repo: repo_b,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.persistence_warning(),
+            None,
+            "a successful retry clears the warning"
+        );
+    }
+
+    #[test]
+    fn picker_keeps_stale_active_choice_and_freezes_during_refresh() {
+        let mut app = App::with_repo_view(RepoFilter::Only("missing-repo".into()));
+        app.hydrate_from_cache(snapshot(vec![row("repo-a", "a-1", 1)]));
+        app.reduce(Msg::OpenRepoPicker);
+        assert_eq!(
+            app.repo_picker_choices(),
+            Some(
+                [
+                    RepoFilter::All,
+                    RepoFilter::Only("missing-repo".into()),
+                    RepoFilter::Only("repo-a".into()),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(app.repo_picker_cursor(), Some(1));
+
+        app.reduce(completed(vec![row("repo-z", "z-1", 1)]));
+
+        assert_eq!(
+            app.repo_picker_choices(),
+            Some(
+                [
+                    RepoFilter::All,
+                    RepoFilter::Only("missing-repo".into()),
+                    RepoFilter::Only("repo-a".into()),
+                ]
+                .as_slice()
+            ),
+            "background refresh does not mutate the open modal snapshot"
+        );
+        assert_eq!(app.repo_picker_cursor(), Some(1));
+        assert_eq!(
+            app.reduce(Msg::ConfirmRepoPicker),
+            Vec::new(),
+            "confirming a stale but already-active view is safe"
+        );
+    }
+
     fn ids(rows: &[&Row]) -> Vec<String> {
         rows.iter().map(|r| r.issue.id.clone()).collect()
+    }
+
+    fn choose_repo(app: &mut App, choice: RepoFilter) -> Vec<Effect> {
+        app.reduce(Msg::OpenRepoPicker);
+        let index = app
+            .repo_picker_choices()
+            .unwrap()
+            .iter()
+            .position(|candidate| candidate == &choice)
+            .expect("repository picker contains requested choice");
+        for _ in 0..app.repo_picker_cursor().unwrap() {
+            app.reduce(Msg::RepoPickerPrev);
+        }
+        for _ in 0..index {
+            app.reduce(Msg::RepoPickerNext);
+        }
+        app.reduce(Msg::ConfirmRepoPicker)
     }
 
     /// Representative native and structured `bd show` detail for `id`.
@@ -1321,9 +1881,10 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 1)]);
         app.reduce(Msg::OpenDetail); // Detail, bound to ra-1, selection 0
 
-        app.reduce(Msg::CycleRepoFilter);
+        app.reduce(Msg::OpenRepoPicker);
         app.reduce(Msg::TogglePriorityFilter);
-        assert_eq!(app.filter().repo(), &RepoFilter::All, "filters frozen");
+        assert!(!app.repo_picker_open(), "picker is inert in detail");
+        assert_eq!(app.repo_view(), &RepoFilter::All, "filters frozen");
         assert_eq!(app.selection(), Some(0), "selection untouched by filters");
 
         app.reduce(Msg::Back);
@@ -1663,7 +2224,7 @@ mod tests {
             row("repo-a", "ra-2", 1),
             row("repo-b", "rb-1", 1),
         ]);
-        app.reduce(Msg::CycleRepoFilter); // Only("repo-a"): shows ra-1, ra-2
+        choose_repo(&mut app, RepoFilter::Only("repo-a".into()));
         app.reduce(Msg::SelectNext); // selection 1 -> ra-2
         let ready_filter = app.filter().clone();
         let ready_selection = app.selection();
@@ -2186,8 +2747,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_filter_cycles() {
-        // repo-a appears first, then repo-b.
+    fn repo_picker_confirms_repository_views() {
         let mut app = app_with(vec![
             row("repo-a", "ra-1", 1),
             row("repo-a", "ra-2", 1),
@@ -2195,17 +2755,17 @@ mod tests {
         ]);
         assert_eq!(app.filtered_rows().len(), 3, "All: every row visible");
 
-        app.reduce(Msg::CycleRepoFilter);
-        assert_eq!(app.filter().repo(), &RepoFilter::Only("repo-a".into()));
+        choose_repo(&mut app, RepoFilter::Only("repo-a".into()));
+        assert_eq!(app.repo_view(), &RepoFilter::Only("repo-a".into()));
         assert_eq!(ids(&app.filtered_rows()), vec!["ra-1", "ra-2"]);
         assert_eq!(app.selection(), Some(0), "selection stays valid");
 
-        app.reduce(Msg::CycleRepoFilter);
-        assert_eq!(app.filter().repo(), &RepoFilter::Only("repo-b".into()));
+        choose_repo(&mut app, RepoFilter::Only("repo-b".into()));
+        assert_eq!(app.repo_view(), &RepoFilter::Only("repo-b".into()));
         assert_eq!(ids(&app.filtered_rows()), vec!["rb-1"]);
 
-        app.reduce(Msg::CycleRepoFilter);
-        assert_eq!(app.filter().repo(), &RepoFilter::All, "cycles back to All");
+        choose_repo(&mut app, RepoFilter::All);
+        assert_eq!(app.repo_view(), &RepoFilter::All);
         assert_eq!(app.filtered_rows().len(), 3);
     }
 
@@ -2230,6 +2790,21 @@ mod tests {
         app.reduce(Msg::TogglePriorityFilter);
         assert_eq!(app.filter().priority(), PriorityFilter::All);
         assert_eq!(app.filtered_rows().len(), 4, "toggles back to all");
+    }
+
+    #[test]
+    fn global_repo_view_combines_with_list_local_priority() {
+        let mut app = app_with(vec![
+            row("repo-a", "a-high", 1),
+            row("repo-a", "a-low", 2),
+            row("repo-b", "b-high", 0),
+        ]);
+        app.reduce(Msg::TogglePriorityFilter);
+
+        choose_repo(&mut app, RepoFilter::Only("repo-a".into()));
+
+        assert_eq!(app.filter().priority(), PriorityFilter::HighOnly);
+        assert_eq!(ids(&app.filtered_rows()), vec!["a-high"]);
     }
 
     #[test]
@@ -2415,8 +2990,8 @@ mod tests {
     #[test]
     fn filters_persist_and_recompute_across_refresh() {
         let mut app = app_with(vec![row("repo-a", "ra-1", 1), row("repo-b", "rb-1", 1)]);
-        app.reduce(Msg::CycleRepoFilter); // Only("repo-a")
-        assert_eq!(app.filter().repo(), &RepoFilter::Only("repo-a".into()));
+        choose_repo(&mut app, RepoFilter::Only("repo-a".into()));
+        assert_eq!(app.repo_view(), &RepoFilter::Only("repo-a".into()));
 
         // A new snapshot (different rows, still has repo-a) keeps the filter.
         app.reduce(completed(vec![
@@ -2425,7 +3000,7 @@ mod tests {
             row("repo-b", "rb-9", 1),
         ]));
         assert_eq!(
-            app.filter().repo(),
+            app.repo_view(),
             &RepoFilter::Only("repo-a".into()),
             "the active filter survives a refresh"
         );
@@ -2462,7 +3037,7 @@ mod tests {
             let msg = match next() % 6 {
                 0 => Msg::SelectNext,
                 1 => Msg::SelectPrev,
-                2 => Msg::CycleRepoFilter,
+                2 => Msg::OpenRepoPicker,
                 3 => Msg::TogglePriorityFilter,
                 4 => Msg::RefreshStarted,
                 _ => {

@@ -21,10 +21,12 @@ use fbd::config::Paths;
     version,
     about = "Federated Beads: a read-only view across your beads repos",
     after_help = "Run `fbd` with no command to launch the interactive TUI \
-                  (ready list, detail pane, search). Keys: j/k move, f repo \
-                  filter, p priority filter, / search, Enter detail, y copy \
+                  (ready list, detail pane, search). Keys: j/k move, f repository \
+                  picker, p priority filter, / search, Enter detail, y copy \
                   `cd … && bd show <id>`, Y copy a markdown block, r refresh, \
-                  Esc back, q quit.\n\n\
+                  Esc back, q quit. The last confirmed repository view is \
+                  restored on the next launch; All repos is the first-run \
+                  default.\n\n\
                   First run: `fbd repos discover ~/dev --add` then `fbd`."
 )]
 struct Cli {

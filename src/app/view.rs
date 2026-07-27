@@ -16,7 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use super::{App, DetailState, Row, SearchPhase, ViewMode};
 use crate::cli::{format_row_body, sanitize};
@@ -33,7 +33,7 @@ const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p t
 /// the UI never promises an inert command; `enter detail` is live as of Slice 10
 /// and `/ search` as of Slice 11.
 const LIST_HINTS: &str =
-    "fbd · q quit · r refresh · / search · f repo · p prio · j/k move · enter detail";
+    "fbd · q quit · r refresh · / search · f repos · p prio · j/k move · enter detail";
 
 /// One-line key hints for the detail pane: `j`/`k` move through beads, while
 /// `J`/`K` and PageUp/PageDown scroll the pane.
@@ -45,7 +45,7 @@ const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc ca
 /// One-line key hints while browsing search results: the keys that act there
 /// (`f`/`p` filter the results the same as the ready list).
 const SEARCH_RESULTS_HINTS: &str =
-    "fbd search · j/k move · f repo · p prio · enter open · esc edit · q quit";
+    "fbd search · j/k move · f repos · p prio · enter open · esc edit · q quit";
 
 /// One-line key hints while a search is pending or failed: only these act there
 /// (navigation and detail-open are inert until results arrive).
@@ -97,7 +97,103 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) -> Option<u16> {
         Paragraph::new(status_line(app, now)).style(Style::default().add_modifier(Modifier::DIM)),
         status_area,
     );
+    if app.repo_picker_open() {
+        draw_repo_picker(frame, app);
+    }
     detail_max_scroll
+}
+
+/// Render the repository picker last so it overlays, rather than replaces, the
+/// current ready/search screen.
+fn draw_repo_picker(frame: &mut Frame, app: &App) {
+    let Some(choices) = app.repo_picker_choices() else {
+        return;
+    };
+    let Some(labels) = app.repo_picker_labels() else {
+        return;
+    };
+    let frame_area = frame.area();
+    if frame_area.width == 0 || frame_area.height == 0 || choices.len() != labels.len() {
+        return;
+    }
+
+    let longest = labels
+        .iter()
+        .map(|label| sanitize(label))
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let desired_width = longest.saturating_add(6).max(40);
+    let width = desired_width.min(frame_area.width as usize) as u16;
+    let desired_height = choices.len().saturating_add(3);
+    let height = desired_height.min(frame_area.height as usize) as u16;
+    let area = Rect {
+        x: frame_area
+            .x
+            .saturating_add(frame_area.width.saturating_sub(width) / 2),
+        y: frame_area
+            .y
+            .saturating_add(frame_area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Select repository");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let cursor = app.repo_picker_cursor().unwrap_or(0).min(choices.len() - 1);
+    let option_height = inner.height.saturating_sub(1) as usize;
+    let start = if option_height == 0 {
+        cursor
+    } else {
+        cursor.saturating_sub(option_height - 1)
+    };
+    let mut lines = Vec::with_capacity(option_height);
+    for (index, (choice, label)) in choices
+        .iter()
+        .zip(labels)
+        .enumerate()
+        .skip(start)
+        .take(option_height)
+    {
+        let active = if choice == app.repo_view() {
+            "●"
+        } else {
+            " "
+        };
+        let line = Line::from(format!("{active} {}", sanitize(label)));
+        lines.push(if index == cursor {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        });
+    }
+    if option_height > 0 {
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                height: inner.height.saturating_sub(1),
+                ..inner
+            },
+        );
+    }
+    let hint_area = Rect {
+        y: inner.y.saturating_add(inner.height.saturating_sub(1)),
+        height: 1,
+        ..inner
+    };
+    frame.render_widget(
+        Paragraph::new("j/k move · enter select · esc cancel")
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        hint_area,
+    );
 }
 
 /// Split the content area for the detail view: the list keeps its full rendering
@@ -362,6 +458,9 @@ fn status_line(app: &App, now: SystemTime) -> String {
     if let Some(flash) = app.copy_flash() {
         status.push_str(&format!(" · copied: {}", sanitize(flash)));
     }
+    if let Some(warning) = app.persistence_warning() {
+        status.push_str(&format!(" · {}", sanitize(warning)));
+    }
     let warnings = app.status_warnings();
     if let Some(first) = warnings.first() {
         // Sanitize at the render boundary: warnings embed bd stderr / paths and
@@ -399,7 +498,7 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Msg;
+    use crate::app::{Msg, RepoFilter};
     use crate::bd::Issue;
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
@@ -428,6 +527,7 @@ mod tests {
                 dependent_count: None,
                 comment_count: None,
             },
+            repo_id: Some(repo.to_string()),
             repo_name: repo.to_string(),
         }
     }
@@ -497,6 +597,60 @@ mod tests {
     }
 
     #[test]
+    fn repo_picker_overlays_with_active_and_pending_choices() {
+        let mut app = app_with(
+            vec![row("repo-a", "a-1", 1, "A"), row("repo-b", "b-1", 1, "B")],
+            vec![],
+        );
+        app.reduce(Msg::OpenRepoPicker);
+        app.reduce(Msg::RepoPickerNext);
+
+        let buf = render(&app, at(1000));
+
+        assert!(find_line(&buf, "Select repository").is_some());
+        assert!(find_line(&buf, "● All repos").is_some());
+        assert!(
+            (0..H).any(|y| {
+                line_text(&buf, y).contains("repo-a")
+                    && (0..W).any(|x| {
+                        buf.cell((x, y))
+                            .unwrap()
+                            .modifier
+                            .contains(Modifier::REVERSED)
+                    })
+            }),
+            "pending choice is highlighted independently of the active marker"
+        );
+        assert!(find_line(&buf, "j/k move · enter select · esc cancel").is_some());
+    }
+
+    #[test]
+    fn repo_picker_scrolls_sanitizes_and_handles_tiny_frames() {
+        let mut rows = Vec::new();
+        for index in 0..12 {
+            let repo = if index == 11 {
+                "zz\nrepo".to_string()
+            } else {
+                format!("repo-{index:02}")
+            };
+            rows.push(row(&repo, &format!("id-{index}"), 1, "work"));
+        }
+        let mut app = app_with(rows, vec![]);
+        app.reduce(Msg::OpenRepoPicker);
+        for _ in 0..12 {
+            app.reduce(Msg::RepoPickerNext);
+        }
+
+        let buf = render_sized(&app, at(1000), 50, 8);
+        assert!(
+            find_at(&buf, "zz\u{FFFD}repo", 50, 8).is_some(),
+            "sanitized pending choice scrolls into the short modal"
+        );
+
+        let _ = render_sized(&app, at(1000), 1, 1);
+    }
+
+    #[test]
     fn renders_selection_highlight() {
         let mut app = app_with(
             vec![
@@ -544,6 +698,23 @@ mod tests {
             status.contains("export failed for reading-lite"),
             "status shows the actual warning text, not a doctor redirect: {status:?}"
         );
+    }
+
+    #[test]
+    fn status_keeps_persistence_warning_separate_from_refresh_warnings() {
+        let mut app = app_with(
+            vec![row("repo-a", "a-1", 1, "A")],
+            vec!["refresh warning".into()],
+        );
+        app.reduce(Msg::RepoViewPersisted {
+            repo: RepoFilter::All,
+            result: Err("save warning".into()),
+        });
+
+        let status = status_line(&app, at(1000));
+
+        assert!(status.contains("save warning"));
+        assert!(status.contains("refresh warning"));
     }
 
     #[test]

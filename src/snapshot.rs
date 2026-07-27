@@ -24,14 +24,17 @@ pub const UNKNOWN_REPO: &str = "unknown";
 /// is noise in a federated view of *this* user's work.
 const HIDDEN_REPOS: &[&str] = &["beads"];
 
-/// One ready issue plus the source repo it was attributed to. `repo_name` is the
-/// repo directory's basename, or `"basename (prefix)"` when another attributed
-/// repo shares that basename (so grouping/filtering never conflates two repos —
-/// see [`fetch`]), or [`UNKNOWN_REPO`] when unattributed. Never a filesystem
-/// path: the serialized snapshot must not leak local layout.
+/// One ready issue plus the source repo it was attributed to. `repo_id` is the
+/// stable, non-sensitive issue prefix used for filtering; it is absent for
+/// unattributed rows and old cached snapshots. `repo_name` is the presentation
+/// label: the repo directory's basename, or `"basename (prefix)"` when another
+/// attributed repo in this result set shares that basename, or [`UNKNOWN_REPO`]
+/// when unattributed. Neither field contains a filesystem path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub issue: Issue,
+    #[serde(default, skip_serializing)]
+    pub repo_id: Option<String>,
     pub repo_name: String,
 }
 
@@ -94,11 +97,18 @@ pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemT
     let mut rows: Vec<Row> = attributed
         .into_iter()
         .map(|(issue, repo)| {
-            let repo_name = match repo {
-                Some((prefix, path)) => display_name(prefix, path, &by_basename),
-                None => UNKNOWN_REPO.to_string(),
+            let (repo_id, repo_name) = match repo {
+                Some((prefix, path)) => (
+                    Some(prefix.to_string()),
+                    display_name(prefix, path, &by_basename),
+                ),
+                None => (None, UNKNOWN_REPO.to_string()),
             };
-            Row { issue, repo_name }
+            Row {
+                issue,
+                repo_id,
+                repo_name,
+            }
         })
         .collect();
 
@@ -360,6 +370,14 @@ mod tests {
         // keeps the two repos distinct.
         assert_eq!(name("ra-1"), "api (ra)");
         assert_eq!(name("rb-1"), "api (rb)");
+        assert_eq!(
+            snap.rows
+                .iter()
+                .find(|row| row.issue.id == "ra-1")
+                .and_then(|row| row.repo_id.as_deref()),
+            Some("ra"),
+            "stable identity is independent of the disambiguated label"
+        );
         assert!(
             !name("ra-1").contains('/') && !name("rb-1").contains('/'),
             "display labels never contain a filesystem path"
@@ -399,6 +417,10 @@ mod tests {
         assert_eq!(
             first.get("repo_name").and_then(|v| v.as_str()),
             Some("session-tui")
+        );
+        assert!(
+            first.get("repo_id").is_none(),
+            "the internal picker identity is not part of public snapshot JSON"
         );
         assert_eq!(
             first

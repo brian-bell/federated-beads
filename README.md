@@ -56,7 +56,7 @@ and is disposable derived data (see `fbd reset`).
 | -------------- | --------------------------------------------------------- |
 | `j` / `↓`      | Move selection down (scrolls the detail pane in detail)   |
 | `k` / `↑`      | Move selection up                                         |
-| `f`            | Cycle the repo filter: All → repo₀ → … → All              |
+| `f`            | Open the repository picker (`All repos` is first)          |
 | `p`            | Toggle the priority filter: All ↔ P0/P1 only              |
 | `/`            | Open cross-repo search                                    |
 | `Enter`        | Open the detail pane for the selected issue               |
@@ -65,6 +65,12 @@ and is disposable derived data (see `fbd reset`).
 | `r`            | Refresh (re-export every repo, re-sync the hub)           |
 | `Esc`          | Leave the current sub-mode (detail / search) → list       |
 | `q`            | Quit                                                      |
+
+The repository picker is available from the ready list and settled search
+results. Move its pending choice with `j`/`k` or the arrow keys, confirm with
+`Enter`, or cancel with `Esc`. A confirmed repository view applies globally to
+both ready and search results and is restored on the next launch. `All repos`
+is used on first run and whenever saved UI state is missing or invalid.
 
 `y`/`Y` place the text on your system clipboard via an **OSC 52** terminal
 escape — no native clipboard dependency, and it works over ssh. For an
@@ -93,6 +99,10 @@ platform config dir (`~/.config` on Linux, `~/Library/Application Support` on
 macOS); the `repos` subcommands edit it, and `fbd doctor` prints the exact
 paths in use. Missing paths warn, never fail.
 
+The last confirmed repository view is stored independently at
+`federated-beads/ui_state.json` under the platform data directory. `fbd reset`
+does not remove this user preference; it only discards derived hub/cache data.
+
 ## Architecture
 
 ```
@@ -116,13 +126,16 @@ Source repos            fbd                              Hub (bd workspace)
   refreshes across concurrent fbd instances.
 - **State core**: the whole TUI is a pure `reduce(&mut App, Msg) -> Vec<Effect>`
   state machine (no I/O, no clock, no threads inside), so it is exhaustively
-  unit-tested; the runtime performs the effects.
+  unit-tested; the runtime performs the effects. The last confirmed repository
+  view is stored separately in versioned `ui_state.json`; snapshot-cache
+  freshness and roster configuration remain independent.
 
-Module map: `config` (roster + XDG paths) · `bd` (the `BdClient` trait, real
-subprocess + fake impls, serde types) · `hub` (lifecycle) · `refresh` (export +
-sync + prefix map) · `snapshot` (the read model) · `app` (`reduce` core,
-`view` renderer, `keys` mapping, `context` copy builders) · `runtime` (the event
-loop and workers) · `cli` (headless subcommands).
+Module map: `config` (roster + XDG paths) · `ui_state` (persisted TUI
+preferences) · `bd` (the `BdClient` trait, real subprocess + fake impls, serde
+types) · `hub` (lifecycle) · `refresh` (export + sync + prefix map) · `snapshot`
+(the read model) · `app` (`reduce` core, `view` renderer, `keys` mapping,
+`context` copy builders) · `runtime` (the event loop and workers) · `cli`
+(headless subcommands).
 
 ## Verification commands
 
