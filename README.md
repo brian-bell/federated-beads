@@ -13,18 +13,31 @@ copy-context key hands you a ready-to-run command.
 
 ## Requirements
 
-- Rust (edition 2024) toolchain.
 - `bd` (beads) **>= 1.1.0** with `schema_version == 1` on `PATH` at runtime.
   fbd checks this at startup and refuses a version it cannot vouch for.
 
+Prebuilt binaries are available for Apple Silicon and Intel macOS, plus ARM64
+and x86_64 GNU/Linux. Building from source requires Rust 1.88 or newer.
+
 ## Install
+
+Install the `0.1.0-rc.1` prerelease:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/brian-bell/federated-beads/releases/download/v0.1.0-rc.1/fbd-installer.sh | sh
+```
+
+The installer places `fbd` in `$CARGO_HOME/bin`, falling back to
+`~/.cargo/bin`, and tells you if that directory needs to be added to `PATH`.
+`bd` remains a separate runtime requirement.
+
+To build from a local source checkout instead:
 
 ```bash
 cargo install --path .
 ```
 
-This builds and installs the `fbd` binary into `~/.cargo/bin` (ensure it is on
-your `PATH`).
+This builds and installs `fbd` into Cargo's binary directory.
 
 ## Quickstart
 
