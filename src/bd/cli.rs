@@ -6,7 +6,7 @@ use std::process::Command;
 
 use serde::de::DeserializeOwned;
 
-use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail};
+use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail, ShowDetail};
 
 /// The real [`BdClient`]: every method shells out to the `bd` binary on PATH.
 #[derive(Debug, Clone)]
@@ -57,6 +57,12 @@ impl BdCli {
     /// (repo add/export/repo sync) that print status text, not JSON.
     fn run_ok(&self, args: Vec<OsString>) -> Result<(), BdError> {
         self.run_capture(&args, None).map(|_| ())
+    }
+
+    /// Spawn `bd <args>`, require exit success, and return human-readable stdout.
+    fn run_text(&self, args: Vec<OsString>) -> Result<String, BdError> {
+        self.run_capture(&args, None)
+            .map(|stdout| String::from_utf8_lossy(&stdout).into_owned())
     }
 
     /// Spawn `bd <args>` (optionally with `cwd` as the working directory),
@@ -173,6 +179,10 @@ fn argv_ready(hub: &Path) -> Vec<OsString> {
 }
 
 fn argv_show(hub: &Path, id: &str) -> Vec<OsString> {
+    vec!["-C".into(), arg(hub), "show".into(), id.into()]
+}
+
+fn argv_show_json(hub: &Path, id: &str) -> Vec<OsString> {
     vec![
         "-C".into(),
         arg(hub),
@@ -236,12 +246,17 @@ impl BdClient for BdCli {
         self.run_json(argv_ready(hub))
     }
 
-    fn show(&self, hub: &Path, id: &str) -> Result<IssueDetail, BdError> {
-        let details: Vec<IssueDetail> = self.run_json(argv_show(hub, id))?;
-        IssueDetail::into_single(details).map_err(|e| BdError {
-            command: self.command_line(&argv_show(hub, id)),
+    fn show(&self, hub: &Path, id: &str) -> Result<ShowDetail, BdError> {
+        let output = self.run_text(argv_show(hub, id))?;
+        let details: Vec<IssueDetail> = self.run_json(argv_show_json(hub, id))?;
+        let detail = IssueDetail::into_single(details).map_err(|e| BdError {
+            command: self.command_line(&argv_show_json(hub, id)),
             stderr: e.to_string(),
             kind: BdErrorKind::Shape,
+        })?;
+        Ok(ShowDetail {
+            output,
+            issue: detail.issue,
         })
     }
 
@@ -309,6 +324,10 @@ mod tests {
 
         assert_eq!(
             argv_show(Path::new("/tmp/hub"), "ra-2hc"),
+            os(&["-C", "/tmp/hub", "show", "ra-2hc"])
+        );
+        assert_eq!(
+            argv_show_json(Path::new("/tmp/hub"), "ra-2hc"),
             os(&["-C", "/tmp/hub", "show", "ra-2hc", "--json"])
         );
 

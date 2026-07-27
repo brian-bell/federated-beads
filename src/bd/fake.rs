@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::{BdClient, BdError, BdVersion, Issue, IssueDetail};
+use super::{BdClient, BdError, BdVersion, Issue, ShowDetail};
 
 /// One recorded invocation, so tests can assert call ordering/count (e.g.
 /// "export A, export B, then sync once").
@@ -50,7 +50,7 @@ pub struct FakeBdClient {
     repo_list: Option<Result<serde_json::Value, BdError>>,
     repo_sync: Option<Result<(), BdError>>,
     ready: Option<Result<Vec<Issue>, BdError>>,
-    show: Option<Result<IssueDetail, BdError>>,
+    show: Option<Result<ShowDetail, BdError>>,
     search: Option<Result<Vec<Issue>, BdError>>,
     export_errs: HashMap<PathBuf, BdError>,
     issue_prefixes: HashMap<PathBuf, String>,
@@ -106,8 +106,11 @@ impl FakeBdClient {
         self
     }
 
-    pub fn with_show(mut self, detail: IssueDetail) -> Self {
-        self.show = Some(Ok(detail));
+    pub fn with_show(mut self, output: impl Into<String>, issue: Issue) -> Self {
+        self.show = Some(Ok(ShowDetail {
+            output: output.into(),
+            issue,
+        }));
         self
     }
 
@@ -228,14 +231,14 @@ impl BdClient for FakeBdClient {
         resolve(&self.ready, Vec::new)
     }
 
-    fn show(&self, hub: &Path, id: &str) -> Result<IssueDetail, BdError> {
+    fn show(&self, hub: &Path, id: &str) -> Result<ShowDetail, BdError> {
         self.record(Call::Show(hub.to_path_buf(), id.to_string()));
         match &self.show {
             Some(r) => r.clone(),
             None => Err(BdError {
-                command: format!("bd -C {} show {id} --json", hub.display()),
+                command: format!("bd -C {} show {id}", hub.display()),
                 stderr: "FakeBdClient: no show response programmed".into(),
-                kind: super::BdErrorKind::Shape,
+                kind: super::BdErrorKind::NonZeroExit { code: Some(1) },
             }),
         }
     }

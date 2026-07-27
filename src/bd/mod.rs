@@ -1,6 +1,6 @@
-//! The `bd` interface layer: serde domain types for every `bd --json` payload
-//! fbd reads, the [`BdClient`] trait fbd calls, and its real ([`BdCli`]) and
-//! fake ([`FakeBdClient`]) implementations.
+//! The `bd` interface layer: serde domain types for `bd --json` payloads fbd
+//! reads, human-readable detail output, the [`BdClient`] trait fbd calls, and its
+//! real ([`BdCli`]) and fake ([`FakeBdClient`]) implementations.
 
 pub mod cli;
 pub mod fake;
@@ -12,6 +12,14 @@ pub use fake::{Call, FakeBdClient};
 pub use types::{BdShapeError, BdVersion, Dependency, Issue, IssueDetail};
 
 use std::path::Path;
+
+/// One `bd show` result: native text for the detail pane plus the structured
+/// issue used by actions such as copying full Markdown context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowDetail {
+    pub output: String,
+    pub issue: Issue,
+}
 
 /// Everything fbd asks of `bd`. All calls are blocking subprocess invocations in
 /// the real impl; the fake makes them synchronous and programmable for tests.
@@ -41,8 +49,8 @@ pub trait BdClient {
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError>;
-    /// `bd -C <hub> show <id> --json` — one issue with its dependencies.
-    fn show(&self, hub: &Path, id: &str) -> Result<IssueDetail, BdError>;
+    /// `bd -C <hub> show <id>` for display plus its structured JSON issue.
+    fn show(&self, hub: &Path, id: &str) -> Result<ShowDetail, BdError>;
     /// `bd -C <hub> search <query> --json` — cross-repo full-text search.
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError>;
 }

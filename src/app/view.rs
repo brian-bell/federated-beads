@@ -19,7 +19,6 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 use super::{App, DetailState, Row, SearchPhase, ViewMode};
-use crate::bd::{Dependency, IssueDetail};
 use crate::cli::{format_row_body, sanitize};
 
 /// Shown when the roster has no rows at all (no repos configured / nothing
@@ -36,9 +35,9 @@ const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p t
 const LIST_HINTS: &str =
     "fbd · q quit · r refresh · / search · f repo · p prio · j/k move · enter detail";
 
-/// One-line key hints for the detail pane: the keys that act there (`j`/`k`
-/// move through the beads behind the pane; `J`/`K` scroll the pane itself).
-const DETAIL_HINTS: &str = "fbd · esc back · j/k move · J/K scroll · q quit";
+/// One-line key hints for the detail pane: `j`/`k` move through beads, while
+/// `J`/`K` and PageUp/PageDown scroll the pane.
+const DETAIL_HINTS: &str = "fbd · esc back · j/k move · J/K scroll · PgUp/PgDn page · q quit";
 
 /// One-line key hints while editing the search query: the keys that act there.
 const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc cancel";
@@ -127,9 +126,8 @@ fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the detail pane for the app's current [`DetailState`]: a loading line, a
-/// fetch-error message, or the loaded issue (title, meta, wrapped description,
-/// blocker dependencies). All bd-sourced text is [`sanitize`]d at the boundary and
-/// wrapped to the pane width.
+/// fetch-error message, or the human-readable `bd show` output. All bd-sourced
+/// text is [`sanitize`]d at the boundary and wrapped to the pane width.
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let lines = match app.detail() {
         Some(DetailState::Loading { id }) => {
@@ -140,7 +138,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(sanitize(message)),
         ],
-        Some(DetailState::Loaded(detail)) => detail_lines(detail),
+        Some(DetailState::Loaded(detail)) => detail_output_lines(&detail.output),
         // Unreachable while `view_mode == Detail` (they are set together), but
         // rendering nothing is a safe fallback rather than a panic.
         None => Vec::new(),
@@ -155,61 +153,14 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph.scroll((offset, 0)), area);
 }
 
-/// Build the wrapped-text lines for a loaded issue detail.
-fn detail_lines(detail: &IssueDetail) -> Vec<Line<'static>> {
-    let issue = &detail.issue;
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-
-    let mut lines = vec![Line::styled(
-        format!("{}  {}", sanitize(&issue.id), sanitize(&issue.title)),
-        bold,
-    )];
-
-    // Meta line: status · priority · type · comment count (present fields only).
-    let mut meta = format!("{} · P{}", sanitize(&issue.status), issue.priority);
-    if let Some(t) = &issue.issue_type {
-        meta.push_str(&format!(" · {}", sanitize(t)));
-    }
-    if let Some(n) = issue.comment_count {
-        meta.push_str(&format!(" · {n} comments"));
-    }
-    lines.push(Line::from(meta));
-
-    if !issue.labels.is_empty() {
-        let labels: Vec<String> = issue.labels.iter().map(|l| sanitize(l)).collect();
-        lines.push(Line::from(format!("labels: {}", labels.join(", "))));
-    }
-
-    if let Some(desc) = &issue.description {
-        lines.push(Line::from(""));
-        lines.push(Line::from(sanitize(desc)));
-    }
-
-    if !detail.dependencies.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::styled("Dependencies:".to_string(), bold));
-        for d in &detail.dependencies {
-            lines.push(Line::from(dependency_line(d)));
-        }
-    }
-
-    lines
-}
-
-/// Format one dependency as `⛔ <type>: <id> <title> (<status>)`, defaulting the
-/// fields bd may omit so a partial `bd show` payload still renders a line. All
-/// bd-sourced fields are [`sanitize`]d.
-fn dependency_line(d: &Dependency) -> String {
-    let kind = d.dependency_type.as_deref().unwrap_or("depends on");
-    let title = d.title.as_deref().unwrap_or("");
-    let status = d.status.as_deref().unwrap_or("?");
-    format!(
-        "⛔ {}: {} {} ({})",
-        sanitize(kind),
-        sanitize(&d.id),
-        sanitize(title),
-        sanitize(status),
-    )
+/// Split `bd show` stdout into renderable rows without reformatting its sections.
+/// Each row is sanitized independently so line breaks survive while terminal
+/// controls cannot reach the renderer.
+fn detail_output_lines(output: &str) -> Vec<Line<'static>> {
+    output
+        .lines()
+        .map(|line| Line::from(sanitize(line)))
+        .collect()
 }
 
 /// Build and render the middle list area: the loading placeholder, the empty
@@ -441,7 +392,7 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::app::Msg;
-    use crate::bd::{Dependency, Issue, IssueDetail};
+    use crate::bd::{Issue, ShowDetail};
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -753,41 +704,23 @@ mod tests {
 
     // ---- Detail pane (Slice 10) ----
 
-    fn dep(id: &str, title: &str, status: &str, kind: &str) -> Dependency {
-        Dependency {
-            id: id.into(),
-            title: Some(title.into()),
-            status: Some(status.into()),
-            dependency_type: Some(kind.into()),
-        }
+    fn dep(id: &str, title: &str, status: &str, kind: &str) -> String {
+        format!("⛔ {kind}: {id} {title} ({status})")
     }
 
-    /// Build an `IssueDetail` for `id` with a chosen title/description and deps.
-    fn issue_detail(id: &str, title: &str, desc: &str, deps: Vec<Dependency>) -> IssueDetail {
-        IssueDetail {
-            issue: Issue {
-                id: id.into(),
-                title: title.into(),
-                status: "open".into(),
-                priority: 2,
-                description: Some(desc.into()),
-                issue_type: Some("task".into()),
-                owner: None,
-                labels: Vec::new(),
-                created_at: None,
-                created_by: None,
-                updated_at: None,
-                dependency_count: Some(deps.len() as i64),
-                dependent_count: None,
-                comment_count: Some(0),
-            },
-            dependencies: deps,
+    /// Build representative human-readable `bd show` output for layout tests.
+    fn issue_detail(id: &str, title: &str, desc: &str, deps: Vec<String>) -> String {
+        let mut output = format!("{id}  {title}\nopen · P2 · task · 0 comments\n\n{desc}");
+        if !deps.is_empty() {
+            output.push_str("\n\nDependencies:\n");
+            output.push_str(&deps.join("\n"));
         }
+        output
     }
 
     /// An app in `Detail` on the (single) row `id`, with the pane advanced to the
     /// given detail via the real reduce path. `None` leaves it `Loading`.
-    fn app_in_detail(id: &str, ready: Option<Result<IssueDetail, String>>) -> App {
+    fn app_in_detail(id: &str, ready: Option<Result<String, String>>) -> App {
         let mut app = app_with(vec![row("session-tui", id, 2, "Blocked task")], vec![]);
         // The single OpenDetail on a fresh app yields request token 1.
         let token = match app.reduce(Msg::OpenDetail).as_slice() {
@@ -797,7 +730,12 @@ mod tests {
         if let Some(detail) = ready {
             app.reduce(Msg::DetailReady {
                 token,
-                detail: detail.map(Box::new),
+                detail: detail.map(|output| {
+                    Box::new(ShowDetail {
+                        output,
+                        issue: row("session-tui", id, 2, "Blocked task").issue,
+                    })
+                }),
             });
         }
         app
@@ -846,6 +784,56 @@ mod tests {
         assert!(dep_row.contains("Blocker task"), "dep title: {dep_row:?}");
         assert!(dep_row.contains("(open)"), "dep status: {dep_row:?}");
         assert!(dep_row.contains('⛔'), "blocker glyph: {dep_row:?}");
+    }
+
+    #[test]
+    fn renders_bd_show_output_without_reformatting() {
+        let output = "\
+○ ra-4zf [TASK] · Native bd title [● P2 · OPEN]
+Owner: Brian Bell · Type: task
+
+DESIGN
+
+  First design line.
+  Second design line.
+
+CHILDREN
+  ↳ ○ ra-child: Follow-up ● P2";
+        let app = app_in_detail("ra-4zf", Some(Ok(output.to_string())));
+        let (w, h) = (120, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        let (header_y, _) = find_at(&buf, "Native bd title", w, h).expect("native bd header");
+        let (design_y, _) = find_at(&buf, "DESIGN", w, h).expect("native design heading");
+        let (children_y, _) = find_at(&buf, "CHILDREN", w, h).expect("native children heading");
+        assert_eq!(header_y, 1, "bd output starts at the top of the pane");
+        assert!(
+            header_y < design_y && design_y < children_y,
+            "bd output line order is preserved"
+        );
+    }
+
+    #[test]
+    fn renders_detail_design_from_bd_show() {
+        let output = "\
+○ ra-4zf [TASK] · Designed task [● P2 · OPEN]
+
+DESIGN
+
+  Keep the reducer pure.
+  Perform I/O in the runtime.";
+        let app = app_in_detail("ra-4zf", Some(Ok(output.into())));
+        let (w, h) = (120, 24);
+        let buf = render_sized(&app, at(1000), w, h);
+
+        assert!(
+            find_at(&buf, "DESIGN", w, h).is_some(),
+            "design section is labeled"
+        );
+        let (first_y, _) = find_at(&buf, "Keep the reducer pure", w, h).expect("first design line");
+        let (second_y, _) =
+            find_at(&buf, "Perform I/O in the runtime", w, h).expect("second design line");
+        assert!(second_y > first_y, "design newlines render as new rows");
     }
 
     #[test]
@@ -1000,9 +988,9 @@ mod tests {
             "dependency starts below the fold"
         );
 
-        // Scroll down enough to reach the end (clamped by the view).
-        for _ in 0..100 {
-            app.reduce(Msg::DetailScrollDown);
+        // Page down enough to reach the end (clamped by the view).
+        for _ in 0..10 {
+            app.reduce(Msg::DetailPageDown);
         }
         let buf = render_sized(&app, at(1000), w, h);
         assert!(
@@ -1018,14 +1006,12 @@ mod tests {
 
     #[test]
     fn renders_detail_labels() {
-        // `bd show` reports labels; the detail pane must surface them.
-        let mut d = issue_detail("ra-4zf", "Blocked task", "desc", vec![]);
-        d.issue.labels = vec!["urgent".into(), "backend".into()];
-        let app = app_in_detail("ra-4zf", Some(Ok(d)));
+        let output = "ra-4zf  Blocked task\nLabels: urgent, backend";
+        let app = app_in_detail("ra-4zf", Some(Ok(output.into())));
         let (w, h) = (80, 24);
         let buf = render_sized(&app, at(1000), w, h);
 
-        let (y, _) = find_at(&buf, "labels:", w, h).expect("labels line present");
+        let (y, _) = find_at(&buf, "Labels:", w, h).expect("labels line present");
         let line: String = (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
         assert!(line.contains("urgent"), "first label shown: {line:?}");
         assert!(line.contains("backend"), "second label shown: {line:?}");

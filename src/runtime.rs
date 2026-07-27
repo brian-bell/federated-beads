@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, Msg, context, keys, view};
-use crate::bd::{BdCli, BdClient, IssueDetail};
+use crate::bd::{BdCli, BdClient};
 use crate::cache;
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
@@ -273,7 +273,7 @@ pub(crate) fn detail_worker(
     let _ = tx.send(Msg::DetailReady { token, detail }.into());
 }
 
-/// Run `bd show <id> --json` against the hub, mapping a [`BdError`] to a
+/// Run `bd show <id>` against the hub, mapping a [`BdError`] to a
 /// pre-formatted, [`sanitize`]d message for the pane. No version gate or
 /// `ensure_hub`: the detail pane is reachable only from the list, i.e. after a
 /// snapshot already hydrated the hub.
@@ -281,7 +281,7 @@ pub(crate) fn gather_detail(
     bd: &impl BdClient,
     paths: &Paths,
     id: &str,
-) -> Result<IssueDetail, String> {
+) -> Result<crate::bd::ShowDetail, String> {
     bd.show(&hub_dir(paths), id)
         .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
 }
@@ -570,7 +570,7 @@ fn set_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bd::{BdError, BdErrorKind, Dependency, FakeBdClient, Issue};
+    use crate::bd::{BdError, BdErrorKind, FakeBdClient, Issue};
     use crate::config::RepoEntry;
     use crate::refresh::HubLock;
     use std::fs;
@@ -734,23 +734,15 @@ mod tests {
         );
     }
 
-    fn detail() -> IssueDetail {
-        IssueDetail {
-            issue: issue("ra-1", 2, "Blocked task"),
-            dependencies: vec![Dependency {
-                id: "ra-z70".into(),
-                title: Some("Blocker task".into()),
-                status: Some("open".into()),
-                dependency_type: Some("blocks".into()),
-            }],
-        }
+    fn detail() -> String {
+        "○ ra-1 [TASK] · Blocked task\n\nDEPENDENCIES\n  → ra-z70: Blocker task".into()
     }
 
     #[test]
     fn detail_worker_sends_ready_for_id() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
-        let bd = FakeBdClient::new().with_show(detail());
+        let bd = FakeBdClient::new().with_show(detail(), issue("ra-1", 2, "Blocked task"));
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || detail_worker(bd, paths, "ra-1".into(), 7, tx));
@@ -760,7 +752,7 @@ mod tests {
                 assert_eq!(token, 7, "the request token is echoed back");
                 let d = detail.expect("a detail on success");
                 assert_eq!(d.issue.id, "ra-1");
-                assert_eq!(d.dependencies.len(), 1);
+                assert!(d.output.contains("ra-z70"));
             }
             other => panic!("expected DetailReady, got {other:?}"),
         }
