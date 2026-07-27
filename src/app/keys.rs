@@ -51,6 +51,8 @@ pub fn map_key(event: KeyEvent, context: InputContext) -> Option<Msg> {
         KeyCode::Char('k') | KeyCode::Up => Some(Msg::SelectPrev),
         KeyCode::Char('J') => Some(Msg::DetailScrollDown),
         KeyCode::Char('K') => Some(Msg::DetailScrollUp),
+        KeyCode::PageDown => Some(Msg::DetailPageDown),
+        KeyCode::PageUp => Some(Msg::DetailPageUp),
         KeyCode::Enter => Some(Msg::OpenDetail),
         KeyCode::Esc => Some(Msg::Back),
         _ => None,
@@ -126,6 +128,14 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('K')), InputContext::Normal),
             Some(Msg::DetailScrollUp)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::PageDown), InputContext::Normal),
+            Some(Msg::DetailPageDown)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::PageUp), InputContext::Normal),
+            Some(Msg::DetailPageUp)
         );
         // While editing a query the same keys are literal text.
         assert_eq!(

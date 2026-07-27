@@ -596,6 +596,7 @@ mod tests {
     fn row(repo_name: &str, id: &str, priority: i64, title: &str) -> Row {
         Row {
             issue: issue(id, priority, title),
+            repo_id: None,
             repo_name: repo_name.to_string(),
         }
     }

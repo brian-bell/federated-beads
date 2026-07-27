@@ -170,6 +170,7 @@ mod tests {
                     dependent_count: None,
                     comment_count: None,
                 },
+                repo_id: None,
                 repo_name: "repo-a".into(),
             }],
             fetched_at,
