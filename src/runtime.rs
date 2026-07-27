@@ -28,6 +28,7 @@ use crate::config::{Config, Paths};
 use crate::hub::{ensure_hub, hub_dir};
 use crate::refresh::{self, RefreshError};
 use crate::snapshot::{self, Row, Snapshot};
+use crate::ui_state;
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -91,18 +92,15 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         thread::spawn(move || input_thread(&tx, &stop))
     };
 
-    let mut app = App::new();
     // A fresh (<12h) on-disk cache paints instantly, before the real refresh
     // below has a chance to land, so launch never sits in `Loading` behind a
     // slow `bd ready` when yesterday's rows would do. `hydrate_from_cache`
     // (unlike `reduce(Msg::RefreshCompleted { .. })`) leaves `stale` alone,
-    // so the born-stale in-flight guard `App::new` reserves for the launch
+    // so the born-stale in-flight guard the constructor reserves for the launch
     // refresh below stays armed the whole time. A stale/missing/corrupt
     // cache is a silent no-op: the app stays `Loading` exactly as before
     // this existed.
-    if let Some(snapshot) = cache::load(paths.cache_file(), SystemTime::now(), roster) {
-        app.hydrate_from_cache(snapshot);
-    }
+    let mut app = initial_app(paths, roster, SystemTime::now());
     // In-flight background workers (refresh *and* detail), tracked so shutdown can
     // wait for the running bd subprocess to finish and release the hub lock —
     // never orphaning a child that would keep mutating the hub after fbd's lock
@@ -134,6 +132,16 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     result
 }
 
+/// Restore persisted UI preferences before hydrating cached rows, preserving
+/// the app's born-stale launch-refresh guard.
+fn initial_app(paths: &Paths, roster: &Config, now: SystemTime) -> App {
+    let mut app = App::with_repo_view(ui_state::load(paths.ui_state_file()));
+    if let Some(snapshot) = cache::load(paths.cache_file(), now, roster) {
+        app.hydrate_from_cache(snapshot);
+    }
+    app
+}
+
 /// The render/reduce loop, factored out so [`event_loop`] can join its threads
 /// whether this returns `Ok` (a `q` quit) or `Err` (a terminal draw failure).
 fn ui_loop(
@@ -156,7 +164,7 @@ fn ui_loop(
                 // pasted `/query` burst can't run `query` as commands); worker
                 // messages pass through. An unmapped key yields no message.
                 let msg = match incoming {
-                    Incoming::Key(key) => keys::map_key(key, app.search_editing()),
+                    Incoming::Key(key) => keys::map_key(key, app.input_context()),
                     Incoming::Msg(msg) => Some(msg),
                 };
                 if let Some(msg) = msg {
@@ -201,6 +209,12 @@ fn execute_effect(
         // a handle to track.
         Effect::WriteClipboard(payload) => {
             write_clipboard(&payload);
+            return;
+        }
+        Effect::PersistRepoView(repo) => {
+            let result = ui_state::save(paths.ui_state_file(), &repo)
+                .map_err(|error| sanitize(&format!("couldn't save repository view: {error}")));
+            let _ = tx.send(Msg::RepoViewPersisted { repo, result }.into());
             return;
         }
     };
@@ -637,6 +651,119 @@ mod tests {
     }
 
     #[test]
+    fn startup_restores_repo_view_before_cache_hydration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let roster = Config::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        ui_state::save(
+            paths.ui_state_file(),
+            &crate::app::RepoFilter::Only("repo-b".into()),
+        )
+        .unwrap();
+        cache::save(
+            paths.cache_file(),
+            &Snapshot {
+                rows: vec![
+                    Row {
+                        issue: issue("a-1", 1, "A"),
+                        repo_name: "repo-a".into(),
+                    },
+                    Row {
+                        issue: issue("b-1", 1, "B"),
+                        repo_name: "repo-b".into(),
+                    },
+                ],
+                fetched_at: now - Duration::from_secs(60),
+            },
+            &roster,
+        )
+        .unwrap();
+
+        let app = initial_app(&paths, &roster, now);
+
+        assert_eq!(
+            app.repo_view(),
+            &crate::app::RepoFilter::Only("repo-b".into())
+        );
+        assert_eq!(
+            app.filtered_rows()
+                .iter()
+                .map(|row| row.issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-1"]
+        );
+        assert!(app.is_stale());
+    }
+
+    #[test]
+    fn persist_repo_view_effect_writes_state_and_reports_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        let repo = crate::app::RepoFilter::Only("repo-b".into());
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        fs::write(paths.cache_file(), b"cache sentinel").unwrap();
+
+        execute_effect(
+            Effect::PersistRepoView(repo.clone()),
+            &tx,
+            &mut handles,
+            &paths,
+            &Config::default(),
+        );
+
+        assert!(
+            handles.is_empty(),
+            "the atomic preference write is synchronous"
+        );
+        assert_eq!(
+            recv_msg(&rx),
+            Msg::RepoViewPersisted {
+                repo: repo.clone(),
+                result: Ok(())
+            }
+        );
+        assert_eq!(ui_state::load(paths.ui_state_file()), repo);
+        assert_eq!(
+            fs::read(paths.cache_file()).unwrap(),
+            b"cache sentinel",
+            "repository preference writes do not rewrite the snapshot cache"
+        );
+    }
+
+    #[test]
+    fn persist_repo_view_failure_is_reported_without_aborting() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("federated-beads"), "not a directory").unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        let repo = crate::app::RepoFilter::Only("repo-b".into());
+
+        execute_effect(
+            Effect::PersistRepoView(repo.clone()),
+            &tx,
+            &mut handles,
+            &paths,
+            &Config::default(),
+        );
+
+        match recv_msg(&rx) {
+            Msg::RepoViewPersisted {
+                repo: attempted,
+                result: Err(message),
+            } => {
+                assert_eq!(attempted, repo);
+                assert!(message.contains("couldn't save repository view"));
+                assert!(!message.chars().any(char::is_control));
+            }
+            other => panic!("expected non-fatal persistence result, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn refresh_task_sends_started_then_completed() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
@@ -962,7 +1089,7 @@ mod tests {
         for code in [KeyCode::Char('/'), KeyCode::Char('q'), KeyCode::Char('k')] {
             let key = KeyEvent::new(code, KeyModifiers::NONE);
             // Mirror the UI loop: decode against the current focus, then reduce.
-            if let Some(msg) = keys::map_key(key, app.search_editing()) {
+            if let Some(msg) = keys::map_key(key, app.input_context()) {
                 app.reduce(msg);
             }
         }

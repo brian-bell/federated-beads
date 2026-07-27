@@ -71,6 +71,7 @@ impl Config {
 const APP_DIR: &str = "federated-beads";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CACHE_FILE_NAME: &str = "snapshot_cache.json";
+const UI_STATE_FILE_NAME: &str = "ui_state.json";
 
 /// Resolved filesystem locations fbd uses. Constructed either from real XDG
 /// roots (`resolve`, only at the process edge) or from an injected base
@@ -81,6 +82,7 @@ pub struct Paths {
     config_file: PathBuf,
     data_dir: PathBuf,
     cache_file: PathBuf,
+    ui_state_file: PathBuf,
 }
 
 impl Paths {
@@ -102,6 +104,12 @@ impl Paths {
         &self.cache_file
     }
 
+    /// Path to the persisted TUI preferences
+    /// (`<data_root>/federated-beads/ui_state.json`).
+    pub fn ui_state_file(&self) -> &Path {
+        &self.ui_state_file
+    }
+
     /// Derive paths from explicit config and data roots. Single source of the
     /// app-dir / file-name join convention.
     fn from_roots(config_root: &Path, data_root: &Path) -> Paths {
@@ -109,6 +117,7 @@ impl Paths {
             config_file: config_root.join(APP_DIR).join(CONFIG_FILE_NAME),
             data_dir: data_root.join(APP_DIR),
             cache_file: data_root.join(APP_DIR).join(CACHE_FILE_NAME),
+            ui_state_file: data_root.join(APP_DIR).join(UI_STATE_FILE_NAME),
         }
     }
 
@@ -189,6 +198,10 @@ mod tests {
             base.join("federated-beads").join("config.toml")
         );
         assert_eq!(paths.data_dir(), base.join("federated-beads"));
+        assert_eq!(
+            paths.ui_state_file(),
+            base.join("federated-beads").join("ui_state.json")
+        );
     }
 
     #[test]
