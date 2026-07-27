@@ -6,7 +6,7 @@ use std::process::Command;
 
 use serde::de::DeserializeOwned;
 
-use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail, ShowDetail};
+use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail};
 
 /// The real [`BdClient`]: every method shells out to the `bd` binary on PATH.
 #[derive(Debug, Clone)]
@@ -246,18 +246,19 @@ impl BdClient for BdCli {
         self.run_json(argv_ready(hub))
     }
 
-    fn show(&self, hub: &Path, id: &str) -> Result<ShowDetail, BdError> {
-        let output = self.run_text(argv_show(hub, id))?;
+    fn show(&self, hub: &Path, id: &str) -> Result<String, BdError> {
+        self.run_text(argv_show(hub, id))
+    }
+
+    fn show_issue(&self, hub: &Path, id: &str) -> Result<Issue, BdError> {
         let details: Vec<IssueDetail> = self.run_json(argv_show_json(hub, id))?;
-        let detail = IssueDetail::into_single(details).map_err(|e| BdError {
-            command: self.command_line(&argv_show_json(hub, id)),
-            stderr: e.to_string(),
-            kind: BdErrorKind::Shape,
-        })?;
-        Ok(ShowDetail {
-            output,
-            issue: detail.issue,
-        })
+        IssueDetail::into_single(details)
+            .map(|detail| detail.issue)
+            .map_err(|e| BdError {
+                command: self.command_line(&argv_show_json(hub, id)),
+                stderr: e.to_string(),
+                kind: BdErrorKind::Shape,
+            })
     }
 
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError> {
@@ -330,7 +331,6 @@ mod tests {
             argv_show_json(Path::new("/tmp/hub"), "ra-2hc"),
             os(&["-C", "/tmp/hub", "show", "ra-2hc", "--json"])
         );
-
         // Flag-like queries stay literal via `--query=`; `--limit 0` = unlimited.
         assert_eq!(
             argv_search(Path::new("/tmp/hub"), "needle"),
@@ -360,6 +360,37 @@ mod tests {
             argv_ready(dir),
             os(&["-C", "/tmp/my repos/rä", "ready", "--limit", "0", "--json"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_spawns_bd_once() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program = tmp.path().join("fake-bd");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+printf 'call\n' >> "${0}.calls"
+case " $* " in
+  *" --json "*) printf '[{"id":"ra-1","title":"Task","status":"open","priority":2}]' ;;
+  *) printf '○ ra-1 [TASK] · Task\n' ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bd = BdCli {
+            program: program.to_string_lossy().into_owned(),
+        };
+        bd.show(Path::new("/tmp/hub"), "ra-1")
+            .expect("native detail loads");
+
+        let calls = fs::read_to_string(format!("{}.calls", program.display())).unwrap();
+        assert_eq!(calls.lines().count(), 1, "one detail open runs one bd show");
     }
 
     /// Non-UTF-8 paths are valid on Unix; the argv must carry their exact bytes

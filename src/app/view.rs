@@ -54,7 +54,7 @@ const SEARCH_WAIT_HINTS: &str = "fbd search · esc edit · q quit";
 /// Render the whole screen for the current [`App`] state and clock `now`: a title
 /// hint row, the mode-specific content (ready list or list+detail split), and the
 /// status bar.
-pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
+pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) -> Option<u16> {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -77,11 +77,17 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
         ViewMode::List | ViewMode::Loading => LIST_HINTS,
     };
     frame.render_widget(Paragraph::new(hints), chunks[0]);
-    match app.view_mode() {
-        ViewMode::Detail => draw_detail_split(frame, app, chunks[1]),
-        ViewMode::Search => draw_search(frame, app, chunks[1]),
-        ViewMode::List | ViewMode::Loading => draw_list(frame, app, chunks[1]),
-    }
+    let detail_max_scroll = match app.view_mode() {
+        ViewMode::Detail => Some(draw_detail_split(frame, app, chunks[1])),
+        ViewMode::Search => {
+            draw_search(frame, app, chunks[1]);
+            None
+        }
+        ViewMode::List | ViewMode::Loading => {
+            draw_list(frame, app, chunks[1]);
+            None
+        }
+    };
     let status_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().add_modifier(Modifier::DIM));
@@ -91,6 +97,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
         Paragraph::new(status_line(app, now)).style(Style::default().add_modifier(Modifier::DIM)),
         status_area,
     );
+    detail_max_scroll
 }
 
 /// Split the content area for the detail view: the list keeps its full rendering
@@ -100,7 +107,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) {
 /// so neither pane is squeezed below usefulness. The pane gets a faint (dim)
 /// rule on the edge it shares with the list plus one column of left padding, so
 /// it reads as its own region without a heavy full frame.
-fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) -> u16 {
     let horizontal = area.width >= 100;
     let direction = if horizontal {
         Direction::Horizontal
@@ -122,13 +129,13 @@ fn draw_detail_split(frame: &mut Frame, app: &App, area: Rect) {
         .padding(Padding::left(1));
     let inner = divider.inner(parts[1]);
     frame.render_widget(divider, parts[1]);
-    draw_detail(frame, app, inner);
+    draw_detail(frame, app, inner)
 }
 
 /// Render the detail pane for the app's current [`DetailState`]: a loading line, a
 /// fetch-error message, or the human-readable `bd show` output. All bd-sourced
 /// text is [`sanitize`]d at the boundary and wrapped to the pane width.
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) -> u16 {
     let lines = match app.detail() {
         Some(DetailState::Loading { id }) => {
             vec![Line::from(format!("Loading {}…", sanitize(id)))]
@@ -151,6 +158,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let max_scroll = content.saturating_sub(area.height);
     let offset = app.detail_scroll().min(max_scroll);
     frame.render_widget(paragraph.scroll((offset, 0)), area);
+    max_scroll
 }
 
 /// Split `bd show` stdout into renderable rows without reformatting its sections.
@@ -392,7 +400,7 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::app::Msg;
-    use crate::bd::{Issue, ShowDetail};
+    use crate::bd::Issue;
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -444,7 +452,11 @@ mod tests {
 
     fn render(app: &App, now: SystemTime) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(W, H)).unwrap();
-        terminal.draw(|f| draw(f, app, now)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, app, now);
+            })
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -728,15 +740,7 @@ mod tests {
             other => panic!("expected one FetchDetail, got {other:?}"),
         };
         if let Some(detail) = ready {
-            app.reduce(Msg::DetailReady {
-                token,
-                detail: detail.map(|output| {
-                    Box::new(ShowDetail {
-                        output,
-                        issue: row("session-tui", id, 2, "Blocked task").issue,
-                    })
-                }),
-            });
+            app.reduce(Msg::DetailReady { token, detail });
         }
         app
     }
@@ -744,7 +748,11 @@ mod tests {
     /// Render at a chosen size (detail split needs width variety).
     fn render_sized(app: &App, now: SystemTime, w: u16, h: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| draw(f, app, now)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = draw(f, app, now);
+            })
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 

@@ -50,7 +50,7 @@ pub enum Msg {
     /// sanitized message on failure (keeping this core free of `bd` error types).
     DetailReady {
         token: u64,
-        detail: Result<Box<ShowDetail>, String>,
+        detail: Result<String, String>,
     },
     /// A cross-repo search concluded (runtime search worker → app). `token` echoes
     /// the request's generation (see [`Effect::Search`]) so a superseded query's
@@ -83,6 +83,10 @@ pub enum Msg {
     /// Scroll the open detail pane one page up (`PageUp`). No-op outside
     /// [`ViewMode::Detail`].
     DetailPageUp,
+    /// Synchronize the stored scroll offset with the maximum visible offset
+    /// computed by the pure renderer. This keeps PageUp relative to what was
+    /// actually displayed after a partial final PageDown.
+    DetailScrollBounds { max_scroll: u16 },
 
     // ---- Filters ----
     /// Cycle the repo filter `All → repo₀ → … → All` (`f`).
@@ -586,6 +590,11 @@ impl App {
                     self.detail_scroll = self.detail_scroll.saturating_sub(DETAIL_PAGE_ROWS);
                 }
             }
+            Msg::DetailScrollBounds { max_scroll } => {
+                if self.view_mode == ViewMode::Detail {
+                    self.detail_scroll = self.detail_scroll.min(max_scroll);
+                }
+            }
             // Filters act on the active browsing list; inert while a pane/editor is up.
             Msg::CycleRepoFilter => {
                 if let Some(list) = self.browsing_list_mut() {
@@ -647,7 +656,15 @@ impl App {
                         .unwrap_or("")
                         .to_string();
                     self.detail = Some(match detail {
-                        Ok(detail) => DetailState::Loaded(detail),
+                        Ok(output) => {
+                            let issue = self
+                                .detail_row
+                                .as_ref()
+                                .expect("detail state always retains its opened row")
+                                .issue
+                                .clone();
+                            DetailState::Loaded(Box::new(ShowDetail { output, issue }))
+                        }
                         // Reuse the id the pane is already bound to (the Loading
                         // state) so the error names the right issue.
                         Err(message) => DetailState::Error { id, message },
@@ -1109,22 +1126,13 @@ mod tests {
     }
 
     /// Representative native and structured `bd show` detail for `id`.
-    fn detail(id: &str) -> Box<ShowDetail> {
-        let mut issue = row("ra", id, 2).issue;
-        issue.description = Some("a description".into());
-        Box::new(ShowDetail {
-            output: format!(
-                "○ {id} [TASK] · title {id} [● P2 · OPEN]\n\nDESCRIPTION\n\n  a description"
-            ),
-            issue,
-        })
+    fn detail(id: &str) -> String {
+        format!("○ {id} [TASK] · title {id} [● P2 · OPEN]\n\nDESCRIPTION\n\n  a description")
     }
 
-    fn detail_with_dependency(id: &str, dependency: &str) -> Box<ShowDetail> {
+    fn detail_with_dependency(id: &str, dependency: &str) -> String {
         let mut detail = detail(id);
-        detail
-            .output
-            .push_str(&format!("\n\nDEPENDENCIES\n  → {dependency}: blocker"));
+        detail.push_str(&format!("\n\nDEPENDENCIES\n  → {dependency}: blocker"));
         detail
     }
 
@@ -1432,6 +1440,24 @@ mod tests {
         app.reduce(Msg::DetailPageDown);
         assert_eq!(app.detail_scroll(), 0, "no pane, no scroll");
         assert_eq!(app.selection(), Some(1), "and the selection does not move");
+    }
+
+    #[test]
+    fn detail_scroll_bounds_clamp_partial_page_before_page_up() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        open(&mut app);
+
+        app.reduce(Msg::DetailPageDown);
+        app.reduce(Msg::DetailPageDown);
+        assert_eq!(app.detail_scroll(), 20, "requested offset may overshoot");
+
+        // Rendering a partial final page reports the visible offset back to the
+        // reducer. PageUp must then move from that visible row, not from the
+        // stale overshoot retained before rendering.
+        app.reduce(Msg::DetailScrollBounds { max_scroll: 11 });
+        assert_eq!(app.detail_scroll(), 11, "stored offset matches the view");
+        app.reduce(Msg::DetailPageUp);
+        assert_eq!(app.detail_scroll(), 1, "moves a full page from row 11");
     }
 
     #[test]
@@ -1784,7 +1810,9 @@ mod tests {
 
     #[test]
     fn copy_in_detail_emits_effect() {
-        let mut app = app_with(vec![row("megaclock", "mc-abc", 1)]);
+        let mut opened = row("megaclock", "mc-abc", 1);
+        opened.issue.description = Some("description from selected row".into());
+        let mut app = app_with(vec![opened]);
         let token = open(&mut app);
         app.reduce(Msg::DetailReady {
             token,
@@ -1795,8 +1823,8 @@ mod tests {
         assert_eq!(r.issue.id, "mc-abc", "copies the opened issue from Detail");
         assert_eq!(
             r.issue.description.as_deref(),
-            Some("a description"),
-            "detail copy retains the full structured description"
+            Some("description from selected row"),
+            "detail copy retains structured data from the selected row"
         );
     }
 

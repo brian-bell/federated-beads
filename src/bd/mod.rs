@@ -13,8 +13,8 @@ pub use types::{BdShapeError, BdVersion, Dependency, Issue, IssueDetail};
 
 use std::path::Path;
 
-/// One `bd show` result: native text for the detail pane plus the structured
-/// issue used by actions such as copying full Markdown context.
+/// One loaded detail: native `bd show` text plus the structured issue retained
+/// from the ready/search row that opened the pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowDetail {
     pub output: String,
@@ -49,8 +49,12 @@ pub trait BdClient {
     fn repo_sync(&self, hub: &Path) -> Result<(), BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError>;
-    /// `bd -C <hub> show <id>` for display plus its structured JSON issue.
-    fn show(&self, hub: &Path, id: &str) -> Result<ShowDetail, BdError>;
+    /// `bd -C <hub> show <id>` — native text for the detail pane.
+    fn show(&self, hub: &Path, id: &str) -> Result<String, BdError>;
+    /// `bd -C <hub> show <id> --json` — structured issue data for an explicit
+    /// Markdown copy request. Kept separate so opening the detail pane never
+    /// performs a second serial read.
+    fn show_issue(&self, hub: &Path, id: &str) -> Result<Issue, BdError>;
     /// `bd -C <hub> search <query> --json` — cross-repo full-text search.
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError>;
 }
