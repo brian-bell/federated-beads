@@ -38,6 +38,9 @@ pub struct RefreshOutcome {
     pub synced_at: SystemTime,
     /// Diagnostic classification of the single sync invocation.
     pub sync_report: RepoSyncReport,
+    /// Complete authoritative repo-prefix map for attributing this sync's hub
+    /// contents, including prefixes that were not eligible for reuse.
+    pub attribution_prefixes: HashMap<PathBuf, String>,
     /// Prefixes proved against the exact nonempty export consumed by this sync.
     /// Runtime sessions may reuse only these entries on their next refresh.
     pub verified_prefixes: HashMap<PathBuf, String>,
@@ -259,12 +262,15 @@ pub(crate) fn run_with_cached_prefixes(
     let outcomes = run_source_jobs(bd, normalized_jobs(roster), worker_limit, cached_prefixes)?;
     let mut errors = Vec::new();
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
+    let mut attribution_prefixes = HashMap::new();
     let mut verified_prefixes = HashMap::new();
     for outcome in outcomes {
         errors.extend(outcome.errors);
         if let Some(prefix) = outcome.prefix {
+            let normalized_path = normalize_path(&outcome.entry.path);
+            attribution_prefixes.insert(normalized_path.clone(), prefix.clone());
             if outcome.verified {
-                verified_prefixes.insert(normalize_path(&outcome.entry.path), prefix.clone());
+                verified_prefixes.insert(normalized_path, prefix.clone());
             }
             pairs.push((prefix, outcome.entry));
         }
@@ -279,6 +285,7 @@ pub(crate) fn run_with_cached_prefixes(
         errors,
         synced_at: SystemTime::now(),
         sync_report,
+        attribution_prefixes,
         verified_prefixes,
     })
 }
@@ -491,22 +498,38 @@ fn stable_export_result(
                 ids,
             }
         }
-        Ok(false) => match fs::rename(&temp, &canonical) {
-            Ok(()) => ExportPublication {
-                errors: Vec::new(),
-                cached_prefix: reuse,
-                ids,
-            },
-            Err(error) => {
-                let mut errors = vec![file_error(repo, "publish export", &canonical, error)];
+        Ok(false) => {
+            if let Err(error) = preserve_canonical_permissions(&canonical, &temp) {
+                let mut errors = vec![file_error(
+                    repo,
+                    "preserve export permissions",
+                    &temp,
+                    error,
+                )];
                 cleanup_temp(repo, &temp, &mut errors);
-                ExportPublication {
+                return ExportPublication {
                     errors,
                     cached_prefix: None,
                     ids: None,
+                };
+            }
+            match fs::rename(&temp, &canonical) {
+                Ok(()) => ExportPublication {
+                    errors: Vec::new(),
+                    cached_prefix: reuse,
+                    ids,
+                },
+                Err(error) => {
+                    let mut errors = vec![file_error(repo, "publish export", &canonical, error)];
+                    cleanup_temp(repo, &temp, &mut errors);
+                    ExportPublication {
+                        errors,
+                        cached_prefix: None,
+                        ids: None,
+                    }
                 }
             }
-        },
+        }
         Err(error) => {
             let mut errors = vec![file_error(repo, "compare export", &temp, error)];
             cleanup_temp(repo, &temp, &mut errors);
@@ -516,6 +539,14 @@ fn stable_export_result(
                 ids: None,
             }
         }
+    }
+}
+
+fn preserve_canonical_permissions(canonical: &Path, temp: &Path) -> std::io::Result<()> {
+    match fs::metadata(canonical) {
+        Ok(metadata) => fs::set_permissions(temp, metadata.permissions()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -746,6 +777,27 @@ mod tests {
                         .to_string_lossy()
                         .contains(".fbd.")
                 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_export_preserves_canonical_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo(tmp.path(), "a", "ra");
+        let canonical = repo.join(".beads/issues.jsonl");
+        fs::write(&canonical, b"old\n").unwrap();
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o600)).unwrap();
+        let fake = FakeBdClient::new().with_export_content(&repo, b"new\n".to_vec());
+
+        assert!(stable_export(&fake, &repo).is_empty());
+
+        assert_eq!(
+            fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "publishing changed bytes must not widen access to the canonical export"
         );
     }
 

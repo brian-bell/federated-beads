@@ -48,8 +48,9 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 #[derive(Default)]
 struct RuntimeRefreshState {
-    compatibility: OnceLock<Result<(), String>>,
-    prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
+    compatibility: OnceLock<()>,
+    attribution_prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
+    reusable_prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
 }
 
 /// What the UI thread consumes from its one channel: a **raw** key event from the
@@ -223,7 +224,7 @@ fn execute_effect(
             query,
             token,
             refresh_state
-                .prefixes
+                .attribution_prefixes
                 .lock()
                 .expect("prefix state poisoned")
                 .clone(),
@@ -240,7 +241,7 @@ fn execute_effect(
             markdown,
             token,
             refresh_state
-                .prefixes
+                .attribution_prefixes
                 .lock()
                 .expect("prefix state poisoned")
                 .clone(),
@@ -636,13 +637,16 @@ fn gather_snapshot_with_state(
     let mut warnings = Vec::new();
 
     // Version gate: a bd whose schema fbd cannot vouch for yields no snapshot.
-    let compatibility = state.compatibility.get_or_init(|| match bd.version() {
-        Ok(v) => version_gate(&v).map_err(|message| sanitize(&message)),
-        Err(error) => Err(sanitize(&format!("bd version check failed: {error}"))),
-    });
-    if let Err(message) = compatibility {
-        warnings.push(message.clone());
-        return (None, warnings);
+    if state.compatibility.get().is_none() {
+        let compatibility = match bd.version() {
+            Ok(version) => version_gate(&version).map_err(|message| sanitize(&message)),
+            Err(error) => Err(sanitize(&format!("bd version check failed: {error}"))),
+        };
+        if let Err(message) = compatibility {
+            warnings.push(message);
+            return (None, warnings);
+        }
+        let _ = state.compatibility.set(());
     }
 
     match ensure_hub(bd, paths, roster) {
@@ -655,7 +659,7 @@ fn gather_snapshot_with_state(
 
     let hub = hub_dir(paths);
     let cached_prefixes = state
-        .prefixes
+        .reusable_prefixes
         .lock()
         .expect("prefix state poisoned")
         .clone();
@@ -673,7 +677,14 @@ fn gather_snapshot_with_state(
                         snapshot::UNKNOWN_REPO,
                     )));
                 }
-                *state.prefixes.lock().expect("prefix state poisoned") = outcome.verified_prefixes;
+                *state
+                    .attribution_prefixes
+                    .lock()
+                    .expect("prefix state poisoned") = outcome.attribution_prefixes;
+                *state
+                    .reusable_prefixes
+                    .lock()
+                    .expect("prefix state poisoned") = outcome.verified_prefixes;
                 (outcome.prefix_map, outcome.synced_at)
             }
             // Another fbd holds the lock: keep the current view intact rather than
@@ -1216,6 +1227,71 @@ mod tests {
                 .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(path) if path == &ra))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn tui_session_retries_version_after_transient_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let config = roster(&[&ra]);
+        let state = RuntimeRefreshState::default();
+        let failing = FakeBdClient::new().with_version_err(bd_err());
+
+        assert!(
+            gather_snapshot_with_state(&failing, &config, &paths, &state)
+                .0
+                .is_none()
+        );
+
+        let recovered = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec());
+        assert!(
+            gather_snapshot_with_state(&recovered, &config, &paths, &state)
+                .0
+                .is_some(),
+            "a later refresh retries the compatibility check and can recover"
+        );
+        assert!(
+            recovered
+                .calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Version))
+        );
+    }
+
+    #[test]
+    fn tui_session_keeps_unverified_prefixes_for_search_attribution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let config = roster(&[&ra, &rb]);
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("rb-1", 1, "ready")])
+            .with_search(vec![issue("rb-1", 1, "found")])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec())
+            .with_export_content(&rb, Vec::new());
+        let state = RuntimeRefreshState::default();
+
+        assert!(
+            gather_snapshot_with_state(&bd, &config, &paths, &state)
+                .0
+                .is_some()
+        );
+        let prefixes = state
+            .attribution_prefixes
+            .lock()
+            .expect("prefix state poisoned")
+            .clone();
+        let rows = gather_search_with_prefixes(&bd, &config, &paths, "found", &prefixes)
+            .expect("search succeeds");
+
+        assert_eq!(
+            rows[0].repo_name, "rb",
+            "an authoritative prefix remains available even when its export was not reusable"
         );
     }
 
