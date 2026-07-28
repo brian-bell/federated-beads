@@ -8,14 +8,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::SystemTime;
 
 use fs2::FileExt;
 use serde::Deserialize;
 
-use crate::bd::{BdClient, BdError};
+use crate::bd::{BdClient, BdError, RepoSyncReport};
 use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::hub_dir;
 
@@ -33,6 +36,11 @@ pub struct RefreshOutcome {
     pub errors: Vec<RepoError>,
     /// Wall-clock time the hub sync completed.
     pub synced_at: SystemTime,
+    /// Diagnostic classification of the single sync invocation.
+    pub sync_report: RepoSyncReport,
+    /// Prefixes proved against the exact nonempty export consumed by this sync.
+    /// Runtime sessions may reuse only these entries on their next refresh.
+    pub verified_prefixes: HashMap<PathBuf, String>,
 }
 
 /// A per-repo failure during refresh: surfaced to the user but never aborts the
@@ -47,6 +55,15 @@ pub enum RepoError {
     /// issues cannot be attributed.
     #[error("cannot read prefix for {repo}: {detail}")]
     Metadata { repo: PathBuf, detail: String },
+    /// Preparing, comparing, cleaning, or atomically publishing an export
+    /// failed. The original JSONL is never opened for writing by fbd.
+    #[error("export {operation} failed for {repo} at {path}: {detail}")]
+    ExportFile {
+        repo: PathBuf,
+        operation: &'static str,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 /// A fatal refresh failure, or a declined refresh.
@@ -71,6 +88,10 @@ pub enum RefreshError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A scoped source worker panicked. All workers have been joined before
+    /// this is returned, so no source job remains detached.
+    #[error("a source refresh worker panicked")]
+    WorkerPanic,
 }
 
 /// Two or more roster repos declared the same id prefix. Ids under a collided
@@ -195,7 +216,7 @@ impl HubLock {
     }
 }
 
-/// Run one refresh: export every roster repo (sequentially), sync the hub once,
+/// Run one refresh: export every roster repo with bounded concurrency, sync the hub once,
 /// and build the prefix map. Declines with [`RefreshError::AlreadyRefreshing`]
 /// if another instance holds the hub lock.
 pub fn run(
@@ -203,63 +224,358 @@ pub fn run(
     roster: &Config,
     paths: &Paths,
 ) -> Result<RefreshOutcome, RefreshError> {
+    run_with_worker_limit(bd, roster, paths, 4)
+}
+
+/// Internal deterministic seam for the bounded scheduler's tests.
+pub(crate) fn run_with_worker_limit(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    worker_limit: usize,
+) -> Result<RefreshOutcome, RefreshError> {
+    run_with_cached_prefixes(bd, roster, paths, worker_limit, &HashMap::new())
+}
+
+/// State-aware refresh used by the interactive runtime. Empty, malformed,
+/// failed, or mismatching exports always force an authoritative prefix read;
+/// only a complete nonempty export can prove a cached prefix reusable.
+pub(crate) fn run_with_cached_prefixes(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    worker_limit: usize,
+    cached_prefixes: &HashMap<PathBuf, String>,
+) -> Result<RefreshOutcome, RefreshError> {
     let hub = hub_dir(paths);
-    // ensure_hub normally created this already; create defensively so the lock
-    // file below always has a directory to live in.
     fs::create_dir_all(&hub).map_err(|source| RefreshError::Io {
         path: hub.clone(),
         source,
     })?;
-
-    // Hold the lock across the whole refresh; it releases when `_lock` drops.
     let _lock = match HubLock::try_acquire(&hub)? {
         Some(lock) => lock,
         None => return Err(RefreshError::AlreadyRefreshing),
     };
-
+    let outcomes = run_source_jobs(bd, normalized_jobs(roster), worker_limit, cached_prefixes)?;
     let mut errors = Vec::new();
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
-    // Canonical paths already handled, so an aliased/duplicate roster entry is
-    // exported once and never mistaken for a prefix collision with itself
-    // (mirrors ensure_hub's roster dedupe).
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-
-    for entry in &roster.repos {
-        if !seen.insert(normalize(&entry.path)) {
-            continue;
-        }
-        // Export refreshes the repo's passive JSONL. A failure is recorded but
-        // never aborts the run — the hub still syncs and other repos hydrate.
-        if entry.path.exists()
-            && let Err(source) = bd.export(&entry.path)
-        {
-            errors.push(RepoError::Export {
-                repo: entry.path.clone(),
-                source,
-            });
-        }
-        // Attribution needs the prefix regardless of export success (already-
-        // synced ids stay attributable even if this refresh's export failed). bd
-        // reports the authoritative, hyphen-preserving prefix; a failure to read
-        // it means the repo cannot be attributed, but never aborts the refresh.
-        match bd.issue_prefix(&entry.path) {
-            Ok(prefix) => pairs.push((prefix, entry.clone())),
-            Err(source) => errors.push(RepoError::Metadata {
-                repo: entry.path.clone(),
-                detail: source.to_string(),
-            }),
+    let mut verified_prefixes = HashMap::new();
+    for outcome in outcomes {
+        errors.extend(outcome.errors);
+        if let Some(prefix) = outcome.prefix {
+            if outcome.verified {
+                verified_prefixes.insert(normalize_path(&outcome.entry.path), prefix.clone());
+            }
+            pairs.push((prefix, outcome.entry));
         }
     }
 
     // One sync hydrates the hub from every repo's fresh export. A sync failure
     // is fatal: the hub was not updated, so the whole refresh failed.
-    bd.repo_sync(&hub).map_err(RefreshError::Sync)?;
+    let sync_report = bd.repo_sync(&hub).map_err(RefreshError::Sync)?;
 
     Ok(RefreshOutcome {
         prefix_map: PrefixMap::from_pairs(pairs),
         errors,
         synced_at: SystemTime::now(),
+        sync_report,
+        verified_prefixes,
     })
+}
+
+#[derive(Clone)]
+struct SourceJob {
+    roster_index: usize,
+    entry: RepoEntry,
+}
+
+struct SourceOutcome {
+    roster_index: usize,
+    entry: RepoEntry,
+    prefix: Option<String>,
+    errors: Vec<RepoError>,
+    verified: bool,
+}
+
+fn normalized_jobs(roster: &Config) -> Vec<SourceJob> {
+    let mut seen = HashSet::new();
+    roster
+        .repos
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| seen.insert(normalize_path(&entry.path)))
+        .map(|(roster_index, entry)| SourceJob {
+            roster_index,
+            entry: entry.clone(),
+        })
+        .collect()
+}
+
+fn run_source_jobs(
+    bd: &impl BdClient,
+    jobs: Vec<SourceJob>,
+    worker_limit: usize,
+    cached_prefixes: &HashMap<PathBuf, String>,
+) -> Result<Vec<SourceOutcome>, RefreshError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = jobs.len().min(worker_limit.max(1));
+    let next = Mutex::new(0usize);
+    let mut joined = Vec::with_capacity(workers);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let job = {
+                        let mut next = next.lock().expect("source queue mutex poisoned");
+                        if *next == jobs.len() {
+                            None
+                        } else {
+                            let job = jobs[*next].clone();
+                            *next += 1;
+                            Some(job)
+                        }
+                    };
+                    let Some(job) = job else { break };
+                    local.push(run_source_job(bd, job, cached_prefixes));
+                }
+                local
+            }));
+        }
+        let mut panicked = false;
+        for handle in handles {
+            match handle.join() {
+                Ok(outcomes) => joined.extend(outcomes),
+                Err(_) => panicked = true,
+            }
+        }
+        if panicked {
+            Err(RefreshError::WorkerPanic)
+        } else {
+            Ok(())
+        }
+    })?;
+    joined.sort_by_key(|outcome| outcome.roster_index);
+    Ok(joined)
+}
+
+fn run_source_job(
+    bd: &impl BdClient,
+    job: SourceJob,
+    cached_prefixes: &HashMap<PathBuf, String>,
+) -> SourceOutcome {
+    let cached = cached_prefixes
+        .get(&normalize_path(&job.entry.path))
+        .map(String::as_str);
+    let publication = stable_export_result(bd, &job.entry.path, cached);
+    let exported_ids = publication.ids.clone();
+    let cached_prefix = publication.cached_prefix.clone();
+    let mut errors = publication.errors;
+    let (prefix, verified) = if let Some(prefix) = cached_prefix {
+        (Some(prefix), true)
+    } else {
+        match bd.issue_prefix(&job.entry.path) {
+            Ok(prefix) => {
+                let verified = exported_ids.as_ref().is_some_and(|ids| {
+                    !ids.is_empty()
+                        && ids.iter().all(|id| {
+                            id.strip_prefix(&prefix)
+                                .is_some_and(|tail| tail.starts_with('-'))
+                        })
+                });
+                (Some(prefix), verified)
+            }
+            Err(source) => {
+                errors.push(RepoError::Metadata {
+                    repo: job.entry.path.clone(),
+                    detail: source.to_string(),
+                });
+                (None, false)
+            }
+        }
+    };
+    SourceOutcome {
+        roster_index: job.roster_index,
+        entry: job.entry,
+        prefix,
+        errors,
+        verified,
+    }
+}
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Export to a unique sibling, compare it with the canonical JSONL, then either
+/// discard it or install it with one same-directory rename. This is deliberately
+/// the only source-artifact publication path in fbd.
+#[cfg(test)]
+fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
+    stable_export_result(bd, repo, None).errors
+}
+
+struct ExportPublication {
+    errors: Vec<RepoError>,
+    cached_prefix: Option<String>,
+    ids: Option<Vec<String>>,
+}
+
+fn stable_export_result(
+    bd: &impl BdClient,
+    repo: &Path,
+    cached_prefix: Option<&str>,
+) -> ExportPublication {
+    if !repo.exists() {
+        return ExportPublication {
+            errors: Vec::new(),
+            cached_prefix: None,
+            ids: None,
+        };
+    }
+    let canonical = repo.join(".beads/issues.jsonl");
+    let parent = match canonical.parent() {
+        Some(parent) => parent,
+        None => {
+            return ExportPublication {
+                errors: Vec::new(),
+                cached_prefix: None,
+                ids: None,
+            };
+        }
+    };
+    let temp = parent.join(format!(
+        ".issues.jsonl.fbd.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(error) = OpenOptions::new().write(true).create_new(true).open(&temp) {
+        return ExportPublication {
+            errors: vec![file_error(repo, "reserve temporary export", &temp, error)],
+            cached_prefix: None,
+            ids: None,
+        };
+    }
+    if let Err(source) = bd.export_to(repo, &temp) {
+        let mut errors = vec![RepoError::Export {
+            repo: repo.to_path_buf(),
+            source,
+        }];
+        cleanup_temp(repo, &temp, &mut errors);
+        return ExportPublication {
+            errors,
+            cached_prefix: None,
+            ids: None,
+        };
+    }
+    let ids = read_exported_ids(&temp);
+    let reuse = cached_prefix
+        .filter(|prefix| {
+            ids.as_ref().is_some_and(|ids| {
+                !ids.is_empty()
+                    && ids.iter().all(|id| {
+                        id.strip_prefix(*prefix)
+                            .is_some_and(|tail| tail.starts_with('-'))
+                    })
+            })
+        })
+        .map(str::to_string);
+    match files_equal(&temp, &canonical) {
+        Ok(true) => {
+            let mut errors = Vec::new();
+            cleanup_temp(repo, &temp, &mut errors);
+            ExportPublication {
+                errors,
+                cached_prefix: reuse,
+                ids,
+            }
+        }
+        Ok(false) => match fs::rename(&temp, &canonical) {
+            Ok(()) => ExportPublication {
+                errors: Vec::new(),
+                cached_prefix: reuse,
+                ids,
+            },
+            Err(error) => {
+                let mut errors = vec![file_error(repo, "publish export", &canonical, error)];
+                cleanup_temp(repo, &temp, &mut errors);
+                ExportPublication {
+                    errors,
+                    cached_prefix: None,
+                    ids: None,
+                }
+            }
+        },
+        Err(error) => {
+            let mut errors = vec![file_error(repo, "compare export", &temp, error)];
+            cleanup_temp(repo, &temp, &mut errors);
+            ExportPublication {
+                errors,
+                cached_prefix: None,
+                ids: None,
+            }
+        }
+    }
+}
+
+fn read_exported_ids(path: &Path) -> Option<Vec<String>> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut ids = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        ids.push(serde_json::from_str::<ExportedId>(line).ok()?.id);
+    }
+    Some(ids)
+}
+
+#[derive(Deserialize)]
+struct ExportedId {
+    id: String,
+}
+
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let a_meta = fs::metadata(a)?;
+    let b_meta = match fs::metadata(b) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if a_meta.len() != b_meta.len() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (File::open(a)?, File::open(b)?);
+    let (mut left, mut right) = ([0u8; 8192], [0u8; 8192]);
+    loop {
+        let n = a.read(&mut left)?;
+        if n != b.read(&mut right)? || left[..n] != right[..n] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn cleanup_temp(repo: &Path, temp: &Path, errors: &mut Vec<RepoError>) {
+    if let Err(error) = fs::remove_file(temp)
+        && error.kind() != ErrorKind::NotFound
+    {
+        errors.push(file_error(repo, "remove temporary export", temp, error));
+    }
+}
+
+fn file_error(
+    repo: &Path,
+    operation: &'static str,
+    path: &Path,
+    error: std::io::Error,
+) -> RepoError {
+    RepoError::ExportFile {
+        repo: repo.to_path_buf(),
+        operation,
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    }
 }
 
 /// Build only the id-prefix → repo attribution map from the roster, without
@@ -280,7 +596,7 @@ pub fn attribution_map(bd: &impl BdClient, roster: &Config) -> (PrefixMap, Vec<R
     // listed twice is not mistaken for a self-collision.
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for entry in &roster.repos {
-        if !seen.insert(normalize(&entry.path)) {
+        if !seen.insert(normalize_path(&entry.path)) {
             continue;
         }
         match bd.issue_prefix(&entry.path) {
@@ -304,7 +620,7 @@ struct Metadata {
 
 /// Canonicalize `p` if it exists on disk; otherwise return it unchanged. Used to
 /// dedupe roster entries that name the same repo via different (aliased) paths.
-fn normalize(p: &Path) -> PathBuf {
+pub(crate) fn normalize_path(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
@@ -376,16 +692,84 @@ mod tests {
         run(&fake, &roster(&[&a, &b]), &paths).unwrap();
 
         let calls = fake.calls();
+        assert_eq!(calls.len(), 5);
+        assert!(matches!(calls.last(), Some(Call::RepoSync(hub)) if hub == &hub_dir(&paths)));
+        for repo in [&a, &b] {
+            assert!(calls.iter().any(|call| matches!(call, Call::Export(actual, output) if actual == repo && output.parent() == Some(repo.join(".beads").as_path()))));
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| matches!(call, Call::IssuePrefix(actual) if actual == repo))
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_export_preserves_canonical_bytes_and_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo(tmp.path(), "a", "ra");
+        let canonical = repo.join(".beads/issues.jsonl");
+        fs::write(&canonical, b"same\n").unwrap();
+        let original = fs::metadata(&canonical).unwrap().modified().unwrap();
+        let fake = FakeBdClient::new().with_export_content(&repo, b"same\n".to_vec());
+
+        assert!(stable_export(&fake, &repo).is_empty());
+        assert_eq!(fs::read(&canonical).unwrap(), b"same\n");
         assert_eq!(
-            calls,
-            vec![
-                Call::Export(a.clone()),
-                Call::IssuePrefix(a.clone()),
-                Call::Export(b.clone()),
-                Call::IssuePrefix(b.clone()),
-                Call::RepoSync(hub_dir(&paths)),
-            ],
-            "each repo exports then yields its prefix, in order, then one sync"
+            fs::metadata(&canonical).unwrap().modified().unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read_dir(canonical.parent().unwrap()).unwrap().count(),
+            2,
+            "only metadata and canonical export remain"
+        );
+    }
+
+    #[test]
+    fn changed_export_publishes_new_canonical_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo(tmp.path(), "a", "ra");
+        let canonical = repo.join(".beads/issues.jsonl");
+        fs::write(&canonical, b"old\n").unwrap();
+        let fake = FakeBdClient::new().with_export_content(&repo, b"new\n".to_vec());
+
+        assert!(stable_export(&fake, &repo).is_empty());
+        assert_eq!(fs::read(&canonical).unwrap(), b"new\n");
+        assert!(
+            fs::read_dir(canonical.parent().unwrap())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".fbd.")
+                })
+        );
+    }
+
+    #[test]
+    fn failed_export_leaves_canonical_untouched_and_removes_temporary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo(tmp.path(), "a", "ra");
+        let canonical = repo.join(".beads/issues.jsonl");
+        fs::write(&canonical, b"old\n").unwrap();
+        let fake = FakeBdClient::new().with_export_err(repo.clone(), bd_err());
+
+        let errors = stable_export(&fake, &repo);
+        assert!(matches!(errors.as_slice(), [RepoError::Export { .. }]));
+        assert_eq!(fs::read(&canonical).unwrap(), b"old\n");
+        assert!(
+            fs::read_dir(canonical.parent().unwrap())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".fbd.")
+                })
         );
     }
 
@@ -572,7 +956,7 @@ mod tests {
         let exports = fake
             .calls()
             .into_iter()
-            .filter(|c| matches!(c, Call::Export(_)))
+            .filter(|c| matches!(c, Call::Export(..)))
             .count();
         assert_eq!(exports, 1, "a duplicate roster entry exports once");
     }
