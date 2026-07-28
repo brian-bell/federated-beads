@@ -5,7 +5,7 @@
 //! [`crate::app::view::draw`]. Terminal setup/teardown installs a panic hook that
 //! restores the terminal (the session-tui pattern). See `plans/slices/slice-9.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -451,16 +451,7 @@ fn gather_search_with_prefixes(
     let issues = bd
         .search(&hub, query)
         .map_err(|e| sanitize(&format!("search failed: {e}")))?;
-    let pairs = roster
-        .repos
-        .iter()
-        .filter_map(|entry| {
-            prefixes
-                .get(&refresh::normalize_path(&entry.path))
-                .map(|prefix| (prefix.clone(), entry.clone()))
-        })
-        .collect();
-    let prefix_map = refresh::PrefixMap::from_pairs(pairs);
+    let prefix_map = cached_prefix_map(roster, prefixes);
     Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
@@ -584,22 +575,34 @@ fn build_copy_with_prefixes(
     if markdown || prefixes.is_empty() {
         return build_copy(bd, roster, paths, row, markdown);
     }
-    let pairs = roster
-        .repos
-        .iter()
-        .filter_map(|entry| {
-            prefixes
-                .get(&refresh::normalize_path(&entry.path))
-                .map(|prefix| (prefix.clone(), entry.clone()))
-        })
-        .collect();
-    let prefix_map = refresh::PrefixMap::from_pairs(pairs);
+    let prefix_map = cached_prefix_map(roster, prefixes);
     let repo = prefix_map
         .repo_for(&row.issue.id)
         .map(|entry| entry.path.clone());
     let payload = context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id);
     let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
     (payload, summary)
+}
+
+fn cached_prefix_map(
+    roster: &Config,
+    prefixes: &HashMap<std::path::PathBuf, String>,
+) -> refresh::PrefixMap {
+    let mut seen = HashSet::new();
+    let pairs = roster
+        .repos
+        .iter()
+        .filter_map(|entry| {
+            let normalized_path = refresh::normalize_path(&entry.path);
+            if !seen.insert(normalized_path.clone()) {
+                return None;
+            }
+            prefixes
+                .get(&normalized_path)
+                .map(|prefix| (prefix.clone(), entry.clone()))
+        })
+        .collect();
+    refresh::PrefixMap::from_pairs(pairs)
 }
 
 /// Write `payload` to the terminal clipboard via an OSC 52 escape. Called only on
@@ -1292,6 +1295,50 @@ mod tests {
         assert_eq!(
             rows[0].repo_name, "rb",
             "an authoritative prefix remains available even when its export was not reusable"
+        );
+    }
+
+    #[test]
+    fn cached_search_prefixes_deduplicate_duplicate_roster_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let config = roster(&[&ra, &ra]);
+        let bd = FakeBdClient::new().with_search(vec![issue("ra-1", 1, "found")]);
+        let prefixes = HashMap::from([(refresh::normalize_path(&ra), "ra".to_string())]);
+
+        let rows = gather_search_with_prefixes(&bd, &config, &paths, "found", &prefixes)
+            .expect("search succeeds");
+
+        assert_eq!(
+            rows[0].repo_name, "ra",
+            "a duplicate roster entry must not turn one cached prefix into a collision"
+        );
+    }
+
+    #[test]
+    fn cached_copy_prefixes_deduplicate_duplicate_roster_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let alias = ra.join(".");
+        let config = roster(&[&ra, &alias]);
+        let prefixes = HashMap::from([(refresh::normalize_path(&ra), "ra".to_string())]);
+        let row = copy_row("ra", "ra-1");
+
+        let (payload, _) = build_copy_with_prefixes(
+            &FakeBdClient::new(),
+            &config,
+            &paths,
+            &row,
+            false,
+            &prefixes,
+        );
+
+        assert_eq!(
+            payload,
+            format!("cd {} && bd show ra-1", ra.display()),
+            "a duplicate roster entry must not force command copy through the hub"
         );
     }
 
