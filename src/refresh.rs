@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -378,7 +378,7 @@ fn run_source_job(
         .get(&normalize_path(&job.entry.path))
         .map(String::as_str);
     let publication = stable_export_result(bd, &job.entry.path, cached);
-    let exported_ids = publication.ids.clone();
+    let exported_ids = publication.id_summary.clone();
     let cached_prefix = publication.cached_prefix.clone();
     let mut errors = publication.errors;
     let (prefix, verified) = if let Some(prefix) = cached_prefix {
@@ -386,13 +386,9 @@ fn run_source_job(
     } else {
         match bd.issue_prefix(&job.entry.path) {
             Ok(prefix) => {
-                let verified = exported_ids.as_ref().is_some_and(|ids| {
-                    !ids.is_empty()
-                        && ids.iter().all(|id| {
-                            id.strip_prefix(&prefix)
-                                .is_some_and(|tail| tail.starts_with('-'))
-                        })
-                });
+                let verified = exported_ids
+                    .as_ref()
+                    .is_some_and(|summary| summary.matches_prefix(&prefix));
                 (Some(prefix), verified)
             }
             Err(source) => {
@@ -426,7 +422,7 @@ fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
 struct ExportPublication {
     errors: Vec<RepoError>,
     cached_prefix: Option<String>,
-    ids: Option<Vec<String>>,
+    id_summary: Option<ExportedIdSummary>,
 }
 
 fn stable_export_result(
@@ -438,7 +434,7 @@ fn stable_export_result(
         return ExportPublication {
             errors: Vec::new(),
             cached_prefix: None,
-            ids: None,
+            id_summary: None,
         };
     }
     let canonical = repo.join(".beads/issues.jsonl");
@@ -448,7 +444,7 @@ fn stable_export_result(
             return ExportPublication {
                 errors: Vec::new(),
                 cached_prefix: None,
-                ids: None,
+                id_summary: None,
             };
         }
     };
@@ -461,7 +457,7 @@ fn stable_export_result(
         return ExportPublication {
             errors: vec![file_error(repo, "reserve temporary export", &temp, error)],
             cached_prefix: None,
-            ids: None,
+            id_summary: None,
         };
     }
     if let Err(source) = bd.export_to(repo, &temp) {
@@ -473,19 +469,15 @@ fn stable_export_result(
         return ExportPublication {
             errors,
             cached_prefix: None,
-            ids: None,
+            id_summary: None,
         };
     }
-    let ids = read_exported_ids(&temp);
+    let id_summary = summarize_exported_ids(&temp);
     let reuse = cached_prefix
         .filter(|prefix| {
-            ids.as_ref().is_some_and(|ids| {
-                !ids.is_empty()
-                    && ids.iter().all(|id| {
-                        id.strip_prefix(*prefix)
-                            .is_some_and(|tail| tail.starts_with('-'))
-                    })
-            })
+            id_summary
+                .as_ref()
+                .is_some_and(|summary| summary.matches_prefix(prefix))
         })
         .map(str::to_string);
     match files_equal(&temp, &canonical) {
@@ -495,7 +487,7 @@ fn stable_export_result(
             ExportPublication {
                 errors,
                 cached_prefix: reuse,
-                ids,
+                id_summary,
             }
         }
         Ok(false) => {
@@ -510,14 +502,14 @@ fn stable_export_result(
                 return ExportPublication {
                     errors,
                     cached_prefix: None,
-                    ids: None,
+                    id_summary: None,
                 };
             }
             match fs::rename(&temp, &canonical) {
                 Ok(()) => ExportPublication {
                     errors: Vec::new(),
                     cached_prefix: reuse,
-                    ids,
+                    id_summary,
                 },
                 Err(error) => {
                     let mut errors = vec![file_error(repo, "publish export", &canonical, error)];
@@ -525,7 +517,7 @@ fn stable_export_result(
                     ExportPublication {
                         errors,
                         cached_prefix: None,
-                        ids: None,
+                        id_summary: None,
                     }
                 }
             }
@@ -536,7 +528,7 @@ fn stable_export_result(
             ExportPublication {
                 errors,
                 cached_prefix: None,
-                ids: None,
+                id_summary: None,
             }
         }
     }
@@ -550,13 +542,50 @@ fn preserve_canonical_permissions(canonical: &Path, temp: &Path) -> std::io::Res
     }
 }
 
-fn read_exported_ids(path: &Path) -> Option<Vec<String>> {
-    let text = fs::read_to_string(path).ok()?;
-    let mut ids = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        ids.push(serde_json::from_str::<ExportedId>(line).ok()?.id);
+#[derive(Clone)]
+struct ExportedIdSummary {
+    count: usize,
+    common_prefix: String,
+}
+
+impl ExportedIdSummary {
+    fn matches_prefix(&self, prefix: &str) -> bool {
+        self.count > 0
+            && self
+                .common_prefix
+                .strip_prefix(prefix)
+                .is_some_and(|tail| tail.starts_with('-'))
     }
-    Some(ids)
+}
+
+fn summarize_exported_ids(path: &Path) -> Option<ExportedIdSummary> {
+    let file = File::open(path).ok()?;
+    let mut count = 0;
+    let mut common_prefix: Option<String> = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let id = serde_json::from_str::<ExportedId>(&line).ok()?.id;
+        count += 1;
+        match &mut common_prefix {
+            Some(common) => {
+                let shared_bytes = common
+                    .chars()
+                    .zip(id.chars())
+                    .take_while(|(left, right)| left == right)
+                    .map(|(character, _)| character.len_utf8())
+                    .sum();
+                common.truncate(shared_bytes);
+            }
+            None => common_prefix = Some(id),
+        }
+    }
+    Some(ExportedIdSummary {
+        count,
+        common_prefix: common_prefix.unwrap_or_default(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -799,6 +828,56 @@ mod tests {
             0o600,
             "publishing changed bytes must not widen access to the canonical export"
         );
+    }
+
+    #[test]
+    fn exported_id_summary_retains_only_prefix_validation_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export = tmp.path().join("issues.jsonl");
+        let large_description = "x".repeat(100_000);
+        fs::write(
+            &export,
+            format!(
+                "{{\"id\":\"alpha-1\",\"description\":\"{large_description}\"}}\n\
+                 {{\"id\":\"alpha-2\",\"description\":\"{large_description}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_exported_ids(&export).expect("valid JSONL");
+
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.common_prefix, "alpha-");
+        assert!(summary.matches_prefix("alpha"));
+        assert!(!summary.matches_prefix("beta"));
+    }
+
+    #[test]
+    fn exported_id_summary_preserves_empty_malformed_and_mismatch_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export = tmp.path().join("issues.jsonl");
+
+        fs::write(&export, b"").unwrap();
+        let empty = summarize_exported_ids(&export).expect("an empty export is valid");
+        assert_eq!(empty.count, 0);
+        assert!(!empty.matches_prefix("alpha"));
+
+        fs::write(&export, b"{not json}\n").unwrap();
+        assert!(
+            summarize_exported_ids(&export).is_none(),
+            "malformed JSONL cannot verify a prefix"
+        );
+
+        fs::write(&export, b"{\"id\":\"alpha-1\"}{\"id\":\"alpha-2\"}\n").unwrap();
+        assert!(
+            summarize_exported_ids(&export).is_none(),
+            "adjacent objects without a JSONL record delimiter are malformed"
+        );
+
+        fs::write(&export, b"{\"id\":\"alpha-1\"}\n{\"id\":\"beta-2\"}\n").unwrap();
+        let mismatched = summarize_exported_ids(&export).expect("valid JSONL");
+        assert!(!mismatched.matches_prefix("alpha"));
+        assert!(!mismatched.matches_prefix("beta"));
     }
 
     #[test]
