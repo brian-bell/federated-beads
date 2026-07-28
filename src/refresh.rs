@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,11 +39,8 @@ pub struct RefreshOutcome {
     /// Diagnostic classification of the single sync invocation.
     pub sync_report: RepoSyncReport,
     /// Complete authoritative repo-prefix map for attributing this sync's hub
-    /// contents, including prefixes that were not eligible for reuse.
+    /// contents.
     pub attribution_prefixes: HashMap<PathBuf, String>,
-    /// Prefixes proved against the exact nonempty export consumed by this sync.
-    /// Runtime sessions may reuse only these entries on their next refresh.
-    pub verified_prefixes: HashMap<PathBuf, String>,
 }
 
 /// A per-repo failure during refresh: surfaced to the user but never aborts the
@@ -237,19 +234,6 @@ pub(crate) fn run_with_worker_limit(
     paths: &Paths,
     worker_limit: usize,
 ) -> Result<RefreshOutcome, RefreshError> {
-    run_with_cached_prefixes(bd, roster, paths, worker_limit, &HashMap::new())
-}
-
-/// State-aware refresh used by the interactive runtime. Empty, malformed,
-/// failed, or mismatching exports always force an authoritative prefix read;
-/// only a complete nonempty export can prove a cached prefix reusable.
-pub(crate) fn run_with_cached_prefixes(
-    bd: &impl BdClient,
-    roster: &Config,
-    paths: &Paths,
-    worker_limit: usize,
-    cached_prefixes: &HashMap<PathBuf, String>,
-) -> Result<RefreshOutcome, RefreshError> {
     let hub = hub_dir(paths);
     fs::create_dir_all(&hub).map_err(|source| RefreshError::Io {
         path: hub.clone(),
@@ -259,19 +243,15 @@ pub(crate) fn run_with_cached_prefixes(
         Some(lock) => lock,
         None => return Err(RefreshError::AlreadyRefreshing),
     };
-    let outcomes = run_source_jobs(bd, normalized_jobs(roster), worker_limit, cached_prefixes)?;
+    let outcomes = run_source_jobs(bd, normalized_jobs(roster), worker_limit)?;
     let mut errors = Vec::new();
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
     let mut attribution_prefixes = HashMap::new();
-    let mut verified_prefixes = HashMap::new();
     for outcome in outcomes {
         errors.extend(outcome.errors);
         if let Some(prefix) = outcome.prefix {
             let normalized_path = normalize_path(&outcome.entry.path);
-            attribution_prefixes.insert(normalized_path.clone(), prefix.clone());
-            if outcome.verified {
-                verified_prefixes.insert(normalized_path, prefix.clone());
-            }
+            attribution_prefixes.insert(normalized_path, prefix.clone());
             pairs.push((prefix, outcome.entry));
         }
     }
@@ -286,7 +266,6 @@ pub(crate) fn run_with_cached_prefixes(
         synced_at: SystemTime::now(),
         sync_report,
         attribution_prefixes,
-        verified_prefixes,
     })
 }
 
@@ -301,7 +280,6 @@ struct SourceOutcome {
     entry: RepoEntry,
     prefix: Option<String>,
     errors: Vec<RepoError>,
-    verified: bool,
 }
 
 fn normalized_jobs(roster: &Config) -> Vec<SourceJob> {
@@ -322,7 +300,6 @@ fn run_source_jobs(
     bd: &impl BdClient,
     jobs: Vec<SourceJob>,
     worker_limit: usize,
-    cached_prefixes: &HashMap<PathBuf, String>,
 ) -> Result<Vec<SourceOutcome>, RefreshError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -347,7 +324,7 @@ fn run_source_jobs(
                         }
                     };
                     let Some(job) = job else { break };
-                    local.push(run_source_job(bd, job, cached_prefixes));
+                    local.push(run_source_job(bd, job));
                 }
                 local
             }));
@@ -369,35 +346,16 @@ fn run_source_jobs(
     Ok(joined)
 }
 
-fn run_source_job(
-    bd: &impl BdClient,
-    job: SourceJob,
-    cached_prefixes: &HashMap<PathBuf, String>,
-) -> SourceOutcome {
-    let cached = cached_prefixes
-        .get(&normalize_path(&job.entry.path))
-        .map(String::as_str);
-    let publication = stable_export_result(bd, &job.entry.path, cached);
-    let exported_ids = publication.id_summary.clone();
-    let cached_prefix = publication.cached_prefix.clone();
-    let mut errors = publication.errors;
-    let (prefix, verified) = if let Some(prefix) = cached_prefix {
-        (Some(prefix), true)
-    } else {
-        match bd.issue_prefix(&job.entry.path) {
-            Ok(prefix) => {
-                let verified = exported_ids
-                    .as_ref()
-                    .is_some_and(|summary| summary.matches_prefix(&prefix));
-                (Some(prefix), verified)
-            }
-            Err(source) => {
-                errors.push(RepoError::Metadata {
-                    repo: job.entry.path.clone(),
-                    detail: source.to_string(),
-                });
-                (None, false)
-            }
+fn run_source_job(bd: &impl BdClient, job: SourceJob) -> SourceOutcome {
+    let mut errors = stable_export(bd, &job.entry.path);
+    let prefix = match bd.issue_prefix(&job.entry.path) {
+        Ok(prefix) => Some(prefix),
+        Err(source) => {
+            errors.push(RepoError::Metadata {
+                repo: job.entry.path.clone(),
+                detail: source.to_string(),
+            });
+            None
         }
     };
     SourceOutcome {
@@ -405,7 +363,6 @@ fn run_source_job(
         entry: job.entry,
         prefix,
         errors,
-        verified,
     }
 }
 
@@ -414,81 +371,39 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Export to a unique sibling, compare it with the canonical JSONL, then either
 /// discard it or install it with one same-directory rename. This is deliberately
 /// the only source-artifact publication path in fbd.
-#[cfg(test)]
 fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
-    stable_export_result(bd, repo, None).errors
-}
-
-struct ExportPublication {
-    errors: Vec<RepoError>,
-    cached_prefix: Option<String>,
-    id_summary: Option<ExportedIdSummary>,
-}
-
-fn stable_export_result(
-    bd: &impl BdClient,
-    repo: &Path,
-    cached_prefix: Option<&str>,
-) -> ExportPublication {
     if !repo.exists() {
-        return ExportPublication {
-            errors: Vec::new(),
-            cached_prefix: None,
-            id_summary: None,
-        };
+        return Vec::new();
     }
     let canonical = repo.join(".beads/issues.jsonl");
     let parent = match canonical.parent() {
         Some(parent) => parent,
-        None => {
-            return ExportPublication {
-                errors: Vec::new(),
-                cached_prefix: None,
-                id_summary: None,
-            };
+        None => return Vec::new(),
+    };
+    let temp = match reserve_temp_export(parent, std::process::id(), &TEMP_COUNTER) {
+        Ok(temp) => temp,
+        Err((candidate, error)) => {
+            return vec![file_error(
+                repo,
+                "reserve temporary export",
+                &candidate,
+                error,
+            )];
         }
     };
-    let temp = parent.join(format!(
-        ".issues.jsonl.fbd.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    if let Err(error) = OpenOptions::new().write(true).create_new(true).open(&temp) {
-        return ExportPublication {
-            errors: vec![file_error(repo, "reserve temporary export", &temp, error)],
-            cached_prefix: None,
-            id_summary: None,
-        };
-    }
     if let Err(source) = bd.export_to(repo, &temp) {
         let mut errors = vec![RepoError::Export {
             repo: repo.to_path_buf(),
             source,
         }];
         cleanup_temp(repo, &temp, &mut errors);
-        return ExportPublication {
-            errors,
-            cached_prefix: None,
-            id_summary: None,
-        };
+        return errors;
     }
-    let id_summary = summarize_exported_ids(&temp);
-    let reuse = cached_prefix
-        .filter(|prefix| {
-            id_summary
-                .as_ref()
-                .is_some_and(|summary| summary.matches_prefix(prefix))
-        })
-        .map(str::to_string);
     match files_equal(&temp, &canonical) {
         Ok(true) => {
             let mut errors = Vec::new();
             cleanup_temp(repo, &temp, &mut errors);
-            ExportPublication {
-                errors,
-                cached_prefix: reuse,
-                id_summary,
-            }
+            errors
         }
         Ok(false) => {
             if let Err(error) = preserve_canonical_permissions(&canonical, &temp) {
@@ -499,37 +414,43 @@ fn stable_export_result(
                     error,
                 )];
                 cleanup_temp(repo, &temp, &mut errors);
-                return ExportPublication {
-                    errors,
-                    cached_prefix: None,
-                    id_summary: None,
-                };
+                return errors;
             }
             match fs::rename(&temp, &canonical) {
-                Ok(()) => ExportPublication {
-                    errors: Vec::new(),
-                    cached_prefix: reuse,
-                    id_summary,
-                },
+                Ok(()) => Vec::new(),
                 Err(error) => {
                     let mut errors = vec![file_error(repo, "publish export", &canonical, error)];
                     cleanup_temp(repo, &temp, &mut errors);
-                    ExportPublication {
-                        errors,
-                        cached_prefix: None,
-                        id_summary: None,
-                    }
+                    errors
                 }
             }
         }
         Err(error) => {
             let mut errors = vec![file_error(repo, "compare export", &temp, error)];
             cleanup_temp(repo, &temp, &mut errors);
-            ExportPublication {
-                errors,
-                cached_prefix: None,
-                id_summary: None,
-            }
+            errors
+        }
+    }
+}
+
+fn reserve_temp_export(
+    parent: &Path,
+    process_id: u32,
+    counter: &AtomicU64,
+) -> Result<PathBuf, (PathBuf, std::io::Error)> {
+    loop {
+        let candidate = parent.join(format!(
+            ".issues.jsonl.fbd.{process_id}.{}.tmp",
+            counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err((candidate, error)),
         }
     }
 }
@@ -540,57 +461,6 @@ fn preserve_canonical_permissions(canonical: &Path, temp: &Path) -> std::io::Res
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-#[derive(Clone)]
-struct ExportedIdSummary {
-    count: usize,
-    common_prefix: String,
-}
-
-impl ExportedIdSummary {
-    fn matches_prefix(&self, prefix: &str) -> bool {
-        self.count > 0
-            && self
-                .common_prefix
-                .strip_prefix(prefix)
-                .is_some_and(|tail| tail.starts_with('-'))
-    }
-}
-
-fn summarize_exported_ids(path: &Path) -> Option<ExportedIdSummary> {
-    let file = File::open(path).ok()?;
-    let mut count = 0;
-    let mut common_prefix: Option<String> = None;
-    for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let id = serde_json::from_str::<ExportedId>(&line).ok()?.id;
-        count += 1;
-        match &mut common_prefix {
-            Some(common) => {
-                let shared_bytes = common
-                    .chars()
-                    .zip(id.chars())
-                    .take_while(|(left, right)| left == right)
-                    .map(|(character, _)| character.len_utf8())
-                    .sum();
-                common.truncate(shared_bytes);
-            }
-            None => common_prefix = Some(id),
-        }
-    }
-    Some(ExportedIdSummary {
-        count,
-        common_prefix: common_prefix.unwrap_or_default(),
-    })
-}
-
-#[derive(Deserialize)]
-struct ExportedId {
-    id: String,
 }
 
 fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
@@ -787,6 +657,28 @@ mod tests {
     }
 
     #[test]
+    fn temporary_export_reservation_retries_stale_name_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        let stale = tmp.path().join(".issues.jsonl.fbd.7.0.tmp");
+        fs::write(&stale, b"stale").unwrap();
+
+        let reserved = reserve_temp_export(tmp.path(), 7, &counter).unwrap();
+
+        assert_eq!(
+            reserved,
+            tmp.path().join(".issues.jsonl.fbd.7.1.tmp"),
+            "the next unused counter value is reserved"
+        );
+        assert_eq!(
+            fs::read(&stale).unwrap(),
+            b"stale",
+            "a colliding stale file is never consumed or overwritten"
+        );
+        assert!(reserved.exists());
+    }
+
+    #[test]
     fn changed_export_publishes_new_canonical_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = seed_repo(tmp.path(), "a", "ra");
@@ -828,56 +720,6 @@ mod tests {
             0o600,
             "publishing changed bytes must not widen access to the canonical export"
         );
-    }
-
-    #[test]
-    fn exported_id_summary_retains_only_prefix_validation_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let export = tmp.path().join("issues.jsonl");
-        let large_description = "x".repeat(100_000);
-        fs::write(
-            &export,
-            format!(
-                "{{\"id\":\"alpha-1\",\"description\":\"{large_description}\"}}\n\
-                 {{\"id\":\"alpha-2\",\"description\":\"{large_description}\"}}\n"
-            ),
-        )
-        .unwrap();
-
-        let summary = summarize_exported_ids(&export).expect("valid JSONL");
-
-        assert_eq!(summary.count, 2);
-        assert_eq!(summary.common_prefix, "alpha-");
-        assert!(summary.matches_prefix("alpha"));
-        assert!(!summary.matches_prefix("beta"));
-    }
-
-    #[test]
-    fn exported_id_summary_preserves_empty_malformed_and_mismatch_semantics() {
-        let tmp = tempfile::tempdir().unwrap();
-        let export = tmp.path().join("issues.jsonl");
-
-        fs::write(&export, b"").unwrap();
-        let empty = summarize_exported_ids(&export).expect("an empty export is valid");
-        assert_eq!(empty.count, 0);
-        assert!(!empty.matches_prefix("alpha"));
-
-        fs::write(&export, b"{not json}\n").unwrap();
-        assert!(
-            summarize_exported_ids(&export).is_none(),
-            "malformed JSONL cannot verify a prefix"
-        );
-
-        fs::write(&export, b"{\"id\":\"alpha-1\"}{\"id\":\"alpha-2\"}\n").unwrap();
-        assert!(
-            summarize_exported_ids(&export).is_none(),
-            "adjacent objects without a JSONL record delimiter are malformed"
-        );
-
-        fs::write(&export, b"{\"id\":\"alpha-1\"}\n{\"id\":\"beta-2\"}\n").unwrap();
-        let mismatched = summarize_exported_ids(&export).expect("valid JSONL");
-        assert!(!mismatched.matches_prefix("alpha"));
-        assert!(!mismatched.matches_prefix("beta"));
     }
 
     #[test]
@@ -1090,6 +932,36 @@ mod tests {
             .filter(|c| matches!(c, Call::Export(..)))
             .count();
         assert_eq!(exports, 1, "a duplicate roster entry exports once");
+    }
+
+    #[test]
+    fn hyphen_extended_authoritative_prefix_does_not_collide_with_shorter_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let extended = seed_repo(tmp.path(), "extended", "foo_bar");
+        let base = seed_repo(tmp.path(), "base", "foo");
+        let fake = FakeBdClient::new()
+            .with_issue_prefix(extended.clone(), "foo-bar")
+            .with_issue_prefix(base.clone(), "foo")
+            .with_export_content(&extended, b"{\"id\":\"foo-bar-1\"}\n".to_vec())
+            .with_export_content(&base, b"{\"id\":\"foo-1\"}\n".to_vec());
+        let outcome =
+            run_with_worker_limit(&fake, &roster(&[&extended, &base]), &paths, 1).unwrap();
+
+        assert_eq!(
+            outcome
+                .prefix_map
+                .repo_for("foo-bar-1")
+                .map(|entry| &entry.path),
+            Some(&extended),
+            "the live foo-bar prefix must not collide with a different repo's foo prefix"
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| matches!(call, Call::IssuePrefix(repo) if repo == &extended)),
+            "the authoritative prefix is read for every source repo"
+        );
     }
 
     #[test]

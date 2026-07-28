@@ -50,7 +50,6 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 struct RuntimeRefreshState {
     compatibility: OnceLock<()>,
     attribution_prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
-    reusable_prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
 }
 
 /// What the UI thread consumes from its one channel: a **raw** key event from the
@@ -661,49 +660,38 @@ fn gather_snapshot_with_state(
     }
 
     let hub = hub_dir(paths);
-    let cached_prefixes = state
-        .reusable_prefixes
-        .lock()
-        .expect("prefix state poisoned")
-        .clone();
-    let (prefix_map, fetched_at) =
-        match refresh::run_with_cached_prefixes(bd, roster, paths, 4, &cached_prefixes) {
-            Ok(outcome) => {
-                for repo_error in &outcome.errors {
-                    warnings.push(sanitize(&repo_error.to_string()));
-                }
-                for collision in outcome.prefix_map.collisions() {
-                    warnings.push(sanitize(&format!(
-                        "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
-                        collision.prefix,
-                        collision.repos.len(),
-                        snapshot::UNKNOWN_REPO,
-                    )));
-                }
-                *state
-                    .attribution_prefixes
-                    .lock()
-                    .expect("prefix state poisoned") = outcome.attribution_prefixes;
-                *state
-                    .reusable_prefixes
-                    .lock()
-                    .expect("prefix state poisoned") = outcome.verified_prefixes;
-                (outcome.prefix_map, outcome.synced_at)
+    let (prefix_map, fetched_at) = match refresh::run_with_worker_limit(bd, roster, paths, 4) {
+        Ok(outcome) => {
+            for repo_error in &outcome.errors {
+                warnings.push(sanitize(&repo_error.to_string()));
             }
-            // Another fbd holds the lock: keep the current view intact rather than
-            // fetching a snapshot with no prefix map (which would re-attribute every
-            // row to `unknown`, reset the age, and empty an active repo filter).
-            // Returning `None` makes `reduce` retain the last-good rows.
-            Err(RefreshError::AlreadyRefreshing) => {
-                warnings
-                    .push("another fbd is refreshing this hub; keeping the current view".into());
-                return (None, warnings);
+            for collision in outcome.prefix_map.collisions() {
+                warnings.push(sanitize(&format!(
+                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+                    collision.prefix,
+                    collision.repos.len(),
+                    snapshot::UNKNOWN_REPO,
+                )));
             }
-            Err(fatal) => {
-                warnings.push(sanitize(&format!("refresh failed: {fatal}")));
-                return (None, warnings);
-            }
-        };
+            *state
+                .attribution_prefixes
+                .lock()
+                .expect("prefix state poisoned") = outcome.attribution_prefixes;
+            (outcome.prefix_map, outcome.synced_at)
+        }
+        // Another fbd holds the lock: keep the current view intact rather than
+        // fetching a snapshot with no prefix map (which would re-attribute every
+        // row to `unknown`, reset the age, and empty an active repo filter).
+        // Returning `None` makes `reduce` retain the last-good rows.
+        Err(RefreshError::AlreadyRefreshing) => {
+            warnings.push("another fbd is refreshing this hub; keeping the current view".into());
+            return (None, warnings);
+        }
+        Err(fatal) => {
+            warnings.push(sanitize(&format!("refresh failed: {fatal}")));
+            return (None, warnings);
+        }
+    };
 
     match snapshot::fetch(bd, &hub, &prefix_map, fetched_at) {
         Ok(snapshot) => (Some(snapshot), warnings),
@@ -1197,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_session_reuses_version_and_verified_nonempty_prefix() {
+    fn tui_session_reuses_version_but_rechecks_authoritative_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
@@ -1229,7 +1217,7 @@ mod tests {
                 .iter()
                 .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(path) if path == &ra))
                 .count(),
-            1
+            2
         );
     }
 
@@ -1266,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_session_keeps_unverified_prefixes_for_search_attribution() {
+    fn tui_session_keeps_authoritative_prefixes_for_search_attribution() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
