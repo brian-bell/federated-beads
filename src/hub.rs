@@ -31,6 +31,68 @@ pub struct HubStatus {
     pub warnings: Vec<String>,
 }
 
+/// One desired roster entry as observed for reconciliation. Reachability is
+/// part of the identity so a path becoming present invalidates retained state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DesiredRepo {
+    Missing {
+        absolute_lexical_path: PathBuf,
+    },
+    Unavailable {
+        absolute_lexical_path: PathBuf,
+        detail: String,
+    },
+    Reachable {
+        canonical_path: PathBuf,
+    },
+}
+
+/// Cheap desired/actual hub state used to decide whether a TUI refresh may
+/// safely skip `ensure_hub`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileWitness {
+    pub desired: Vec<DesiredRepo>,
+    pub hub_initialized: bool,
+    pub actual_repos: Vec<PathBuf>,
+}
+
+impl ReconcileWitness {
+    /// Whether the observed hub is fully initialized and contains every
+    /// currently reachable desired repository. Missing desired paths are
+    /// intentionally allowed: `ensure_hub` can only warn about them.
+    pub fn is_satisfied(&self) -> bool {
+        self.hub_initialized
+            && self.desired.iter().all(|desired| match desired {
+                DesiredRepo::Missing { .. } | DesiredRepo::Unavailable { .. } => true,
+                DesiredRepo::Reachable { canonical_path } => {
+                    self.actual_repos.contains(canonical_path)
+                }
+            })
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        self.desired
+            .iter()
+            .filter_map(|desired| match desired {
+                DesiredRepo::Missing {
+                    absolute_lexical_path,
+                } => Some(format!(
+                    "roster path does not exist: {}",
+                    absolute_lexical_path.display()
+                )),
+                DesiredRepo::Unavailable {
+                    absolute_lexical_path,
+                    detail,
+                } => Some(format!(
+                    "roster path is unavailable: {}: {detail}",
+                    absolute_lexical_path.display()
+                )),
+                DesiredRepo::Reachable { .. } => None,
+            })
+            .collect()
+    }
+}
+
 /// A fatal hub-lifecycle failure.
 #[derive(Debug, thiserror::Error)]
 pub enum HubError {
@@ -57,6 +119,46 @@ pub enum HubError {
 /// The hub workspace directory: `<data_dir>/hub`.
 pub fn hub_dir(paths: &Paths) -> PathBuf {
     paths.data_dir().join("hub")
+}
+
+/// Observe both the desired roster and the hub's actual initialized roster.
+pub fn reconcile_witness(paths: &Paths, roster: &Config) -> Result<ReconcileWitness, HubError> {
+    let mut desired = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &roster.repos {
+        let resolved_path = paths.resolve_roster_path(&entry.path);
+        let observed = match fs::canonicalize(&resolved_path) {
+            Ok(canonical_path) => DesiredRepo::Reachable { canonical_path },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesiredRepo::Missing {
+                absolute_lexical_path: resolved_path,
+            },
+            Err(source) => DesiredRepo::Unavailable {
+                absolute_lexical_path: resolved_path,
+                detail: source.to_string(),
+            },
+        };
+        if seen.insert(observed.clone()) {
+            desired.push(observed);
+        }
+    }
+
+    let hub = hub_dir(paths);
+    let hub_initialized = is_initialized(&hub);
+    let mut actual_repos = if hub_initialized {
+        read_hub_roster(&hub)?
+            .into_iter()
+            .map(|path| normalize(&resolve_against(&hub, &path)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    actual_repos.sort();
+    actual_repos.dedup();
+    Ok(ReconcileWitness {
+        desired,
+        hub_initialized,
+        actual_repos,
+    })
 }
 
 /// Ensure the hub exists and tracks every reachable roster repo.
@@ -90,14 +192,15 @@ pub fn ensure_hub(
 
     let mut warnings = Vec::new();
     for entry in &roster.repos {
-        if !entry.path.exists() {
+        let resolved_path = paths.resolve_roster_path(&entry.path);
+        if !resolved_path.exists() {
             warnings.push(format!(
                 "roster path does not exist: {}",
-                entry.path.display()
+                resolved_path.display()
             ));
             continue;
         }
-        let canonical = normalize(&entry.path);
+        let canonical = normalize(&resolved_path);
         // Skip repos the hub already tracks — including ones added earlier in
         // this same run, so duplicate/aliased roster entries add exactly once.
         if !existing.insert(canonical.clone()) {
@@ -539,5 +642,108 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = tmp.path().join("hub");
         assert_eq!(read_hub_roster(&hub).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn reconcile_witness_resolves_relative_roster_paths_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let roster = Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("later"),
+            }],
+        };
+
+        let witness = reconcile_witness(&paths, &roster).unwrap();
+
+        assert_eq!(
+            witness.desired,
+            vec![DesiredRepo::Missing {
+                absolute_lexical_path: paths
+                    .config_file()
+                    .parent()
+                    .expect("config file has a parent")
+                    .join("later"),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_witness_keeps_unavailable_roster_paths_nonfatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        seed_hub_config(&hub_dir(&paths), &[]);
+        let repo = tmp.path().join("loop");
+        std::os::unix::fs::symlink(&repo, &repo).unwrap();
+        let roster = roster(&[&repo]);
+
+        let witness = reconcile_witness(&paths, &roster).expect("unavailable repo is degraded");
+
+        assert!(witness.is_satisfied());
+        assert!(
+            witness.warnings()[0].contains("unavailable"),
+            "the reachability failure is surfaced as a warning"
+        );
+    }
+
+    #[test]
+    fn reconcile_witness_ignores_malformed_roster_for_partial_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let beads = hub_dir(&paths).join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("config.yaml"), "repos: [not valid").unwrap();
+
+        let witness =
+            reconcile_witness(&paths, &Config::default()).expect("partial hub remains repairable");
+
+        assert!(!witness.hub_initialized);
+        assert!(witness.actual_repos.is_empty());
+    }
+
+    #[test]
+    fn ensure_hub_resolves_relative_roster_paths_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        seed_hub_config(&hub_dir(&paths), &[]);
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = make_repo(config_dir, "repo");
+        let roster = Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("repo"),
+            }],
+        };
+        let fake = FakeBdClient::new();
+
+        let status = ensure_hub(&fake, &paths, &roster).unwrap();
+
+        assert!(status.warnings.is_empty());
+        let canonical_repo = fs::canonicalize(repo).unwrap();
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| matches!(call, Call::RepoAdd(_, actual) if actual == &canonical_repo))
+        );
+    }
+
+    #[test]
+    fn reconcile_witness_changes_when_missing_repo_becomes_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = tmp.path().join("later");
+        let roster = Config {
+            repos: vec![RepoEntry { path: repo.clone() }],
+        };
+
+        let missing = reconcile_witness(&paths, &roster).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let present = reconcile_witness(&paths, &roster).unwrap();
+
+        assert_ne!(missing, present);
+        assert!(!missing.is_satisfied());
     }
 }

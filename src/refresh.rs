@@ -8,12 +8,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::Deserialize;
@@ -24,6 +24,7 @@ use crate::hub::hub_dir;
 
 /// Advisory lock file, inside the hub dir.
 const LOCK_FILE: &str = ".fbd.lock";
+const GENERATION_FILE: &str = ".fbd-generation";
 
 /// A completed refresh. Individual repos may still appear in `errors`; a
 /// completed refresh with per-repo errors is still a success (the hub was
@@ -38,9 +39,88 @@ pub struct RefreshOutcome {
     pub synced_at: SystemTime,
     /// Diagnostic classification of the single sync invocation.
     pub sync_report: RepoSyncReport,
-    /// Complete authoritative repo-prefix map for attributing this sync's hub
-    /// contents.
-    pub attribution_prefixes: HashMap<PathBuf, String>,
+    /// Production-neutral phase observations for benchmarks and diagnostics.
+    pub metrics: RefreshMetrics,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RefreshMetrics {
+    pub source_wall: Duration,
+    pub sync: Duration,
+    pub export_calls: usize,
+    pub issue_prefix_calls: usize,
+}
+
+/// A source prefix that a non-empty, freshly exported JSONL file proved still
+/// matches every exported issue id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRepoPrefix {
+    pub normalized_path: PathBuf,
+    pub prefix: String,
+}
+
+/// Opaque provenance id pairing attributed rows with the immutable prefix map
+/// used to build them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttributionGeneration(u64);
+
+impl AttributionGeneration {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Cross-process equality token pairing the hub contents with an in-process
+/// attribution generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubGenerationToken(String);
+
+impl HubGenerationToken {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn fresh() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Self::new(format!(
+            "{}-{nanos}-{}",
+            std::process::id(),
+            GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+}
+
+/// Prefix attribution assembled for one successfully synced hub generation.
+#[derive(Debug, Clone)]
+pub struct AttributionCandidate {
+    pub roster_paths: Vec<PathBuf>,
+    pub repos: Vec<VerifiedRepoPrefix>,
+    pub prefix_map: Arc<PrefixMap>,
+}
+
+/// A successfully synced refresh whose advisory hub lock is still held.
+#[derive(Debug)]
+pub struct SyncedRefresh {
+    outcome: RefreshOutcome,
+    candidate: AttributionCandidate,
+    _lock: HubLock,
+}
+
+impl SyncedRefresh {
+    pub fn outcome(&self) -> &RefreshOutcome {
+        &self.outcome
+    }
+
+    pub fn candidate(&self) -> &AttributionCandidate {
+        &self.candidate
+    }
+
+    pub fn into_outcome(self) -> RefreshOutcome {
+        self.outcome
+    }
 }
 
 /// A per-repo failure during refresh: surfaced to the user but never aborts the
@@ -51,8 +131,8 @@ pub enum RepoError {
     /// data, and other repos still hydrate.
     #[error("export failed for {repo}: {source}")]
     Export { repo: PathBuf, source: BdError },
-    /// This repo's `.beads/metadata.json` prefix could not be read, so its
-    /// issues cannot be attributed.
+    /// This repo's effective prefix could not be read or verified, so its issues
+    /// cannot be attributed.
     #[error("cannot read prefix for {repo}: {detail}")]
     Metadata { repo: PathBuf, detail: String },
     /// Preparing, comparing, cleaning, or atomically publishing an export
@@ -92,6 +172,12 @@ pub enum RefreshError {
     /// this is returned, so no source job remains detached.
     #[error("a source refresh worker panicked")]
     WorkerPanic,
+    /// Publishing or reading the derived hub-generation marker failed.
+    #[error("hub generation marker error at {path}: {source}")]
+    Generation {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Two or more roster repos declared the same id prefix. Ids under a collided
@@ -216,6 +302,55 @@ impl HubLock {
     }
 }
 
+static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically publish the token for the hub contents while the caller holds the
+/// hub lock.
+pub(crate) fn publish_hub_generation(
+    paths: &Paths,
+    token: &HubGenerationToken,
+) -> Result<(), RefreshError> {
+    let hub = hub_dir(paths);
+    let marker = hub.join(GENERATION_FILE);
+    let temp = hub.join(format!(
+        ".fbd-generation.{}.{}.tmp",
+        std::process::id(),
+        GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(token.0.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, &marker)
+    })();
+    if let Err(source) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(RefreshError::Generation {
+            path: marker,
+            source,
+        });
+    }
+    Ok(())
+}
+
+/// Read the currently published cross-process hub token.
+pub(crate) fn read_hub_generation(
+    paths: &Paths,
+) -> Result<Option<HubGenerationToken>, RefreshError> {
+    let marker = hub_dir(paths).join(GENERATION_FILE);
+    match fs::read_to_string(&marker) {
+        Ok(value) => Ok(Some(HubGenerationToken(value))),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RefreshError::Generation {
+            path: marker,
+            source,
+        }),
+    }
+}
+
 /// Run one refresh: export every roster repo with bounded concurrency, sync the hub once,
 /// and build the prefix map. Declines with [`RefreshError::AlreadyRefreshing`]
 /// if another instance holds the hub lock.
@@ -224,48 +359,101 @@ pub fn run(
     roster: &Config,
     paths: &Paths,
 ) -> Result<RefreshOutcome, RefreshError> {
-    run_with_worker_limit(bd, roster, paths, 4)
+    let synced = run_with_state(bd, roster, paths, None, 4)?;
+    publish_hub_generation(paths, &HubGenerationToken::fresh())?;
+    Ok(synced.into_outcome())
 }
 
 /// Internal deterministic seam for the bounded scheduler's tests.
+#[cfg(test)]
 pub(crate) fn run_with_worker_limit(
     bd: &impl BdClient,
     roster: &Config,
     paths: &Paths,
     worker_limit: usize,
 ) -> Result<RefreshOutcome, RefreshError> {
+    Ok(run_with_state(bd, roster, paths, None, worker_limit)?.into_outcome())
+}
+
+/// State-aware refresh entry point. A prior candidate is only a hint: every
+/// reused prefix must be re-proved against the current non-empty export.
+pub(crate) fn run_with_state(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    previous: Option<&AttributionCandidate>,
+    worker_limit: usize,
+) -> Result<SyncedRefresh, RefreshError> {
     let hub = hub_dir(paths);
     fs::create_dir_all(&hub).map_err(|source| RefreshError::Io {
         path: hub.clone(),
         source,
     })?;
-    let _lock = match HubLock::try_acquire(&hub)? {
+    let lock = match HubLock::try_acquire(&hub)? {
         Some(lock) => lock,
         None => return Err(RefreshError::AlreadyRefreshing),
     };
-    let outcomes = run_source_jobs(bd, normalized_jobs(roster), worker_limit)?;
+    let previous_prefixes: HashMap<PathBuf, String> = previous
+        .into_iter()
+        .flat_map(|candidate| candidate.repos.iter())
+        .map(|repo| (repo.normalized_path.clone(), repo.prefix.clone()))
+        .collect();
+    let jobs = normalized_jobs(roster, paths);
+    let roster_paths = jobs
+        .iter()
+        .map(|job| normalize_path(&job.entry.path))
+        .collect();
+    let source_started = Instant::now();
+    let outcomes = run_source_jobs(bd, jobs, &previous_prefixes, worker_limit)?;
+    let source_wall = source_started.elapsed();
+    let export_calls = outcomes
+        .iter()
+        .filter(|outcome| outcome.export_called)
+        .count();
+    let issue_prefix_calls = outcomes
+        .iter()
+        .filter(|outcome| outcome.issue_prefix_called)
+        .count();
     let mut errors = Vec::new();
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
-    let mut attribution_prefixes = HashMap::new();
+    let mut verified_repos = Vec::new();
     for outcome in outcomes {
         errors.extend(outcome.errors);
         if let Some(prefix) = outcome.prefix {
-            let normalized_path = normalize_path(&outcome.entry.path);
-            attribution_prefixes.insert(normalized_path, prefix.clone());
             pairs.push((prefix, outcome.entry));
+        }
+        if let Some(verified) = outcome.verified_prefix {
+            verified_repos.push(verified);
         }
     }
 
     // One sync hydrates the hub from every repo's fresh export. A sync failure
     // is fatal: the hub was not updated, so the whole refresh failed.
+    let sync_started = Instant::now();
     let sync_report = bd.repo_sync(&hub).map_err(RefreshError::Sync)?;
+    let sync = sync_started.elapsed();
 
-    Ok(RefreshOutcome {
-        prefix_map: PrefixMap::from_pairs(pairs),
+    let prefix_map = Arc::new(PrefixMap::from_pairs(pairs));
+    let outcome = RefreshOutcome {
+        prefix_map: (*prefix_map).clone(),
         errors,
         synced_at: SystemTime::now(),
         sync_report,
-        attribution_prefixes,
+        metrics: RefreshMetrics {
+            source_wall,
+            sync,
+            export_calls,
+            issue_prefix_calls,
+        },
+    };
+    Ok(SyncedRefresh {
+        outcome,
+        candidate: AttributionCandidate {
+            roster_paths,
+            repos: verified_repos,
+            prefix_map,
+        },
+        _lock: lock,
     })
 }
 
@@ -279,19 +467,27 @@ struct SourceOutcome {
     roster_index: usize,
     entry: RepoEntry,
     prefix: Option<String>,
+    verified_prefix: Option<VerifiedRepoPrefix>,
+    export_called: bool,
+    issue_prefix_called: bool,
     errors: Vec<RepoError>,
 }
 
-fn normalized_jobs(roster: &Config) -> Vec<SourceJob> {
+fn normalized_jobs(roster: &Config, paths: &Paths) -> Vec<SourceJob> {
     let mut seen = HashSet::new();
     roster
         .repos
         .iter()
         .enumerate()
-        .filter(|(_, entry)| seen.insert(normalize_path(&entry.path)))
-        .map(|(roster_index, entry)| SourceJob {
-            roster_index,
-            entry: entry.clone(),
+        .filter_map(|(roster_index, entry)| {
+            let resolved_path = paths.resolve_roster_path(&entry.path);
+            seen.insert(normalize_path(&resolved_path))
+                .then_some(SourceJob {
+                    roster_index,
+                    entry: RepoEntry {
+                        path: resolved_path,
+                    },
+                })
         })
         .collect()
 }
@@ -299,6 +495,7 @@ fn normalized_jobs(roster: &Config) -> Vec<SourceJob> {
 fn run_source_jobs(
     bd: &impl BdClient,
     jobs: Vec<SourceJob>,
+    previous_prefixes: &HashMap<PathBuf, String>,
     worker_limit: usize,
 ) -> Result<Vec<SourceOutcome>, RefreshError> {
     if jobs.is_empty() {
@@ -324,7 +521,7 @@ fn run_source_jobs(
                         }
                     };
                     let Some(job) = job else { break };
-                    local.push(run_source_job(bd, job));
+                    local.push(run_source_job(bd, job, previous_prefixes));
                 }
                 local
             }));
@@ -346,22 +543,105 @@ fn run_source_jobs(
     Ok(joined)
 }
 
-fn run_source_job(bd: &impl BdClient, job: SourceJob) -> SourceOutcome {
+fn run_source_job(
+    bd: &impl BdClient,
+    job: SourceJob,
+    previous_prefixes: &HashMap<PathBuf, String>,
+) -> SourceOutcome {
     let mut errors = stable_export(bd, &job.entry.path);
-    let prefix = match bd.issue_prefix(&job.entry.path) {
-        Ok(prefix) => Some(prefix),
+    let export_called = job.entry.path.exists();
+    let normalized_path = normalize_path(&job.entry.path);
+    let canonical = job.entry.path.join(".beads/issues.jsonl");
+    let fresh_export_available =
+        job.entry.path.exists() && errors.is_empty() && canonical.is_file();
+
+    if let Some(cached) = previous_prefixes.get(&normalized_path)
+        && fresh_export_available
+    {
+        match exported_prefix_evidence(&canonical, cached) {
+            Ok(ExportPrefixEvidence::NonEmptyAllMatch) => {
+                return SourceOutcome {
+                    roster_index: job.roster_index,
+                    entry: job.entry,
+                    prefix: Some(cached.clone()),
+                    verified_prefix: Some(VerifiedRepoPrefix {
+                        normalized_path,
+                        prefix: cached.clone(),
+                    }),
+                    export_called,
+                    issue_prefix_called: false,
+                    errors,
+                };
+            }
+            Ok(
+                ExportPrefixEvidence::Empty
+                | ExportPrefixEvidence::NonEmptyDescendantMatch
+                | ExportPrefixEvidence::Mismatch
+                | ExportPrefixEvidence::Malformed,
+            ) => {}
+            Err(error) => errors.push(file_error(
+                &job.entry.path,
+                "validate exported ids",
+                &canonical,
+                error,
+            )),
+        }
+    }
+
+    let (prefix, verified_prefix) = match bd.issue_prefix(&job.entry.path) {
+        Ok(prefix) => {
+            let evidence = canonical
+                .is_file()
+                .then(|| exported_prefix_evidence(&canonical, &prefix))
+                .transpose();
+            match evidence {
+                Ok(Some(
+                    ExportPrefixEvidence::NonEmptyAllMatch
+                    | ExportPrefixEvidence::NonEmptyDescendantMatch,
+                )) => {
+                    let verified_prefix = fresh_export_available.then_some(VerifiedRepoPrefix {
+                        normalized_path,
+                        prefix: prefix.clone(),
+                    });
+                    (Some(prefix), verified_prefix)
+                }
+                Ok(Some(ExportPrefixEvidence::Mismatch)) => {
+                    errors.push(RepoError::Metadata {
+                        repo: job.entry.path.clone(),
+                        detail: format!(
+                            "authoritative prefix `{prefix}` does not match freshly exported ids"
+                        ),
+                    });
+                    (None, None)
+                }
+                Ok(Some(ExportPrefixEvidence::Empty | ExportPrefixEvidence::Malformed))
+                | Ok(None) => (Some(prefix), None),
+                Err(error) => {
+                    errors.push(file_error(
+                        &job.entry.path,
+                        "validate exported ids",
+                        &canonical,
+                        error,
+                    ));
+                    (Some(prefix), None)
+                }
+            }
+        }
         Err(source) => {
             errors.push(RepoError::Metadata {
                 repo: job.entry.path.clone(),
                 detail: source.to_string(),
             });
-            None
+            (None, None)
         }
     };
     SourceOutcome {
         roster_index: job.roster_index,
         entry: job.entry,
         prefix,
+        verified_prefix,
+        export_called,
+        issue_prefix_called: true,
         errors,
     }
 }
@@ -406,13 +686,8 @@ fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
             errors
         }
         Ok(false) => {
-            if let Err(error) = preserve_canonical_permissions(&canonical, &temp) {
-                let mut errors = vec![file_error(
-                    repo,
-                    "preserve export permissions",
-                    &temp,
-                    error,
-                )];
+            if let Err(error) = preserve_supported_metadata(&canonical, &temp) {
+                let mut errors = vec![file_error(repo, "preserve export metadata", &temp, error)];
                 cleanup_temp(repo, &temp, &mut errors);
                 return errors;
             }
@@ -431,6 +706,57 @@ fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
             errors
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportPrefixEvidence {
+    /// Every id has exactly one `-` delimiter after the candidate prefix.
+    NonEmptyAllMatch,
+    /// Every id starts with the candidate prefix, but at least one has another
+    /// `-` in its suffix, so the candidate may only be an ancestor prefix.
+    NonEmptyDescendantMatch,
+    Empty,
+    Mismatch,
+    Malformed,
+}
+
+#[derive(Deserialize)]
+struct ExportedId {
+    id: String,
+}
+
+fn exported_prefix_evidence(export: &Path, prefix: &str) -> std::io::Result<ExportPrefixEvidence> {
+    let reader = BufReader::new(File::open(export)?);
+    let mut saw_id = false;
+    let mut saw_descendant = false;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let exported: ExportedId = match serde_json::from_str(&line) {
+            Ok(exported) => exported,
+            Err(_) => return Ok(ExportPrefixEvidence::Malformed),
+        };
+        saw_id = true;
+        let Some(suffix) = exported
+            .id
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('-'))
+        else {
+            return Ok(ExportPrefixEvidence::Mismatch);
+        };
+        if suffix.contains('-') {
+            saw_descendant = true;
+        }
+    }
+    Ok(if saw_descendant {
+        ExportPrefixEvidence::NonEmptyDescendantMatch
+    } else if saw_id {
+        ExportPrefixEvidence::NonEmptyAllMatch
+    } else {
+        ExportPrefixEvidence::Empty
+    })
 }
 
 fn reserve_temp_export(
@@ -455,7 +781,16 @@ fn reserve_temp_export(
     }
 }
 
-fn preserve_canonical_permissions(canonical: &Path, temp: &Path) -> std::io::Result<()> {
+/// Apply fbd's supported metadata contract to a replacement export.
+///
+/// An unchanged export leaves the canonical inode untouched, preserving all of
+/// its metadata. A changed export must use a new inode for atomic rename, so the
+/// portable contract preserves `std::fs::Permissions` (Unix mode bits, Windows
+/// readonly state). Ownership remains that of the fbd-created sibling file;
+/// ACLs, xattrs, SELinux labels, file flags, and inode identity are explicitly
+/// outside the cross-platform contract. Attempting to preserve the old inode
+/// would weaken the crash-safe atomic publication invariant.
+fn preserve_supported_metadata(canonical: &Path, temp: &Path) -> std::io::Result<()> {
     match fs::metadata(canonical) {
         Ok(metadata) => fs::set_permissions(temp, metadata.permissions()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -519,7 +854,8 @@ fn file_error(
 /// factored out of [`run`], so `run`'s interleaved export/prefix call order (an
 /// asserted Slice 4 contract) is not disturbed. A per-repo prefix-read failure is
 /// a non-fatal [`RepoError`]; that repo's ids simply fall to the `unknown` bucket.
-pub fn attribution_map(bd: &impl BdClient, roster: &Config) -> (PrefixMap, Vec<RepoError>) {
+#[cfg(test)]
+pub(crate) fn attribution_map(bd: &impl BdClient, roster: &Config) -> (PrefixMap, Vec<RepoError>) {
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
     let mut errors = Vec::new();
     // Dedupe aliased/duplicate roster entries, mirroring `run`, so one repo
@@ -578,6 +914,10 @@ mod tests {
     use super::*;
     use crate::bd::{BdErrorKind, Call, FakeBdClient};
     use crate::config::RepoEntry;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::Condvar;
+    use std::sync::atomic::AtomicUsize;
 
     /// A repo dir under `base` with a seeded `.beads/metadata.json` prefix.
     fn seed_repo(base: &Path, name: &str, prefix: &str) -> PathBuf {
@@ -632,6 +972,238 @@ mod tests {
                     .any(|call| matches!(call, Call::IssuePrefix(actual) if actual == repo))
             );
         }
+    }
+
+    #[test]
+    fn refresh_resolves_relative_roster_paths_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = seed_repo(config_dir, "repo", "repo");
+        let config = Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("repo"),
+            }],
+        };
+        let fake = FakeBdClient::new();
+
+        run(&fake, &config, &paths).unwrap();
+
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| matches!(call, Call::Export(actual, _) if actual == &repo))
+        );
+    }
+
+    #[test]
+    fn source_jobs_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let a = seed_repo(tmp.path(), "a", "ra");
+        let b = seed_repo(tmp.path(), "b", "rb");
+        let barrier = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let fake = FakeBdClient::new().with_call_hook({
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |call| {
+                if matches!(call, Call::Export(..)) {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    barrier.wait();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        });
+
+        run_with_worker_limit(&fake, &roster(&[&a, &b]), &paths, 2).unwrap();
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn source_jobs_never_exceed_bound_and_sync_waits_for_all_outcomes() {
+        #[derive(Default)]
+        struct Gate {
+            active: usize,
+            maximum: usize,
+            release: bool,
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repos = (0..5)
+            .map(|index| seed_repo(tmp.path(), &format!("r{index}"), &format!("r{index}")))
+            .collect::<Vec<_>>();
+        let config = roster(&repos.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+        let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
+        let fake = Arc::new(FakeBdClient::new().with_call_hook({
+            let gate = Arc::clone(&gate);
+            move |call| {
+                if matches!(call, Call::Export(..)) {
+                    let (mutex, changed) = &*gate;
+                    let mut state = mutex.lock().unwrap();
+                    state.active += 1;
+                    state.maximum = state.maximum.max(state.active);
+                    changed.notify_all();
+                    while !state.release {
+                        state = changed.wait(state).unwrap();
+                    }
+                    state.active -= 1;
+                }
+            }
+        }));
+        let worker_fake = Arc::clone(&fake);
+        let handle =
+            thread::spawn(move || run_with_worker_limit(worker_fake.as_ref(), &config, &paths, 2));
+
+        let (mutex, changed) = &*gate;
+        let mut state = mutex.lock().unwrap();
+        while state.active < 2 {
+            state = changed.wait(state).unwrap();
+        }
+        assert_eq!(state.maximum, 2);
+        assert!(
+            fake.calls()
+                .iter()
+                .all(|call| !matches!(call, Call::RepoSync(_))),
+            "sync cannot start while source outcomes remain blocked"
+        );
+        state.release = true;
+        changed.notify_all();
+        drop(state);
+
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::RepoSync(_)))
+                .count(),
+            1
+        );
+        assert_eq!(mutex.lock().unwrap().maximum, 2);
+    }
+
+    #[test]
+    fn panicked_worker_joins_every_worker_and_skips_sync() {
+        #[derive(Default)]
+        struct Gate {
+            final_entered: bool,
+            release: bool,
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let a = seed_repo(tmp.path(), "a", "a");
+        let b = seed_repo(tmp.path(), "b", "b");
+        let c = seed_repo(tmp.path(), "c", "c");
+        let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
+        let fake = Arc::new(FakeBdClient::new().with_call_hook({
+            let b = b.clone();
+            let c = c.clone();
+            let gate = Arc::clone(&gate);
+            move |call| match call {
+                Call::Export(repo, _) if repo == &b => panic!("injected source panic"),
+                Call::Export(repo, _) if repo == &c => {
+                    let (mutex, changed) = &*gate;
+                    let mut state = mutex.lock().unwrap();
+                    state.final_entered = true;
+                    changed.notify_all();
+                    while !state.release {
+                        state = changed.wait(state).unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }));
+        let worker_fake = Arc::clone(&fake);
+        let config = roster(&[&a, &b, &c]);
+        let worker_paths = paths.clone();
+        let handle = thread::spawn(move || {
+            run_with_worker_limit(worker_fake.as_ref(), &config, &worker_paths, 2)
+        });
+
+        let (mutex, changed) = &*gate;
+        let mut state = mutex.lock().unwrap();
+        while !state.final_entered {
+            state = changed.wait(state).unwrap();
+        }
+        state.release = true;
+        changed.notify_all();
+        drop(state);
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(matches!(error, RefreshError::WorkerPanic));
+        assert!(
+            fake.calls()
+                .iter()
+                .all(|call| !matches!(call, Call::RepoSync(_)))
+        );
+        assert!(
+            HubLock::try_acquire(&hub_dir(&paths)).unwrap().is_some(),
+            "the outer refresh returns only after every worker joins and the lock releases"
+        );
+    }
+
+    #[test]
+    fn warnings_and_collisions_follow_roster_order_not_completion_order() {
+        #[derive(Default)]
+        struct Gate {
+            second_started: bool,
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let first = seed_repo(tmp.path(), "first", "dup");
+        let second = seed_repo(tmp.path(), "second", "dup");
+        let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
+        let fake = FakeBdClient::new()
+            .with_export_err(first.clone(), bd_err())
+            .with_export_err(second.clone(), bd_err())
+            .with_issue_prefix(first.clone(), "dup")
+            .with_issue_prefix(second.clone(), "dup")
+            .with_call_hook({
+                let first = first.clone();
+                let second = second.clone();
+                let gate = Arc::clone(&gate);
+                move |call| match call {
+                    Call::Export(repo, _) if repo == &first => {
+                        let (mutex, changed) = &*gate;
+                        let mut state = mutex.lock().unwrap();
+                        while !state.second_started {
+                            state = changed.wait(state).unwrap();
+                        }
+                    }
+                    Call::Export(repo, _) if repo == &second => {
+                        let (mutex, changed) = &*gate;
+                        mutex.lock().unwrap().second_started = true;
+                        changed.notify_all();
+                    }
+                    _ => {}
+                }
+            });
+
+        let outcome = run_with_worker_limit(&fake, &roster(&[&first, &second]), &paths, 2).unwrap();
+
+        let warning_repos = outcome
+            .errors
+            .iter()
+            .filter_map(|error| match error {
+                RepoError::Export { repo, .. } => Some(repo),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warning_repos, vec![&first, &second]);
+        assert_eq!(
+            outcome.prefix_map.collisions()[0].repos,
+            vec![first, second]
+        );
     }
 
     #[test]
@@ -720,6 +1292,21 @@ mod tests {
             0o600,
             "publishing changed bytes must not widen access to the canonical export"
         );
+    }
+
+    #[test]
+    fn changed_export_preserves_cross_platform_readonly_permission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = seed_repo(tmp.path(), "a", "ra");
+        let canonical = repo.join(".beads/issues.jsonl");
+        fs::write(&canonical, b"old\n").unwrap();
+        let mut permissions = fs::metadata(&canonical).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&canonical, permissions).unwrap();
+        let fake = FakeBdClient::new().with_export_content(&repo, b"new\n".to_vec());
+
+        assert!(stable_export(&fake, &repo).is_empty());
+        assert!(fs::metadata(&canonical).unwrap().permissions().readonly());
     }
 
     #[test]
@@ -965,6 +1552,226 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_nonempty_export_reuses_verified_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "reading_lite");
+        let fake = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "reading-lite")
+            .with_export_content(&repo, b"{\"id\":\"reading-lite-1\"}\n".to_vec());
+
+        let first =
+            run_with_state(&fake, &roster(&[&repo]), &paths, None, 1).expect("first refresh");
+        let verified = first.candidate().clone();
+        let _ = first.into_outcome();
+
+        let second = run_with_state(&fake, &roster(&[&repo]), &paths, Some(&verified), 1)
+            .expect("warm refresh");
+        let _ = second.into_outcome();
+
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::IssuePrefix(path) if path == &repo))
+                .count(),
+            1,
+            "the second valid export proves the retained prefix without reopening the source database"
+        );
+    }
+
+    #[test]
+    fn renamed_exported_ids_reread_only_changed_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let renamed = seed_repo(tmp.path(), "renamed", "old");
+        let stable = seed_repo(tmp.path(), "stable", "stable");
+        let first_bd = FakeBdClient::new()
+            .with_issue_prefix(renamed.clone(), "old")
+            .with_issue_prefix(stable.clone(), "stable")
+            .with_export_content(&renamed, b"{\"id\":\"old-1\"}\n".to_vec())
+            .with_export_content(&stable, b"{\"id\":\"stable-1\"}\n".to_vec());
+        let first =
+            run_with_state(&first_bd, &roster(&[&renamed, &stable]), &paths, None, 1).unwrap();
+        let verified = first.candidate().clone();
+        let _ = first.into_outcome();
+
+        let second_bd = FakeBdClient::new()
+            .with_issue_prefix(renamed.clone(), "new")
+            .with_issue_prefix(stable.clone(), "stable")
+            .with_export_content(&renamed, b"{\"id\":\"new-1\"}\n".to_vec())
+            .with_export_content(&stable, b"{\"id\":\"stable-1\"}\n".to_vec());
+        let second = run_with_state(
+            &second_bd,
+            &roster(&[&renamed, &stable]),
+            &paths,
+            Some(&verified),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second
+                .outcome()
+                .prefix_map
+                .repo_for("new-1")
+                .map(|entry| &entry.path),
+            Some(&renamed)
+        );
+        assert_eq!(
+            second_bd
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    Call::IssuePrefix(path) => Some(path),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![&renamed],
+            "the changed export invalidates only its own cached prefix"
+        );
+    }
+
+    #[test]
+    fn descendant_prefix_rename_rereads_metadata_and_reports_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let renamed = seed_repo(tmp.path(), "renamed", "foo");
+        let existing = seed_repo(tmp.path(), "existing", "foo-bar");
+        let first_bd = FakeBdClient::new()
+            .with_issue_prefix(renamed.clone(), "foo")
+            .with_issue_prefix(existing.clone(), "foo-bar")
+            .with_export_content(&renamed, b"{\"id\":\"foo-1\"}\n".to_vec())
+            .with_export_content(&existing, b"{\"id\":\"foo-bar-2\"}\n".to_vec());
+        let first =
+            run_with_state(&first_bd, &roster(&[&renamed, &existing]), &paths, None, 1).unwrap();
+        let verified = first.candidate().clone();
+        let _ = first.into_outcome();
+
+        let second_bd = FakeBdClient::new()
+            .with_issue_prefix(renamed.clone(), "foo-bar")
+            .with_issue_prefix(existing.clone(), "foo-bar")
+            .with_export_content(&renamed, b"{\"id\":\"foo-bar-1\"}\n".to_vec())
+            .with_export_content(&existing, b"{\"id\":\"foo-bar-2\"}\n".to_vec());
+        let second = run_with_state(
+            &second_bd,
+            &roster(&[&renamed, &existing]),
+            &paths,
+            Some(&verified),
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            second.outcome().prefix_map.repo_for("foo-bar-1").is_none(),
+            "the renamed repo must collide with the existing foo-bar owner"
+        );
+        assert!(
+            second_bd
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::IssuePrefix(path) if path == &renamed)),
+            "foo-bar-1 cannot prove that cached ancestor prefix foo is still exact"
+        );
+    }
+
+    #[test]
+    fn empty_export_rereads_prefix_every_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "empty", "empty");
+        let fake = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "empty")
+            .with_export_content(&repo, Vec::new());
+
+        let first = run_with_state(&fake, &roster(&[&repo]), &paths, None, 1).unwrap();
+        let candidate = first.candidate().clone();
+        assert!(candidate.repos.is_empty(), "empty output proves no prefix");
+        let _ = first.into_outcome();
+        let second = run_with_state(&fake, &roster(&[&repo]), &paths, Some(&candidate), 1).unwrap();
+        let _ = second.into_outcome();
+
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::IssuePrefix(path) if path == &repo))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_export_rereads_prefix_and_does_not_retain_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let healthy = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "ra")
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let first = run_with_state(&healthy, &roster(&[&repo]), &paths, None, 1).unwrap();
+        let previous = first.candidate().clone();
+        let _ = first.into_outcome();
+
+        let failing = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "new")
+            .with_export_err(repo.clone(), bd_err());
+        let second =
+            run_with_state(&failing, &roster(&[&repo]), &paths, Some(&previous), 1).unwrap();
+
+        assert!(second.candidate().repos.is_empty());
+        assert!(
+            second.outcome().prefix_map.repo_for("ra-1").is_none(),
+            "a changed authoritative prefix cannot attribute stale canonical ids after export failure"
+        );
+        assert_eq!(
+            failing
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::IssuePrefix(path) if path == &repo))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_export_rereads_prefix_and_does_not_retain_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let fake = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "ra")
+            .with_export_content(&repo, b"not-json\n".to_vec());
+
+        let refresh = run_with_state(&fake, &roster(&[&repo]), &paths, None, 1).unwrap();
+
+        assert!(refresh.candidate().repos.is_empty());
+        assert!(refresh.outcome().prefix_map.repo_for("ra-1").is_some());
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| matches!(call, Call::IssuePrefix(path) if path == &repo))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn authoritative_prefix_mismatching_export_is_unattributed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "wrong");
+        let fake = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "authoritative")
+            .with_export_content(&repo, b"{\"id\":\"different-1\"}\n".to_vec());
+
+        let outcome = run(&fake, &roster(&[&repo]), &paths).unwrap();
+
+        assert!(outcome.prefix_map.repo_for("different-1").is_none());
+        assert!(outcome.errors.iter().any(
+            |error| matches!(error, RepoError::Metadata { repo: actual, detail } if actual == &repo && detail.contains("does not match"))
+        ));
+    }
+
+    #[test]
     fn declines_when_lock_already_held() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
@@ -1121,5 +1928,24 @@ mod tests {
         // The refresh released the lock, so it can be re-acquired now.
         let reacquired = HubLock::try_acquire(&hub_dir(&paths)).unwrap();
         assert!(reacquired.is_some(), "lock must be released after refresh");
+    }
+
+    #[test]
+    fn hub_generation_marker_round_trips_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        fs::create_dir_all(hub_dir(&paths)).unwrap();
+        let token = HubGenerationToken::new("test-generation");
+
+        publish_hub_generation(&paths, &token).unwrap();
+
+        assert_eq!(read_hub_generation(&paths).unwrap(), Some(token));
+        assert!(fs::read_dir(hub_dir(&paths)).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")
+        }));
     }
 }

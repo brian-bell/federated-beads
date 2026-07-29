@@ -12,10 +12,11 @@ pub mod context;
 pub mod keys;
 pub mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use crate::bd::ShowDetail;
+use crate::refresh::AttributionGeneration;
 use crate::snapshot::{Row, Snapshot};
 
 /// Rows advanced by PageDown/PageUp in the detail pane. The view applies the
@@ -1054,6 +1055,7 @@ impl App {
                 issue,
                 repo_id: opened.repo_id.clone(),
                 repo_name: opened.repo_name.clone(),
+                attribution_generation: opened.attribution_generation,
             });
         }
         if self.is_browsing() {
@@ -1124,6 +1126,38 @@ impl App {
     /// The selected row, or `None` when nothing is visible.
     pub fn selected_row(&self) -> Option<&Row> {
         self.active().selected_row()
+    }
+
+    /// Attribution generations still referenced by visible or retained app
+    /// state. Runtime uses this to prune immutable prefix maps safely.
+    pub fn attribution_generations(&self) -> HashSet<AttributionGeneration> {
+        let mut generations = HashSet::new();
+        generations.extend(
+            self.ready
+                .rows
+                .iter()
+                .filter_map(|row| row.attribution_generation),
+        );
+        if let Some(search) = &self.search {
+            generations.extend(
+                search
+                    .list
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.attribution_generation),
+            );
+        }
+        if let Some(row) = &self.detail_row
+            && let Some(generation) = row.attribution_generation
+        {
+            generations.insert(generation);
+        }
+        if let Some((row, _)) = &self.copy_pending
+            && let Some(generation) = row.attribution_generation
+        {
+            generations.insert(generation);
+        }
+        generations
     }
 
     /// Install a fresh snapshot's rows: shared by `Msg::RefreshCompleted` and
@@ -1297,6 +1331,7 @@ mod tests {
             },
             repo_id: Some(repo.to_string()),
             repo_name: repo.to_string(),
+            attribution_generation: None,
         }
     }
 
@@ -2394,13 +2429,19 @@ mod tests {
         // Open detail on ra-1, then a refresh removes ra-1 and the ready selection
         // clamps to ra-2. `y` must still copy the pinned ra-1 (what the pane
         // shows), not the re-clamped selection.
-        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]);
+        let old_generation = crate::refresh::AttributionGeneration::new(1);
+        let new_generation = crate::refresh::AttributionGeneration::new(2);
+        let mut first = row("ra", "ra-1", 1);
+        first.attribution_generation = Some(old_generation);
+        let mut app = app_with(vec![first, row("ra", "ra-2", 2)]);
         let token = open(&mut app);
         app.reduce(Msg::DetailReady {
             token,
             detail: Ok(detail("ra-1")),
         });
-        app.reduce(completed(vec![row("ra", "ra-2", 2), row("ra", "ra-3", 2)]));
+        let mut refreshed = row("ra", "ra-2", 2);
+        refreshed.attribution_generation = Some(new_generation);
+        app.reduce(completed(vec![refreshed, row("ra", "ra-3", 2)]));
         assert_eq!(app.view_mode(), ViewMode::Detail, "pane stays open");
 
         let (r, _, _) = copy(&mut app, Msg::CopyContext);
@@ -2411,6 +2452,11 @@ mod tests {
         assert_eq!(
             r.repo_name, "ra",
             "the opened row's repo attribution survives the refresh, not 'unknown'"
+        );
+        assert_eq!(
+            r.attribution_generation,
+            Some(old_generation),
+            "the pinned detail row keeps the immutable map that attributed it"
         );
     }
 
@@ -2712,6 +2758,19 @@ mod tests {
         assert_eq!(app.rows().len(), 2);
         assert_eq!(app.selection(), Some(0));
         assert!(!app.is_stale());
+    }
+
+    #[test]
+    fn reports_attribution_generations_retained_by_ready_rows() {
+        let generation = crate::refresh::AttributionGeneration::new(11);
+        let mut retained = row("repo", "ra-1", 1);
+        retained.attribution_generation = Some(generation);
+        let app = app_with(vec![retained]);
+
+        assert_eq!(
+            app.attribution_generations(),
+            std::collections::HashSet::from([generation])
+        );
     }
 
     #[test]

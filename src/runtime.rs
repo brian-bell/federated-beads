@@ -10,7 +10,7 @@ use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -23,12 +23,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, Msg, context, keys, view};
-use crate::bd::{BdCli, BdClient};
+use crate::bd::{BdCli, BdClient, RepoSyncReport};
 use crate::cache;
 use crate::cli::{CliError, sanitize, version_gate};
 use crate::config::{Config, Paths};
-use crate::hub::{ensure_hub, hub_dir};
-use crate::refresh::{self, RefreshError};
+use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
+use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
 use crate::snapshot::{self, Row, Snapshot};
 use crate::ui_state;
 
@@ -46,10 +46,75 @@ const COPY_SUMMARY_MAX: usize = 72;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+#[derive(Debug, Clone, Default)]
+pub struct PipelineMetrics {
+    pub total: Duration,
+    pub version: Duration,
+    pub reconcile: Duration,
+    pub source_wall: Duration,
+    pub sync: Duration,
+    pub ready: Duration,
+    pub calls: OperationCounts,
+    pub sync_report: Option<RepoSyncReport>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OperationCounts {
+    pub version: usize,
+    pub export: usize,
+    pub issue_prefix: usize,
+    pub repo_sync: usize,
+    pub ready: usize,
+    pub search: usize,
+}
+
 #[derive(Default)]
-struct RuntimeRefreshState {
-    compatibility: OnceLock<()>,
-    attribution_prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
+pub(crate) struct RuntimeRefreshState {
+    compatibility: OnceLock<Result<(), String>>,
+    reconciled: Mutex<Option<ReconcileWitness>>,
+    hub_access: RwLock<HubGenerationState>,
+    maps: Mutex<HashMap<AttributionGeneration, Arc<refresh::PrefixMap>>>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedAttribution {
+    generation: AttributionGeneration,
+    hub_token: HubGenerationToken,
+    candidate: refresh::AttributionCandidate,
+}
+
+#[derive(Debug, Default)]
+struct HubGenerationState {
+    next_generation: u64,
+    current_hub: Option<VerifiedAttribution>,
+}
+
+impl RuntimeRefreshState {
+    fn map_for(&self, generation: AttributionGeneration) -> Option<Arc<refresh::PrefixMap>> {
+        self.maps
+            .lock()
+            .expect("attribution map registry poisoned")
+            .get(&generation)
+            .cloned()
+    }
+
+    fn register_map(&self, generation: AttributionGeneration, map: Arc<refresh::PrefixMap>) {
+        self.maps
+            .lock()
+            .expect("attribution map registry poisoned")
+            .insert(generation, map);
+    }
+
+    fn prune(&self, retained: &HashSet<AttributionGeneration>) {
+        let Ok(hub) = self.hub_access.try_read() else {
+            return;
+        };
+        let current = hub.current_hub.as_ref().map(|current| current.generation);
+        self.maps
+            .lock()
+            .expect("attribution map registry poisoned")
+            .retain(|generation, _| Some(*generation) == current || retained.contains(generation));
+    }
 }
 
 /// What the UI thread consumes from its one channel: a **raw** key event from the
@@ -67,6 +132,13 @@ pub(crate) enum Incoming {
     Key(KeyEvent),
     /// An app message from a background worker (refresh / detail / search).
     Msg(Msg),
+    /// A row-bearing result whose immutable attribution map must be registered
+    /// before the app can retain those rows.
+    AttributedMsg {
+        msg: Msg,
+        generation: AttributionGeneration,
+        map: Arc<refresh::PrefixMap>,
+    },
 }
 
 impl From<Msg> for Incoming {
@@ -183,11 +255,20 @@ fn ui_loop(
                 let msg = match incoming {
                     Incoming::Key(key) => keys::map_key(key, app.input_context()),
                     Incoming::Msg(msg) => Some(msg),
+                    Incoming::AttributedMsg {
+                        msg,
+                        generation,
+                        map,
+                    } => {
+                        refresh_state.register_map(generation, map);
+                        Some(msg)
+                    }
                 };
                 if let Some(msg) = msg {
                     for effect in app.reduce(msg) {
                         execute_effect(effect, tx, worker_handles, paths, roster, refresh_state);
                     }
+                    refresh_state.prune(&app.attribution_generations());
                     if app.is_done() {
                         return Ok(());
                     }
@@ -216,35 +297,19 @@ fn execute_effect(
     let handle = match effect {
         Effect::Refresh => spawn_refresh(tx, paths, roster, Arc::clone(refresh_state)),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
-        Effect::Search { query, token } => spawn_search(
-            tx,
-            paths,
-            roster,
-            query,
-            token,
-            refresh_state
-                .attribution_prefixes
-                .lock()
-                .expect("prefix state poisoned")
-                .clone(),
-        ),
+        Effect::Search { query, token } => {
+            spawn_search(tx, paths, query, token, Arc::clone(refresh_state))
+        }
         Effect::Copy {
             row,
             markdown,
             token,
-        } => spawn_copy(
-            tx,
-            paths,
-            roster,
-            *row,
-            markdown,
-            token,
-            refresh_state
-                .attribution_prefixes
-                .lock()
-                .expect("prefix state poisoned")
-                .clone(),
-        ),
+        } => {
+            let map = row
+                .attribution_generation
+                .and_then(|generation| refresh_state.map_for(generation));
+            spawn_copy(tx, paths, *row, markdown, token, map)
+        }
         // Not a worker: write the OSC 52 escape here, on the UI thread that owns
         // the tty, so it can never interleave with a ratatui draw. Returns without
         // a handle to track.
@@ -367,29 +432,24 @@ pub(crate) fn gather_detail(bd: &impl BdClient, paths: &Paths, id: &str) -> Resu
 }
 
 /// Spawn a background search worker that reports over `tx`, returning its join
-/// handle so the event loop can wait for it on shutdown. Clones the roster and
-/// paths into the thread and builds a fresh [`BdCli`] (stateless).
+/// handle so the event loop can wait for it on shutdown.
 fn spawn_search(
     tx: &Sender<Incoming>,
     paths: &Paths,
-    roster: &Config,
     query: String,
     token: u64,
-    prefixes: HashMap<std::path::PathBuf, String>,
+    state: Arc<RuntimeRefreshState>,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
-    let roster = roster.clone();
-    thread::spawn(move || {
-        search_worker_with_prefixes(BdCli::new(), roster, paths, query, token, tx, prefixes)
-    })
+    thread::spawn(move || search_worker_with_state(BdCli::new(), paths, query, token, tx, state))
 }
 
 /// The search worker body: run the query, attribute the results, and send exactly
 /// one [`Msg::SearchResults`] echoing `token` (so a superseded response can be
 /// dropped). Owned args so it moves cleanly into a thread; unit-tested directly
 /// with a [`crate::bd::FakeBdClient`] and a channel.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn search_worker(
     bd: impl BdClient,
     roster: Config,
@@ -402,17 +462,35 @@ pub(crate) fn search_worker(
     let _ = tx.send(Msg::SearchResults { token, rows }.into());
 }
 
-fn search_worker_with_prefixes(
+fn search_worker_with_state(
     bd: impl BdClient,
-    roster: Config,
     paths: Paths,
     query: String,
     token: u64,
     tx: Sender<Incoming>,
-    prefixes: HashMap<std::path::PathBuf, String>,
+    state: Arc<RuntimeRefreshState>,
 ) {
-    let rows = gather_search_with_prefixes(&bd, &roster, &paths, &query, &prefixes);
-    let _ = tx.send(Msg::SearchResults { token, rows }.into());
+    match gather_search_with_state(&bd, &paths, &query, &state) {
+        Ok((rows, verified)) => {
+            let _ = tx.send(Incoming::AttributedMsg {
+                msg: Msg::SearchResults {
+                    token,
+                    rows: Ok(rows),
+                },
+                generation: verified.generation,
+                map: Arc::clone(&verified.candidate.prefix_map),
+            });
+        }
+        Err(message) => {
+            let _ = tx.send(
+                Msg::SearchResults {
+                    token,
+                    rows: Err(message),
+                }
+                .into(),
+            );
+        }
+    }
 }
 
 /// Run `bd search <query> --json` against the hub and attribute the results
@@ -422,6 +500,7 @@ fn search_worker_with_prefixes(
 /// those ids fall to the `unknown` bucket). A `bd search` failure maps to a
 /// [`sanitize`]d message. No version gate / `ensure_hub`: search is reachable only
 /// from the list, i.e. after a snapshot already hydrated the hub.
+#[cfg(test)]
 pub(crate) fn gather_search(
     bd: &impl BdClient,
     roster: &Config,
@@ -436,6 +515,7 @@ pub(crate) fn gather_search(
     Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
+#[cfg(test)]
 fn gather_search_with_prefixes(
     bd: &impl BdClient,
     roster: &Config,
@@ -454,32 +534,72 @@ fn gather_search_with_prefixes(
     Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
+fn gather_search_with_state(
+    bd: &impl BdClient,
+    paths: &Paths,
+    query: &str,
+    state: &RuntimeRefreshState,
+) -> Result<(Vec<Row>, VerifiedAttribution), String> {
+    let generation_state = state
+        .hub_access
+        .read()
+        .expect("hub generation state poisoned");
+    let verified = generation_state
+        .current_hub
+        .clone()
+        .ok_or_else(|| "search unavailable until a verified refresh completes".to_string())?;
+    let hub = hub_dir(paths);
+    let _hub_lock = match refresh::HubLock::try_acquire(&hub)
+        .map_err(|error| sanitize(&format!("search failed: {error}")))?
+    {
+        Some(lock) => lock,
+        None => {
+            return Err(
+                "search unavailable while another fbd is refreshing; retry shortly".to_string(),
+            );
+        }
+    };
+    let marker = refresh::read_hub_generation(paths)
+        .map_err(|error| sanitize(&format!("search failed: {error}")))?;
+    if marker.as_ref() != Some(&verified.hub_token) {
+        return Err("hub changed in another fbd process; refresh required".to_string());
+    }
+    let issues = bd
+        .search(&hub, query)
+        .map_err(|error| sanitize(&format!("search failed: {error}")))?;
+    let rows = snapshot::attribute_with_generation(
+        issues,
+        &verified.candidate.prefix_map,
+        SystemTime::now(),
+        verified.generation,
+    )
+    .rows;
+    Ok((rows, verified))
+}
+
 /// Spawn a background copy worker that reports over `tx`, returning its join
 /// handle so the event loop can wait for it on shutdown. Clones the roster and
 /// paths into the thread and builds a fresh [`BdCli`] (stateless).
 fn spawn_copy(
     tx: &Sender<Incoming>,
     paths: &Paths,
-    roster: &Config,
     row: Row,
     markdown: bool,
     token: u64,
-    prefixes: HashMap<std::path::PathBuf, String>,
+    map: Option<Arc<refresh::PrefixMap>>,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
-    let roster = roster.clone();
     thread::spawn(move || {
-        copy_worker_with_prefixes(
-            BdCli::new(),
-            roster,
-            paths,
-            row,
-            markdown,
-            token,
-            tx,
-            prefixes,
-        )
+        let (payload, summary) = build_copy_with_map(&BdCli::new(), &paths, &row, markdown, map);
+        let _ = tx.send(
+            Msg::Copied {
+                token,
+                payload,
+                summary,
+            }
+            .into(),
+        );
     })
 }
 
@@ -488,7 +608,7 @@ fn spawn_copy(
 /// [`Msg::Copied`]. `reduce` turns that into the UI-thread [`Effect::WriteClipboard`]
 /// so the escape write never races a draw. Owned args so it moves cleanly into a
 /// thread; unit-tested directly with a [`crate::bd::FakeBdClient`] and a channel.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn copy_worker(
     bd: impl BdClient,
     roster: Config,
@@ -509,29 +629,6 @@ pub(crate) fn copy_worker(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_worker_with_prefixes(
-    bd: impl BdClient,
-    roster: Config,
-    paths: Paths,
-    row: Row,
-    markdown: bool,
-    token: u64,
-    tx: Sender<Incoming>,
-    prefixes: HashMap<std::path::PathBuf, String>,
-) {
-    let (payload, summary) =
-        build_copy_with_prefixes(&bd, &roster, &paths, &row, markdown, &prefixes);
-    let _ = tx.send(
-        Msg::Copied {
-            token,
-            payload,
-            summary,
-        }
-        .into(),
-    );
-}
-
 /// Build the clipboard payload and its status-bar summary for `row`.
 ///
 /// The command form (`markdown == false`) resolves the row's source-repo path
@@ -542,6 +639,7 @@ fn copy_worker_with_prefixes(
 /// refresh fails. This keeps detail navigation to one native `bd show` while
 /// avoiding stale copied metadata. All bd-sourced text is sanitized inside
 /// [`context`].
+#[cfg(test)]
 fn build_copy(
     bd: &impl BdClient,
     roster: &Config,
@@ -563,6 +661,7 @@ fn build_copy(
     (payload, summary)
 }
 
+#[cfg(test)]
 fn build_copy_with_prefixes(
     bd: &impl BdClient,
     roster: &Config,
@@ -583,6 +682,30 @@ fn build_copy_with_prefixes(
     (payload, summary)
 }
 
+fn build_copy_with_map(
+    bd: &impl BdClient,
+    paths: &Paths,
+    row: &Row,
+    markdown: bool,
+    map: Option<Arc<refresh::PrefixMap>>,
+) -> (String, String) {
+    let payload = if markdown {
+        let issue = bd
+            .show_issue(&hub_dir(paths), &row.issue.id)
+            .unwrap_or_else(|_| row.issue.clone());
+        context::markdown_block(&issue, &row.repo_name)
+    } else {
+        let repo = map
+            .as_deref()
+            .and_then(|prefix_map| prefix_map.repo_for(&row.issue.id))
+            .and_then(|entry| entry.path.is_dir().then(|| entry.path.clone()));
+        context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id)
+    };
+    let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
+    (payload, summary)
+}
+
+#[cfg(test)]
 fn cached_prefix_map(
     roster: &Config,
     prefixes: &HashMap<std::path::PathBuf, String>,
@@ -636,36 +759,76 @@ fn gather_snapshot_with_state(
     paths: &Paths,
     state: &RuntimeRefreshState,
 ) -> (Option<Snapshot>, Vec<String>) {
+    gather_snapshot_measured(bd, roster, paths, state).0
+}
+
+pub(crate) fn gather_snapshot_measured(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    state: &RuntimeRefreshState,
+) -> ((Option<Snapshot>, Vec<String>), PipelineMetrics) {
+    let mut metrics = PipelineMetrics::default();
+    let result = gather_snapshot_with_metrics(bd, roster, paths, state, &mut metrics);
+    (result, metrics)
+}
+
+fn gather_snapshot_with_metrics(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    state: &RuntimeRefreshState,
+    metrics: &mut PipelineMetrics,
+) -> (Option<Snapshot>, Vec<String>) {
+    let total_started = std::time::Instant::now();
     let mut warnings = Vec::new();
 
     // Version gate: a bd whose schema fbd cannot vouch for yields no snapshot.
-    if state.compatibility.get().is_none() {
-        let compatibility = match bd.version() {
-            Ok(version) => version_gate(&version).map_err(|message| sanitize(&message)),
-            Err(error) => Err(sanitize(&format!("bd version check failed: {error}"))),
-        };
-        if let Err(message) = compatibility {
-            warnings.push(message);
-            return (None, warnings);
-        }
-        let _ = state.compatibility.set(());
+    let version_was_uncached = state.compatibility.get().is_none();
+    let version_started = std::time::Instant::now();
+    let compatibility = state.compatibility.get_or_init(|| match bd.version() {
+        Ok(version) => version_gate(&version).map_err(|message| sanitize(&message)),
+        Err(error) => Err(sanitize(&format!("bd version check failed: {error}"))),
+    });
+    metrics.version = version_started.elapsed();
+    metrics.calls.version = usize::from(version_was_uncached);
+    if let Err(message) = compatibility {
+        warnings.push(message.clone());
+        metrics.total = total_started.elapsed();
+        return (None, warnings);
     }
 
-    match ensure_hub(bd, paths, roster) {
-        Ok(status) => warnings.extend(status.warnings.iter().map(|w| sanitize(w))),
+    let reconcile_started = std::time::Instant::now();
+    match ensure_reconciled(bd, paths, roster, state) {
+        Ok(reconcile_warnings) => {
+            warnings.extend(reconcile_warnings.iter().map(|warning| sanitize(warning)))
+        }
         Err(e) => {
             warnings.push(sanitize(&format!("hub error: {e}")));
+            metrics.reconcile = reconcile_started.elapsed();
+            metrics.total = total_started.elapsed();
             return (None, warnings);
         }
     }
+    metrics.reconcile = reconcile_started.elapsed();
 
     let hub = hub_dir(paths);
-    let (prefix_map, fetched_at) = match refresh::run_with_worker_limit(bd, roster, paths, 4) {
-        Ok(outcome) => {
-            for repo_error in &outcome.errors {
+    // Bind sync, marker publication, generation registration, and ready to one
+    // in-process write generation. Search takes the read side.
+    let mut generation_state = state
+        .hub_access
+        .write()
+        .expect("hub generation state poisoned");
+    let previous = generation_state
+        .current_hub
+        .as_ref()
+        .map(|verified| verified.candidate.clone());
+    let synced = match refresh::run_with_state(bd, roster, paths, previous.as_ref(), 4) {
+        Ok(synced) => {
+            for repo_error in &synced.outcome().errors {
                 warnings.push(sanitize(&repo_error.to_string()));
             }
-            for collision in outcome.prefix_map.collisions() {
+            for collision in synced.outcome().prefix_map.collisions() {
                 warnings.push(sanitize(&format!(
                     "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
                     collision.prefix,
@@ -673,11 +836,7 @@ fn gather_snapshot_with_state(
                     snapshot::UNKNOWN_REPO,
                 )));
             }
-            *state
-                .attribution_prefixes
-                .lock()
-                .expect("prefix state poisoned") = outcome.attribution_prefixes;
-            (outcome.prefix_map, outcome.synced_at)
+            synced
         }
         // Another fbd holds the lock: keep the current view intact rather than
         // fetching a snapshot with no prefix map (which would re-attribute every
@@ -685,21 +844,82 @@ fn gather_snapshot_with_state(
         // Returning `None` makes `reduce` retain the last-good rows.
         Err(RefreshError::AlreadyRefreshing) => {
             warnings.push("another fbd is refreshing this hub; keeping the current view".into());
+            metrics.total = total_started.elapsed();
             return (None, warnings);
         }
         Err(fatal) => {
             warnings.push(sanitize(&format!("refresh failed: {fatal}")));
+            metrics.total = total_started.elapsed();
             return (None, warnings);
         }
     };
+    metrics.source_wall = synced.outcome().metrics.source_wall;
+    metrics.sync = synced.outcome().metrics.sync;
+    metrics.calls.export = synced.outcome().metrics.export_calls;
+    metrics.calls.issue_prefix = synced.outcome().metrics.issue_prefix_calls;
+    metrics.calls.repo_sync = 1;
+    metrics.sync_report = Some(synced.outcome().sync_report.clone());
 
-    match snapshot::fetch(bd, &hub, &prefix_map, fetched_at) {
-        Ok(snapshot) => (Some(snapshot), warnings),
+    let hub_token = HubGenerationToken::fresh();
+    if let Err(error) = refresh::publish_hub_generation(paths, &hub_token) {
+        generation_state.current_hub = None;
+        warnings.push(sanitize(&format!("refresh failed: {error}")));
+        metrics.total = total_started.elapsed();
+        return (None, warnings);
+    }
+    generation_state.next_generation += 1;
+    let generation = AttributionGeneration::new(generation_state.next_generation);
+    let verified = VerifiedAttribution {
+        generation,
+        hub_token,
+        candidate: synced.candidate().clone(),
+    };
+    state.register_map(generation, Arc::clone(&verified.candidate.prefix_map));
+    generation_state.current_hub = Some(verified);
+
+    let ready_started = std::time::Instant::now();
+    metrics.calls.ready = 1;
+    let result = match bd.ready(&hub) {
+        Ok(issues) => (
+            Some(snapshot::attribute_with_generation(
+                issues,
+                &synced.outcome().prefix_map,
+                synced.outcome().synced_at,
+                generation,
+            )),
+            warnings,
+        ),
         Err(e) => {
             warnings.push(sanitize(&format!("reading ready list failed: {e}")));
             (None, warnings)
         }
+    };
+    metrics.ready = ready_started.elapsed();
+    metrics.total = total_started.elapsed();
+    result
+}
+
+fn ensure_reconciled(
+    bd: &impl BdClient,
+    paths: &Paths,
+    roster: &Config,
+    state: &RuntimeRefreshState,
+) -> Result<Vec<String>, crate::hub::HubError> {
+    let before = reconcile_witness(paths, roster)?;
+    let can_reuse = state
+        .reconciled
+        .lock()
+        .expect("reconcile state poisoned")
+        .as_ref()
+        .is_some_and(|cached| cached == &before && before.is_satisfied());
+    if can_reuse {
+        return Ok(before.warnings());
     }
+
+    let status = ensure_hub(bd, paths, roster)?;
+    let after = reconcile_witness(paths, roster)?;
+    *state.reconciled.lock().expect("reconcile state poisoned") = Some(after);
+    Ok(status.warnings)
 }
 
 /// The crossterm event producer: forward **raw** key presses until told to stop
@@ -792,6 +1012,7 @@ mod tests {
     fn recv_msg(rx: &Receiver<Incoming>) -> Msg {
         match rx.recv().expect("a worker message") {
             Incoming::Msg(msg) => msg,
+            Incoming::AttributedMsg { msg, .. } => msg,
             Incoming::Key(key) => panic!("workers never send keys, got {key:?}"),
         }
     }
@@ -826,6 +1047,16 @@ mod tests {
         )
         .unwrap();
         repo
+    }
+
+    fn seed_initialized_hub(paths: &Paths, additional: &[&Path]) {
+        let beads = hub_dir(paths).join(".beads");
+        fs::create_dir_all(beads.join("embeddeddolt")).unwrap();
+        let mut yaml = String::from("repos:\n  primary: \".\"\n  additional:\n");
+        for repo in additional {
+            yaml.push_str(&format!("    - \"{}\"\n", repo.display()));
+        }
+        fs::write(beads.join("config.yaml"), yaml).unwrap();
     }
 
     fn roster(paths: &[&Path]) -> Config {
@@ -866,11 +1097,13 @@ mod tests {
                         issue: issue("a-1", 1, "A"),
                         repo_id: Some("ra".into()),
                         repo_name: "repo-a".into(),
+                        attribution_generation: None,
                     },
                     Row {
                         issue: issue("b-1", 1, "B"),
                         repo_id: Some("rb".into()),
                         repo_name: "repo-b".into(),
+                        attribution_generation: None,
                     },
                 ],
                 fetched_at: now - Duration::from_secs(60),
@@ -1013,9 +1246,27 @@ mod tests {
 
         let cached = crate::cache::load(&cache_file, SystemTime::now(), &roster(&[&ra]))
             .expect("a fresh cache hit");
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .all(|row| row.attribution_generation.is_some()),
+            "live rows retain in-process provenance"
+        );
+        assert!(
+            cached
+                .rows
+                .iter()
+                .all(|row| row.attribution_generation.is_none()),
+            "disk cache never claims an in-process attribution generation"
+        );
+        let mut serializable_snapshot = snapshot;
+        for row in &mut serializable_snapshot.rows {
+            row.attribution_generation = None;
+        }
         assert_eq!(
-            cached, snapshot,
-            "the cached snapshot matches what shipped over the channel"
+            cached, serializable_snapshot,
+            "the cache preserves every serialized snapshot field"
         );
     }
 
@@ -1181,11 +1432,12 @@ mod tests {
             issue: issue(id, 1, "Ready one"),
             repo_id: None,
             repo_name: repo_name.to_string(),
+            attribution_generation: None,
         }
     }
 
     #[test]
-    fn tui_session_reuses_version_but_rechecks_authoritative_prefix() {
+    fn tui_session_reuses_version_and_verified_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
@@ -1217,12 +1469,72 @@ mod tests {
                 .iter()
                 .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(path) if path == &ra))
                 .count(),
-            2
+            1,
+            "the warm refresh revalidates the cached prefix from its fresh export"
         );
     }
 
     #[test]
-    fn tui_session_retries_version_after_transient_failure() {
+    fn missing_repo_becoming_present_invalidates_reconcile_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        seed_initialized_hub(&paths, &[]);
+        let repo = tmp.path().join("later");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let bd = FakeBdClient::new();
+
+        let first = ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        let second = ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        assert_eq!(first, second);
+        assert!(first[0].contains("does not exist"));
+        assert!(
+            bd.calls().is_empty(),
+            "stable missing state skips reconcile"
+        );
+
+        fs::create_dir_all(&repo).unwrap();
+        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
+
+        assert!(
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::RepoAdd(_, actual) if actual == &canonical_repo)),
+            "missing→present reachability invalidates the retained witness"
+        );
+    }
+
+    #[test]
+    fn external_hub_reset_and_roster_drift_invalidate_reconcile_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        seed_initialized_hub(&paths, &[&repo]);
+        let state = RuntimeRefreshState::default();
+        let bd = FakeBdClient::new();
+        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        assert!(bd.calls().is_empty());
+
+        seed_initialized_hub(&paths, &[]);
+        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
+        assert!(bd.calls().iter().any(
+            |call| matches!(call, crate::bd::Call::RepoAdd(_, actual) if actual == &canonical_repo)
+        ));
+
+        fs::remove_dir_all(hub_dir(&paths)).unwrap();
+        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        assert!(
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Init(..)))
+        );
+    }
+
+    #[test]
+    fn tui_session_caches_incompatible_version_result() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
@@ -1242,14 +1554,15 @@ mod tests {
         assert!(
             gather_snapshot_with_state(&recovered, &config, &paths, &state)
                 .0
-                .is_some(),
-            "a later refresh retries the compatibility check and can recover"
+                .is_none(),
+            "compatibility is a session invariant; recovery requires a restart"
         );
         assert!(
             recovered
                 .calls()
                 .iter()
-                .any(|call| matches!(call, crate::bd::Call::Version))
+                .all(|call| !matches!(call, crate::bd::Call::Version)),
+            "the cached failure avoids another version subprocess"
         );
     }
 
@@ -1272,17 +1585,372 @@ mod tests {
                 .0
                 .is_some()
         );
-        let prefixes = state
-            .attribution_prefixes
-            .lock()
-            .expect("prefix state poisoned")
-            .clone();
-        let rows = gather_search_with_prefixes(&bd, &config, &paths, "found", &prefixes)
-            .expect("search succeeds");
+        let rows = gather_search_with_state(&bd, &paths, "found", &state)
+            .expect("search succeeds")
+            .0;
 
         assert_eq!(
             rows[0].repo_name, "rb",
             "an authoritative prefix remains available even when its export was not reusable"
+        );
+    }
+
+    #[test]
+    fn search_after_refresh_uses_current_generation_without_prefix_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_search(vec![issue("ra-1", 1, "found")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let state = RuntimeRefreshState::default();
+        let snapshot = gather_snapshot_with_state(&bd, &config, &paths, &state)
+            .0
+            .expect("refresh");
+        let generation = snapshot.rows[0]
+            .attribution_generation
+            .expect("fresh rows are stamped");
+        let prefix_calls_before = bd
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(_)))
+            .count();
+
+        let rows = gather_search_with_state(&bd, &paths, "found", &state)
+            .unwrap()
+            .0;
+
+        assert_eq!(rows[0].attribution_generation, Some(generation));
+        assert_eq!(
+            bd.calls()
+                .iter()
+                .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(_)))
+                .count(),
+            prefix_calls_before
+        );
+    }
+
+    #[test]
+    fn old_ready_row_copied_after_refresh_uses_old_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "old");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let first_bd = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "old")
+            .with_ready(vec![issue("old-1", 1, "old")])
+            .with_export_content(&repo, b"{\"id\":\"old-1\"}\n".to_vec());
+        let old_row = gather_snapshot_with_state(&first_bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows
+            .remove(0);
+
+        let second_bd = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "new")
+            .with_ready(vec![issue("new-1", 1, "new")])
+            .with_export_content(&repo, b"{\"id\":\"new-1\"}\n".to_vec());
+        assert!(
+            gather_snapshot_with_state(&second_bd, &config, &paths, &state)
+                .0
+                .is_some()
+        );
+
+        let old_map = state
+            .map_for(old_row.attribution_generation.unwrap())
+            .expect("old visible generation retained");
+        let (payload, _) =
+            build_copy_with_map(&FakeBdClient::new(), &paths, &old_row, false, Some(old_map));
+
+        assert_eq!(payload, format!("cd {} && bd show old-1", repo.display()));
+    }
+
+    #[test]
+    fn copied_row_falls_back_to_hub_after_source_disappears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "old");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let bd = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "old")
+            .with_ready(vec![issue("old-1", 1, "old")])
+            .with_export_content(&repo, b"{\"id\":\"old-1\"}\n".to_vec());
+        let row = gather_snapshot_with_state(&bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows
+            .remove(0);
+        let map = state
+            .map_for(row.attribution_generation.unwrap())
+            .expect("visible generation retained");
+        fs::remove_dir_all(&repo).unwrap();
+
+        let (payload, _) =
+            build_copy_with_map(&FakeBdClient::new(), &paths, &row, false, Some(map));
+
+        assert_eq!(
+            payload,
+            format!("bd -C {} show old-1", hub_dir(&paths).display())
+        );
+    }
+
+    #[test]
+    fn search_rejects_mismatched_external_hub_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_search(vec![issue("ra-1", 1, "found")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let state = RuntimeRefreshState::default();
+        assert!(
+            gather_snapshot_with_state(&bd, &config, &paths, &state)
+                .0
+                .is_some()
+        );
+        fs::write(hub_dir(&paths).join(".fbd-generation"), "external").unwrap();
+
+        let error = gather_search_with_state(&bd, &paths, "found", &state)
+            .expect_err("a stale local map must fail closed");
+
+        assert!(error.contains("refresh required"), "{error}");
+        assert!(
+            bd.calls()
+                .iter()
+                .all(|call| !matches!(call, crate::bd::Call::Search(..))),
+            "the marker is verified before reading the changed hub"
+        );
+    }
+
+    #[test]
+    fn search_rejects_hub_advanced_by_stateless_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_search(vec![issue("ra-1", 1, "found")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let state = RuntimeRefreshState::default();
+        assert!(
+            gather_snapshot_with_state(&bd, &config, &paths, &state)
+                .0
+                .is_some()
+        );
+
+        refresh::run(&bd, &config, &paths).expect("another fbd refresh");
+        let error = gather_search_with_state(&bd, &paths, "found", &state)
+            .expect_err("the stateless refresh must advance the marker");
+
+        assert!(error.contains("refresh required"), "{error}");
+    }
+
+    #[test]
+    fn ready_failure_advances_hub_generation_but_preserves_old_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let first_bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let old_snapshot = gather_snapshot_with_state(&first_bd, &config, &paths, &state)
+            .0
+            .unwrap();
+        let old_generation = old_snapshot.rows[0].attribution_generation.unwrap();
+
+        let second_bd = FakeBdClient::new()
+            .with_ready_err(bd_err())
+            .with_search(vec![issue("ra-1", 1, "found")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        assert!(
+            gather_snapshot_with_state(&second_bd, &config, &paths, &state)
+                .0
+                .is_none()
+        );
+        let current_generation = state
+            .hub_access
+            .read()
+            .unwrap()
+            .current_hub
+            .as_ref()
+            .unwrap()
+            .generation;
+
+        assert_ne!(current_generation, old_generation);
+        assert!(state.map_for(old_generation).is_some());
+        let rows = gather_search_with_state(&second_bd, &paths, "found", &state)
+            .unwrap()
+            .0;
+        assert_eq!(rows[0].attribution_generation, Some(current_generation));
+    }
+
+    #[test]
+    fn marker_publish_failure_clears_current_hub_and_keeps_old_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let first_bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let old_generation = gather_snapshot_with_state(&first_bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows[0]
+            .attribution_generation
+            .unwrap();
+        let marker = hub_dir(&paths).join(".fbd-generation");
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+
+        let second_bd =
+            FakeBdClient::new().with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let (snapshot, warnings) = gather_snapshot_with_state(&second_bd, &config, &paths, &state);
+
+        assert!(snapshot.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("generation marker"))
+        );
+        assert!(state.hub_access.read().unwrap().current_hub.is_none());
+        assert!(state.map_for(old_generation).is_some());
+    }
+
+    #[test]
+    fn sync_failure_preserves_current_hub_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let first_bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let old_generation = gather_snapshot_with_state(&first_bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows[0]
+            .attribution_generation
+            .unwrap();
+        let failing = FakeBdClient::new()
+            .with_repo_sync_err(bd_err())
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+
+        assert!(
+            gather_snapshot_with_state(&failing, &config, &paths, &state)
+                .0
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .hub_access
+                .read()
+                .unwrap()
+                .current_hub
+                .as_ref()
+                .unwrap()
+                .generation,
+            old_generation
+        );
+    }
+
+    #[test]
+    fn generation_pruning_retains_current_and_explicit_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let first = gather_snapshot_with_state(&bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows[0]
+            .attribution_generation
+            .unwrap();
+        let second = gather_snapshot_with_state(&bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows[0]
+            .attribution_generation
+            .unwrap();
+        let current = gather_snapshot_with_state(&bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows[0]
+            .attribution_generation
+            .unwrap();
+
+        state.prune(&HashSet::from([first]));
+
+        assert!(state.map_for(first).is_some());
+        assert!(state.map_for(current).is_some());
+        assert!(state.map_for(second).is_none());
+    }
+
+    #[test]
+    fn cached_row_without_generation_uses_hub_copy_fallback_without_prefix_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let row = copy_row("repo", "ra-1");
+        let bd = FakeBdClient::new();
+
+        let (payload, _) = build_copy_with_map(&bd, &paths, &row, false, None);
+
+        assert_eq!(
+            payload,
+            format!("bd -C {} show ra-1", hub_dir(&paths).display())
+        );
+        assert!(bd.calls().is_empty());
+    }
+
+    #[test]
+    fn nested_source_panic_sends_one_fatal_completion_without_panicking_outer_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let bd = FakeBdClient::new().with_call_hook(|call| {
+            if matches!(call, crate::bd::Call::Export(..)) {
+                panic!("injected nested panic");
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let worker_paths = paths.clone();
+        let handle = thread::spawn(move || refresh_worker(bd, roster(&[&repo]), worker_paths, tx));
+
+        assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
+        match recv_msg(&rx) {
+            Msg::RefreshCompleted { snapshot, warnings } => {
+                assert!(snapshot.is_none());
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("worker panicked"))
+                );
+            }
+            other => panic!("expected fatal completion, got {other:?}"),
+        }
+        assert!(rx.recv().is_err(), "exactly one terminal completion");
+        assert!(
+            handle.join().is_ok(),
+            "the outer refresh worker does not panic"
+        );
+        assert!(
+            HubLock::try_acquire(&hub_dir(&paths)).unwrap().is_some(),
+            "nested workers joined and released the hub lock"
         );
     }
 

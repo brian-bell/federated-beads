@@ -529,6 +529,7 @@ mod tests {
             },
             repo_id: Some(repo.to_string()),
             repo_name: repo.to_string(),
+            attribution_generation: None,
         }
     }
 

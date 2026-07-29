@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::bd::{BdClient, BdError, Issue};
-use crate::refresh::PrefixMap;
+use crate::refresh::{AttributionGeneration, PrefixMap};
 
 /// The `repo_name` given to a row whose issue id matches no configured prefix
 /// (or matches a collided, ambiguous one). Slice 9 renders this as its own
@@ -36,6 +36,10 @@ pub struct Row {
     #[serde(default, skip_serializing)]
     pub repo_id: Option<String>,
     pub repo_name: String,
+    /// In-process attribution provenance. Disk/CLI snapshots deliberately omit
+    /// it and deserialize with no trusted generation.
+    #[serde(skip)]
+    pub attribution_generation: Option<AttributionGeneration>,
 }
 
 /// Everything the ready screen needs: attributed, display-sorted rows plus the
@@ -69,6 +73,25 @@ pub fn fetch(
 /// (Slice 11), whose worker feeds `bd search` results through this same path so
 /// search rows carry `repo_name` and sort exactly as ready rows do.
 pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemTime) -> Snapshot {
+    attribute_with_optional_generation(issues, prefix_map, fetched_at, None)
+}
+
+/// Attribute rows and stamp the immutable prefix-map generation used.
+pub fn attribute_with_generation(
+    issues: Vec<Issue>,
+    prefix_map: &PrefixMap,
+    fetched_at: SystemTime,
+    generation: AttributionGeneration,
+) -> Snapshot {
+    attribute_with_optional_generation(issues, prefix_map, fetched_at, Some(generation))
+}
+
+fn attribute_with_optional_generation(
+    issues: Vec<Issue>,
+    prefix_map: &PrefixMap,
+    fetched_at: SystemTime,
+    attribution_generation: Option<AttributionGeneration>,
+) -> Snapshot {
     // Attribute every issue to its source repo first (carrying the unique id
     // prefix), so a repo's display name can be made unique across the repos that
     // actually appear before it is stamped onto rows.
@@ -108,6 +131,7 @@ pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemT
                 issue,
                 repo_id,
                 repo_name,
+                attribution_generation,
             }
         })
         .collect();
@@ -431,6 +455,21 @@ mod tests {
             "the issue is nested under the row and exposes its id"
         );
         assert!(json.get("fetched_at").is_some(), "fetch time is serialized");
+    }
+
+    #[test]
+    fn attribution_generation_is_stamped_but_not_serialized() {
+        let generation = crate::refresh::AttributionGeneration::new(7);
+        let snapshot = attribute_with_generation(
+            vec![issue("ra-1", 1, None)],
+            &prefix_map(&[("ra", "/dev/repo-a")]),
+            at(1),
+            generation,
+        );
+
+        assert_eq!(snapshot.rows[0].attribution_generation, Some(generation));
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("generation"), "{json}");
     }
 
     #[test]

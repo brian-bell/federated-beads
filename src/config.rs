@@ -110,6 +110,20 @@ impl Paths {
         &self.ui_state_file
     }
 
+    /// Resolve a possibly-relative roster entry against the injected config
+    /// directory. This keeps direct lower-level callers deterministic even when
+    /// they construct a [`Config`] without going through the CLI load boundary.
+    pub(crate) fn resolve_roster_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.config_file
+                .parent()
+                .expect("the configured roster path always has a parent directory")
+                .join(path)
+        }
+    }
+
     /// Derive paths from explicit config and data roots. Single source of the
     /// app-dir / file-name join convention.
     fn from_roots(config_root: &Path, data_root: &Path) -> Paths {

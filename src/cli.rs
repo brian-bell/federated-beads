@@ -145,37 +145,47 @@ pub fn run_snapshot(
     }
 
     let hub = hub_dir(paths);
-    let (prefix_map, fetched_at) = match refresh::run(bd, roster, paths) {
-        Ok(outcome) => {
+    let fallback_map = PrefixMap::default();
+    let (snapshot, refresh_warnings) = match refresh::run_with_state(bd, roster, paths, None, 4) {
+        Ok(synced) => {
             // Per-repo failures and prefix collisions are surfaced but never fatal
             // — the hub still synced whatever exported cleanly.
-            for repo_error in &outcome.errors {
-                writeln!(err, "warning: {}", sanitize(&repo_error.to_string()))?;
-            }
-            for collision in outcome.prefix_map.collisions() {
-                writeln!(
-                    err,
-                    "warning: id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+            let mut warnings = synced
+                .outcome()
+                .errors
+                .iter()
+                .map(|repo_error| sanitize(&repo_error.to_string()))
+                .collect::<Vec<_>>();
+            for collision in synced.outcome().prefix_map.collisions() {
+                warnings.push(format!(
+                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
                     sanitize(&collision.prefix),
                     collision.repos.len(),
                     snapshot::UNKNOWN_REPO,
-                )?;
+                ));
             }
-            (outcome.prefix_map, outcome.synced_at)
+            refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
+            let snapshot = snapshot::fetch(
+                bd,
+                &hub,
+                &synced.outcome().prefix_map,
+                synced.outcome().synced_at,
+            )?;
+            drop(synced);
+            (snapshot, warnings)
         }
         // Degraded, not fatal: another fbd holds the lock, so print the last
         // synced data (attribution unavailable → every row falls to `unknown`).
-        Err(RefreshError::AlreadyRefreshing) => {
-            writeln!(
-                err,
-                "warning: another fbd is refreshing this hub; showing the last synced data",
-            )?;
-            (PrefixMap::default(), SystemTime::now())
-        }
+        Err(RefreshError::AlreadyRefreshing) => (
+            snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now())?,
+            vec!["another fbd is refreshing this hub; showing the last synced data".to_string()],
+        ),
         Err(fatal) => return Err(fatal.into()),
     };
 
-    let snapshot = snapshot::fetch(bd, &hub, &prefix_map, fetched_at)?;
+    for warning in refresh_warnings {
+        writeln!(err, "warning: {warning}")?;
+    }
 
     if json {
         serde_json::to_writer_pretty(&mut *out, &snapshot)
@@ -258,7 +268,9 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
 /// Load the roster from `<config>/config.toml`, treating an absent file as an
 /// empty roster (first run) while surfacing a present-but-invalid file as an
 /// error. Shared by `main`'s snapshot path (where a bad config is fatal) and
-/// `run_doctor` (where it is reported, not fatal).
+/// `run_doctor` (where it is reported, not fatal). Relative entries are
+/// absolutized against the config directory here so every lower-level consumer
+/// operates on the same repository regardless of the process CWD.
 pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
     let config_file = paths.config_file();
     // `Path::exists` collapses "absent" and "present but unreadable" (permission
@@ -268,7 +280,15 @@ pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
     // attempted so a real error surfaces per this function's contract.
     match std::fs::symlink_metadata(config_file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        _ => Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e))),
+        _ => {
+            let mut roster =
+                Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e)))?;
+            for entry in &mut roster.repos {
+                let expanded = expand_tilde(&entry.path);
+                entry.path = store_path(&paths.resolve_roster_path(&expanded));
+            }
+            Ok(roster)
+        }
     }
 }
 
@@ -598,6 +618,7 @@ mod tests {
             issue: issue(id, priority, title),
             repo_id: None,
             repo_name: repo_name.to_string(),
+            attribution_generation: None,
         }
     }
 
@@ -673,6 +694,44 @@ mod tests {
         assert!(
             stdout.contains("[ra] P1 ra-2hc Ready task one"),
             "human row present: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_releases_hub_lock_before_writing_output() {
+        struct LockCheckingWriter {
+            hub: PathBuf,
+            lock_was_available: bool,
+        }
+
+        impl Write for LockCheckingWriter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.lock_was_available |= HubLock::try_acquire(&self.hub)
+                    .expect("lock check")
+                    .is_some();
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-2hc", 1, "Ready task one")]);
+        let mut out = LockCheckingWriter {
+            hub: hub_dir(&paths),
+            lock_was_available: false,
+        };
+        let mut err = Vec::new();
+
+        run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+
+        assert!(
+            out.lock_was_available,
+            "snapshot output must not retain the completed refresh lock"
         );
     }
 
@@ -886,6 +945,37 @@ mod tests {
         fs::create_dir_all(config_file.parent().unwrap()).unwrap();
         fs::write(config_file, "not = [valid").unwrap();
         assert!(load_roster(&paths).is_err(), "invalid config must error");
+    }
+
+    #[test]
+    fn load_roster_absolutizes_relative_entries_at_the_config_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = seed_repo(config_dir, "repo", "repo");
+        let launch_dir = tmp.path().join("elsewhere");
+        fs::create_dir_all(&launch_dir).unwrap();
+        Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("repo"),
+            }],
+        }
+        .save(paths.config_file())
+        .unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(launch_dir).unwrap();
+        let loaded = load_roster(&paths);
+        std::env::set_current_dir(previous_dir).unwrap();
+
+        assert_eq!(
+            loaded.unwrap().repos[0].path,
+            fs::canonicalize(repo).unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -1250,8 +1340,14 @@ mod tests {
         // by its canonical absolute path must dedupe against it, not duplicate.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
-        let repo = seed_repo(tmp.path(), "r", "r");
-        // Persist a roster whose entry is the *relative* name, resolvable from tmp.
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = seed_repo(config_dir, "r", "r");
+        let launch_dir = tmp.path().join("elsewhere");
+        fs::create_dir_all(&launch_dir).unwrap();
+        // Persist a roster whose entry is relative to the config directory.
         Config {
             repos: vec![RepoEntry {
                 path: PathBuf::from("r"),
@@ -1262,7 +1358,7 @@ mod tests {
 
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        std::env::set_current_dir(launch_dir).unwrap();
         let mut out = Vec::new();
         // Add by the canonical absolute path.
         let result = run_repos_add(&paths, &repo.canonicalize().unwrap(), &mut out);
@@ -1289,8 +1385,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let (root, x, _y) = discovery_tree(tmp.path());
-        // Hand-edited roster: x stored relative to tmp.
-        let rel_x = x.strip_prefix(tmp.path()).unwrap().to_path_buf();
+        // Hand-edited roster: x stored relative to the config directory, which
+        // is one level below the injected base.
+        let rel_x = PathBuf::from("..").join(x.strip_prefix(tmp.path()).expect("x is under base"));
         Config {
             repos: vec![RepoEntry { path: rel_x }],
         }
