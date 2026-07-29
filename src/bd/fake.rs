@@ -5,11 +5,12 @@
 //! `hub`, `refresh`, and `snapshot` modules — which take a `&impl BdClient` —
 //! can drive it. It is a test double, not part of fbd's supported API.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use super::{BdClient, BdError, BdVersion, Issue};
+use super::{BdClient, BdError, BdVersion, Issue, RepoSyncReport};
 
 /// One recorded invocation, so tests can assert call ordering/count (e.g.
 /// "export A, export B, then sync once").
@@ -20,7 +21,7 @@ pub enum Call {
     Init(PathBuf, String),
     RepoAdd(PathBuf, PathBuf),
     RepoList(PathBuf),
-    Export(PathBuf),
+    Export(PathBuf, PathBuf),
     IssuePrefix(PathBuf),
     RepoSync(PathBuf),
     Ready(PathBuf),
@@ -44,17 +45,18 @@ pub enum Call {
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct FakeBdClient {
-    calls: RefCell<Vec<Call>>,
+    calls: Mutex<Vec<Call>>,
     version: Option<Result<BdVersion, BdError>>,
     init: Option<Result<(), BdError>>,
     repo_add: Option<Result<(), BdError>>,
     repo_list: Option<Result<serde_json::Value, BdError>>,
-    repo_sync: Option<Result<(), BdError>>,
+    repo_sync: Option<Result<RepoSyncReport, BdError>>,
     ready: Option<Result<Vec<Issue>, BdError>>,
     show: Option<Result<String, BdError>>,
     show_issue: Option<Result<Issue, BdError>>,
     search: Option<Result<Vec<Issue>, BdError>>,
     export_errs: HashMap<PathBuf, BdError>,
+    export_contents: HashMap<PathBuf, Vec<u8>>,
     issue_prefixes: HashMap<PathBuf, String>,
 }
 
@@ -145,6 +147,17 @@ impl FakeBdClient {
         self
     }
 
+    /// Program the exact bytes a successful export writes to its explicit
+    /// target. This keeps stable-publication tests deterministic.
+    pub fn with_export_content(
+        mut self,
+        repo: impl Into<PathBuf>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.export_contents.insert(repo.into(), bytes.into());
+        self
+    }
+
     /// Program `issue_prefix(repo)` to return this exact (possibly hyphenated)
     /// prefix, overriding the default (which reads the repo's seeded
     /// `metadata.json` `dolt_database`). Lets attribution tests declare a real
@@ -160,11 +173,11 @@ impl FakeBdClient {
 
     /// The invocations recorded so far, in order.
     pub fn calls(&self) -> Vec<Call> {
-        self.calls.borrow().clone()
+        self.calls.lock().expect("calls mutex poisoned").clone()
     }
 
     fn record(&self, call: Call) {
-        self.calls.borrow_mut().push(call);
+        self.calls.lock().expect("calls mutex poisoned").push(call);
     }
 }
 
@@ -206,11 +219,23 @@ impl BdClient for FakeBdClient {
         resolve(&self.repo_list, || serde_json::Value::Array(Vec::new()))
     }
 
-    fn export(&self, repo: &Path) -> Result<(), BdError> {
-        self.record(Call::Export(repo.to_path_buf()));
+    fn export_to(&self, repo: &Path, output: &Path) -> Result<(), BdError> {
+        self.record(Call::Export(repo.to_path_buf(), output.to_path_buf()));
         match self.export_errs.get(repo) {
             Some(err) => Err(err.clone()),
-            None => Ok(()),
+            None => {
+                let bytes = self
+                    .export_contents
+                    .get(repo)
+                    .cloned()
+                    .or_else(|| fs::read(repo.join(".beads/issues.jsonl")).ok())
+                    .unwrap_or_else(|| b"[]\n".to_vec());
+                fs::write(output, bytes).map_err(|error| BdError {
+                    command: format!("fake export {}", repo.display()),
+                    stderr: error.to_string(),
+                    kind: super::BdErrorKind::NonZeroExit { code: Some(1) },
+                })
+            }
         }
     }
 
@@ -230,9 +255,9 @@ impl BdClient for FakeBdClient {
         })
     }
 
-    fn repo_sync(&self, hub: &Path) -> Result<(), BdError> {
+    fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError> {
         self.record(Call::RepoSync(hub.to_path_buf()));
-        resolve(&self.repo_sync, || ())
+        resolve(&self.repo_sync, || RepoSyncReport::Other(String::new()))
     }
 
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError> {
@@ -332,8 +357,15 @@ mod tests {
         let fake = FakeBdClient::new().with_export_err("/tmp/b", boom);
 
         // Programmed path fails; a different path still exports Ok.
-        assert!(fake.export(Path::new("/tmp/a")).is_ok());
-        assert!(fake.export(Path::new("/tmp/b")).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            fake.export_to(Path::new("/tmp/a"), &tmp.path().join("a"))
+                .is_ok()
+        );
+        assert!(
+            fake.export_to(Path::new("/tmp/b"), &tmp.path().join("b"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -398,14 +430,15 @@ mod tests {
     #[test]
     fn records_calls() {
         let fake = FakeBdClient::new();
-        let _ = fake.export(Path::new("/tmp/a"));
-        let _ = fake.export(Path::new("/tmp/b"));
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = fake.export_to(Path::new("/tmp/a"), &tmp.path().join("a"));
+        let _ = fake.export_to(Path::new("/tmp/b"), &tmp.path().join("b"));
         let _ = fake.repo_sync(Path::new("/tmp/hub"));
 
         let calls = fake.calls();
         assert_eq!(calls.len(), 3);
-        assert!(matches!(&calls[0], Call::Export(p) if p == Path::new("/tmp/a")));
-        assert!(matches!(&calls[1], Call::Export(p) if p == Path::new("/tmp/b")));
+        assert!(matches!(&calls[0], Call::Export(p, _) if p == Path::new("/tmp/a")));
+        assert!(matches!(&calls[1], Call::Export(p, _) if p == Path::new("/tmp/b")));
         assert!(matches!(&calls[2], Call::RepoSync(p) if p == Path::new("/tmp/hub")));
     }
 }

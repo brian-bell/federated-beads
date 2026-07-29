@@ -6,7 +6,7 @@ use std::process::Command;
 
 use serde::de::DeserializeOwned;
 
-use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail};
+use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail, RepoSyncReport};
 
 /// The real [`BdClient`]: every method shells out to the `bd` binary on PATH.
 #[derive(Debug, Clone)]
@@ -132,7 +132,7 @@ fn argv_repo_list(hub: &Path) -> Vec<OsString> {
     ]
 }
 
-fn argv_export(repo: &Path) -> Vec<OsString> {
+fn argv_export(repo: &Path, output: &Path) -> Vec<OsString> {
     // bd resolves a relative `-o` against fbd's *process* working directory, not
     // the `-C` dir (verified against bd 1.1.0: `bd -C <repo> export -o
     // .beads/issues.jsonl` writes under the caller's cwd, not <repo>). So the
@@ -140,13 +140,12 @@ fn argv_export(repo: &Path) -> Vec<OsString> {
     // `<repo>/.beads/issues.jsonl` correctly whether `repo` is absolute (an
     // absolute `-o`) or relative (the same cwd base as `-C`), keeping each
     // export inside its own source repo instead of clobbering the caller's cwd.
-    let out = repo.join(".beads").join("issues.jsonl");
     vec![
         "-C".into(),
         arg(repo),
         "export".into(),
         "-o".into(),
-        arg(&out),
+        arg(output),
     ]
 }
 
@@ -229,8 +228,8 @@ impl BdClient for BdCli {
         self.run_json(argv_repo_list(hub))
     }
 
-    fn export(&self, repo: &Path) -> Result<(), BdError> {
-        self.run_ok(argv_export(repo))
+    fn export_to(&self, repo: &Path, output: &Path) -> Result<(), BdError> {
+        self.run_ok(argv_export(repo, output))
     }
 
     fn issue_prefix(&self, repo: &Path) -> Result<String, BdError> {
@@ -238,8 +237,19 @@ impl BdClient for BdCli {
         Ok(config.value)
     }
 
-    fn repo_sync(&self, hub: &Path) -> Result<(), BdError> {
-        self.run_ok(argv_repo_sync(hub))
+    fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError> {
+        let output = self.run_text(argv_repo_sync(hub))?;
+        let lower = output.to_ascii_lowercase();
+        if lower.contains("up to date") {
+            Ok(RepoSyncReport::UpToDate)
+        } else if let Some(count) = lower
+            .split_whitespace()
+            .find_map(|word| word.parse::<usize>().ok())
+        {
+            Ok(RepoSyncReport::Imported { count })
+        } else {
+            Ok(RepoSyncReport::Other(output))
+        }
     }
 
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError> {
@@ -294,17 +304,10 @@ mod tests {
             os(&["-C", "/tmp/hub", "repo", "list", "--json"])
         );
 
-        // bd resolves a relative `-o` against the caller's cwd, not `-C`, so the
-        // output path is joined onto the repo to keep the export inside it.
+        // The caller controls the output path; its bytes are passed unchanged.
         assert_eq!(
-            argv_export(Path::new("/tmp/ra")),
-            os(&[
-                "-C",
-                "/tmp/ra",
-                "export",
-                "-o",
-                "/tmp/ra/.beads/issues.jsonl"
-            ])
+            argv_export(Path::new("/tmp/ra"), Path::new("/tmp/export.tmp")),
+            os(&["-C", "/tmp/ra", "export", "-o", "/tmp/export.tmp"])
         );
 
         assert_eq!(

@@ -13,6 +13,16 @@ pub use types::{BdShapeError, BdVersion, Dependency, Issue, IssueDetail};
 
 use std::path::Path;
 
+/// A sanitized classification of `bd repo sync`'s status output.  Callers do
+/// not use this to decide correctness (bd remains the source of truth); it is
+/// retained for refresh diagnostics and the ignored performance matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoSyncReport {
+    Imported { count: usize },
+    UpToDate,
+    Other(String),
+}
+
 /// One loaded detail: native `bd show` text plus the structured issue retained
 /// from the ready/search row that opened the pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +36,7 @@ pub struct ShowDetail {
 ///
 /// `dir`/`hub`/`repo` are passed to `bd -C <dir>`; `hub` is fbd's aggregation
 /// workspace, `repo`/`dir` a source beads repo.
-pub trait BdClient {
+pub trait BdClient: Sync {
     /// `bd version --json` — the startup gate.
     fn version(&self) -> Result<BdVersion, BdError>;
     /// `bd -C <dir> init --prefix <prefix>` — create a beads workspace.
@@ -36,9 +46,10 @@ pub trait BdClient {
     /// `bd -C <hub> repo list --json` — the hub's registered repos. The shape is
     /// consumed in Slice 3; here it is returned as a tolerant JSON value.
     fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError>;
-    /// `bd -C <repo> export -o <repo>/.beads/issues.jsonl` — refresh a repo's
-    /// passive JSONL export (the only write fbd makes to a source repo).
-    fn export(&self, repo: &Path) -> Result<(), BdError>;
+    /// `bd -C <repo> export -o <output>` — write a passive JSONL export to the
+    /// caller-selected target. `refresh` alone decides whether to publish it
+    /// over the canonical source artifact.
+    fn export_to(&self, repo: &Path, output: &Path) -> Result<(), BdError>;
     /// `bd -C <repo> config get issue_prefix --json` — the repo's authoritative
     /// id prefix (hyphens intact), used to attribute hub ids back to their source
     /// repo. This is bd's *effective* prefix, which it reports even when
@@ -46,7 +57,7 @@ pub trait BdClient {
     /// `metadata.json`'s `dolt_database`, it is not underscore-sanitized.
     fn issue_prefix(&self, repo: &Path) -> Result<String, BdError>;
     /// `bd -C <hub> repo sync` — hydrate the hub from registered repos' exports.
-    fn repo_sync(&self, hub: &Path) -> Result<(), BdError>;
+    fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError>;
     /// `bd -C <hub> show <id>` — native text for the detail pane.

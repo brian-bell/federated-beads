@@ -5,10 +5,12 @@
 //! [`crate::app::view::draw`]. Terminal setup/teardown installs a panic hook that
 //! restores the terminal (the session-tui pattern). See `plans/slices/slice-9.md`.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -43,6 +45,12 @@ const TICK: Duration = Duration::from_secs(1);
 const COPY_SUMMARY_MAX: usize = 72;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+#[derive(Default)]
+struct RuntimeRefreshState {
+    compatibility: OnceLock<()>,
+    attribution_prefixes: Mutex<HashMap<std::path::PathBuf, String>>,
+}
 
 /// What the UI thread consumes from its one channel: a **raw** key event from the
 /// input thread, or an app [`Msg`] from a background worker.
@@ -108,8 +116,14 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     // grow across a long session (the Slice 8 guard bounds live refresh workers to
     // one; detail fetches are short and pruned likewise).
     let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let refresh_state = Arc::new(RuntimeRefreshState::default());
     // The App is born stale; launch immediately kicks off the first refresh.
-    worker_handles.push(spawn_refresh(&tx, paths, roster));
+    worker_handles.push(spawn_refresh(
+        &tx,
+        paths,
+        roster,
+        Arc::clone(&refresh_state),
+    ));
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
     // clean quit and for every error return alike — so a terminal write failure
@@ -123,6 +137,7 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         &mut worker_handles,
         paths,
         roster,
+        &refresh_state,
     );
     stop.store(true, Ordering::SeqCst);
     let _ = input_handle.join();
@@ -144,6 +159,7 @@ fn initial_app(paths: &Paths, roster: &Config, now: SystemTime) -> App {
 
 /// The render/reduce loop, factored out so [`event_loop`] can join its threads
 /// whether this returns `Ok` (a `q` quit) or `Err` (a terminal draw failure).
+#[allow(clippy::too_many_arguments)]
 fn ui_loop(
     terminal: &mut Tui,
     rx: &Receiver<Incoming>,
@@ -152,6 +168,7 @@ fn ui_loop(
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
     roster: &Config,
+    refresh_state: &Arc<RuntimeRefreshState>,
 ) -> Result<(), CliError> {
     draw(terminal, app)?;
     // Redraw on every message and on every idle tick, so the staleness age keeps
@@ -169,7 +186,7 @@ fn ui_loop(
                 };
                 if let Some(msg) = msg {
                     for effect in app.reduce(msg) {
-                        execute_effect(effect, tx, worker_handles, paths, roster);
+                        execute_effect(effect, tx, worker_handles, paths, roster, refresh_state);
                     }
                     if app.is_done() {
                         return Ok(());
@@ -193,17 +210,41 @@ fn execute_effect(
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
     roster: &Config,
+    refresh_state: &Arc<RuntimeRefreshState>,
 ) {
     worker_handles.retain(|h| !h.is_finished());
     let handle = match effect {
-        Effect::Refresh => spawn_refresh(tx, paths, roster),
+        Effect::Refresh => spawn_refresh(tx, paths, roster, Arc::clone(refresh_state)),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
-        Effect::Search { query, token } => spawn_search(tx, paths, roster, query, token),
+        Effect::Search { query, token } => spawn_search(
+            tx,
+            paths,
+            roster,
+            query,
+            token,
+            refresh_state
+                .attribution_prefixes
+                .lock()
+                .expect("prefix state poisoned")
+                .clone(),
+        ),
         Effect::Copy {
             row,
             markdown,
             token,
-        } => spawn_copy(tx, paths, roster, *row, markdown, token),
+        } => spawn_copy(
+            tx,
+            paths,
+            roster,
+            *row,
+            markdown,
+            token,
+            refresh_state
+                .attribution_prefixes
+                .lock()
+                .expect("prefix state poisoned")
+                .clone(),
+        ),
         // Not a worker: write the OSC 52 escape here, on the UI thread that owns
         // the tty, so it can never interleave with a ratatui draw. Returns without
         // a handle to track.
@@ -239,11 +280,16 @@ fn draw(terminal: &mut Tui, app: &mut App) -> Result<(), CliError> {
 /// Spawn a background refresh worker that reports over `tx`, returning its join
 /// handle so the event loop can wait for it on shutdown. Clones the roster and
 /// paths into the thread and builds a fresh [`BdCli`] (stateless).
-fn spawn_refresh(tx: &Sender<Incoming>, paths: &Paths, roster: &Config) -> thread::JoinHandle<()> {
+fn spawn_refresh(
+    tx: &Sender<Incoming>,
+    paths: &Paths,
+    roster: &Config,
+    state: Arc<RuntimeRefreshState>,
+) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
-    thread::spawn(move || refresh_worker(BdCli::new(), roster, paths, tx))
+    thread::spawn(move || refresh_worker_with_state(BdCli::new(), roster, paths, tx, state))
 }
 
 /// The refresh worker body: announce the start, run the pipeline, cache a
@@ -251,14 +297,31 @@ fn spawn_refresh(tx: &Sender<Incoming>, paths: &Paths, roster: &Config) -> threa
 /// delivery), then send exactly one atomic completion. Owned args so it moves
 /// cleanly into a thread; unit-tested directly with a [`crate::bd::FakeBdClient`]
 /// and a channel.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn refresh_worker(
     bd: impl BdClient,
     roster: Config,
     paths: Paths,
     tx: Sender<Incoming>,
 ) {
+    refresh_worker_with_state(
+        bd,
+        roster,
+        paths,
+        tx,
+        Arc::new(RuntimeRefreshState::default()),
+    );
+}
+
+fn refresh_worker_with_state(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    tx: Sender<Incoming>,
+    state: Arc<RuntimeRefreshState>,
+) {
     let _ = tx.send(Msg::RefreshStarted.into());
-    let (snapshot, warnings) = gather_snapshot(&bd, &roster, &paths);
+    let (snapshot, warnings) = gather_snapshot_with_state(&bd, &roster, &paths, &state);
     if let Some(snapshot) = &snapshot {
         let _ = cache::save(paths.cache_file(), snapshot, &roster);
     }
@@ -312,17 +375,21 @@ fn spawn_search(
     roster: &Config,
     query: String,
     token: u64,
+    prefixes: HashMap<std::path::PathBuf, String>,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
-    thread::spawn(move || search_worker(BdCli::new(), roster, paths, query, token, tx))
+    thread::spawn(move || {
+        search_worker_with_prefixes(BdCli::new(), roster, paths, query, token, tx, prefixes)
+    })
 }
 
 /// The search worker body: run the query, attribute the results, and send exactly
 /// one [`Msg::SearchResults`] echoing `token` (so a superseded response can be
 /// dropped). Owned args so it moves cleanly into a thread; unit-tested directly
 /// with a [`crate::bd::FakeBdClient`] and a channel.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn search_worker(
     bd: impl BdClient,
     roster: Config,
@@ -332,6 +399,19 @@ pub(crate) fn search_worker(
     tx: Sender<Incoming>,
 ) {
     let rows = gather_search(&bd, &roster, &paths, &query);
+    let _ = tx.send(Msg::SearchResults { token, rows }.into());
+}
+
+fn search_worker_with_prefixes(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    query: String,
+    token: u64,
+    tx: Sender<Incoming>,
+    prefixes: HashMap<std::path::PathBuf, String>,
+) {
+    let rows = gather_search_with_prefixes(&bd, &roster, &paths, &query, &prefixes);
     let _ = tx.send(Msg::SearchResults { token, rows }.into());
 }
 
@@ -356,6 +436,24 @@ pub(crate) fn gather_search(
     Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
+fn gather_search_with_prefixes(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    query: &str,
+    prefixes: &HashMap<std::path::PathBuf, String>,
+) -> Result<Vec<Row>, String> {
+    if prefixes.is_empty() {
+        return gather_search(bd, roster, paths, query);
+    }
+    let hub = hub_dir(paths);
+    let issues = bd
+        .search(&hub, query)
+        .map_err(|e| sanitize(&format!("search failed: {e}")))?;
+    let prefix_map = cached_prefix_map(roster, prefixes);
+    Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
+}
+
 /// Spawn a background copy worker that reports over `tx`, returning its join
 /// handle so the event loop can wait for it on shutdown. Clones the roster and
 /// paths into the thread and builds a fresh [`BdCli`] (stateless).
@@ -366,11 +464,23 @@ fn spawn_copy(
     row: Row,
     markdown: bool,
     token: u64,
+    prefixes: HashMap<std::path::PathBuf, String>,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
-    thread::spawn(move || copy_worker(BdCli::new(), roster, paths, row, markdown, token, tx))
+    thread::spawn(move || {
+        copy_worker_with_prefixes(
+            BdCli::new(),
+            roster,
+            paths,
+            row,
+            markdown,
+            token,
+            tx,
+            prefixes,
+        )
+    })
 }
 
 /// The copy worker body: build the clipboard payload + status summary off the UI
@@ -378,6 +488,7 @@ fn spawn_copy(
 /// [`Msg::Copied`]. `reduce` turns that into the UI-thread [`Effect::WriteClipboard`]
 /// so the escape write never races a draw. Owned args so it moves cleanly into a
 /// thread; unit-tested directly with a [`crate::bd::FakeBdClient`] and a channel.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn copy_worker(
     bd: impl BdClient,
     roster: Config,
@@ -388,6 +499,29 @@ pub(crate) fn copy_worker(
     tx: Sender<Incoming>,
 ) {
     let (payload, summary) = build_copy(&bd, &roster, &paths, &row, markdown);
+    let _ = tx.send(
+        Msg::Copied {
+            token,
+            payload,
+            summary,
+        }
+        .into(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_worker_with_prefixes(
+    bd: impl BdClient,
+    roster: Config,
+    paths: Paths,
+    row: Row,
+    markdown: bool,
+    token: u64,
+    tx: Sender<Incoming>,
+    prefixes: HashMap<std::path::PathBuf, String>,
+) {
+    let (payload, summary) =
+        build_copy_with_prefixes(&bd, &roster, &paths, &row, markdown, &prefixes);
     let _ = tx.send(
         Msg::Copied {
             token,
@@ -429,6 +563,47 @@ fn build_copy(
     (payload, summary)
 }
 
+fn build_copy_with_prefixes(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    row: &Row,
+    markdown: bool,
+    prefixes: &HashMap<std::path::PathBuf, String>,
+) -> (String, String) {
+    if markdown || prefixes.is_empty() {
+        return build_copy(bd, roster, paths, row, markdown);
+    }
+    let prefix_map = cached_prefix_map(roster, prefixes);
+    let repo = prefix_map
+        .repo_for(&row.issue.id)
+        .map(|entry| entry.path.clone());
+    let payload = context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id);
+    let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
+    (payload, summary)
+}
+
+fn cached_prefix_map(
+    roster: &Config,
+    prefixes: &HashMap<std::path::PathBuf, String>,
+) -> refresh::PrefixMap {
+    let mut seen = HashSet::new();
+    let pairs = roster
+        .repos
+        .iter()
+        .filter_map(|entry| {
+            let normalized_path = refresh::normalize_path(&entry.path);
+            if !seen.insert(normalized_path.clone()) {
+                return None;
+            }
+            prefixes
+                .get(&normalized_path)
+                .map(|prefix| (prefix.clone(), entry.clone()))
+        })
+        .collect();
+    refresh::PrefixMap::from_pairs(pairs)
+}
+
 /// Write `payload` to the terminal clipboard via an OSC 52 escape. Called only on
 /// the UI thread (which owns the tty), so the sequence can never interleave with
 /// a ratatui draw. Best-effort: a terminal that ignores OSC 52 simply drops it,
@@ -446,25 +621,34 @@ fn write_clipboard(payload: &str) {
 /// [`crate::cli::run_snapshot`]: the TUI degrades and stays interactive. All
 /// warnings are [`sanitize`]d (they embed bd stderr / paths and reach a
 /// terminal).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn gather_snapshot(
     bd: &impl BdClient,
     roster: &Config,
     paths: &Paths,
 ) -> (Option<Snapshot>, Vec<String>) {
+    gather_snapshot_with_state(bd, roster, paths, &RuntimeRefreshState::default())
+}
+
+fn gather_snapshot_with_state(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    state: &RuntimeRefreshState,
+) -> (Option<Snapshot>, Vec<String>) {
     let mut warnings = Vec::new();
 
     // Version gate: a bd whose schema fbd cannot vouch for yields no snapshot.
-    match bd.version() {
-        Ok(v) => {
-            if let Err(msg) = version_gate(&v) {
-                warnings.push(sanitize(&msg));
-                return (None, warnings);
-            }
-        }
-        Err(e) => {
-            warnings.push(sanitize(&format!("bd version check failed: {e}")));
+    if state.compatibility.get().is_none() {
+        let compatibility = match bd.version() {
+            Ok(version) => version_gate(&version).map_err(|message| sanitize(&message)),
+            Err(error) => Err(sanitize(&format!("bd version check failed: {error}"))),
+        };
+        if let Err(message) = compatibility {
+            warnings.push(message);
             return (None, warnings);
         }
+        let _ = state.compatibility.set(());
     }
 
     match ensure_hub(bd, paths, roster) {
@@ -476,7 +660,7 @@ pub(crate) fn gather_snapshot(
     }
 
     let hub = hub_dir(paths);
-    let (prefix_map, fetched_at) = match refresh::run(bd, roster, paths) {
+    let (prefix_map, fetched_at) = match refresh::run_with_worker_limit(bd, roster, paths, 4) {
         Ok(outcome) => {
             for repo_error in &outcome.errors {
                 warnings.push(sanitize(&repo_error.to_string()));
@@ -489,6 +673,10 @@ pub(crate) fn gather_snapshot(
                     snapshot::UNKNOWN_REPO,
                 )));
             }
+            *state
+                .attribution_prefixes
+                .lock()
+                .expect("prefix state poisoned") = outcome.attribution_prefixes;
             (outcome.prefix_map, outcome.synced_at)
         }
         // Another fbd holds the lock: keep the current view intact rather than
@@ -720,6 +908,7 @@ mod tests {
             &mut handles,
             &paths,
             &Config::default(),
+            &Arc::new(RuntimeRefreshState::default()),
         );
 
         assert!(
@@ -756,6 +945,7 @@ mod tests {
             &mut handles,
             &paths,
             &Config::default(),
+            &Arc::new(RuntimeRefreshState::default()),
         );
 
         match recv_msg(&rx) {
@@ -992,6 +1182,152 @@ mod tests {
             repo_id: None,
             repo_name: repo_name.to_string(),
         }
+    }
+
+    #[test]
+    fn tui_session_reuses_version_but_rechecks_authoritative_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let state = RuntimeRefreshState::default();
+
+        assert!(
+            gather_snapshot_with_state(&bd, &roster(&[&ra]), &paths, &state)
+                .0
+                .is_some()
+        );
+        assert!(
+            gather_snapshot_with_state(&bd, &roster(&[&ra]), &paths, &state)
+                .0
+                .is_some()
+        );
+        let calls = bd.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, crate::bd::Call::Version))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(path) if path == &ra))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn tui_session_retries_version_after_transient_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let config = roster(&[&ra]);
+        let state = RuntimeRefreshState::default();
+        let failing = FakeBdClient::new().with_version_err(bd_err());
+
+        assert!(
+            gather_snapshot_with_state(&failing, &config, &paths, &state)
+                .0
+                .is_none()
+        );
+
+        let recovered = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec());
+        assert!(
+            gather_snapshot_with_state(&recovered, &config, &paths, &state)
+                .0
+                .is_some(),
+            "a later refresh retries the compatibility check and can recover"
+        );
+        assert!(
+            recovered
+                .calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Version))
+        );
+    }
+
+    #[test]
+    fn tui_session_keeps_authoritative_prefixes_for_search_attribution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let config = roster(&[&ra, &rb]);
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("rb-1", 1, "ready")])
+            .with_search(vec![issue("rb-1", 1, "found")])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec())
+            .with_export_content(&rb, Vec::new());
+        let state = RuntimeRefreshState::default();
+
+        assert!(
+            gather_snapshot_with_state(&bd, &config, &paths, &state)
+                .0
+                .is_some()
+        );
+        let prefixes = state
+            .attribution_prefixes
+            .lock()
+            .expect("prefix state poisoned")
+            .clone();
+        let rows = gather_search_with_prefixes(&bd, &config, &paths, "found", &prefixes)
+            .expect("search succeeds");
+
+        assert_eq!(
+            rows[0].repo_name, "rb",
+            "an authoritative prefix remains available even when its export was not reusable"
+        );
+    }
+
+    #[test]
+    fn cached_search_prefixes_deduplicate_duplicate_roster_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let config = roster(&[&ra, &ra]);
+        let bd = FakeBdClient::new().with_search(vec![issue("ra-1", 1, "found")]);
+        let prefixes = HashMap::from([(refresh::normalize_path(&ra), "ra".to_string())]);
+
+        let rows = gather_search_with_prefixes(&bd, &config, &paths, "found", &prefixes)
+            .expect("search succeeds");
+
+        assert_eq!(
+            rows[0].repo_name, "ra",
+            "a duplicate roster entry must not turn one cached prefix into a collision"
+        );
+    }
+
+    #[test]
+    fn cached_copy_prefixes_deduplicate_duplicate_roster_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let alias = ra.join(".");
+        let config = roster(&[&ra, &alias]);
+        let prefixes = HashMap::from([(refresh::normalize_path(&ra), "ra".to_string())]);
+        let row = copy_row("ra", "ra-1");
+
+        let (payload, _) = build_copy_with_prefixes(
+            &FakeBdClient::new(),
+            &config,
+            &paths,
+            &row,
+            false,
+            &prefixes,
+        );
+
+        assert_eq!(
+            payload,
+            format!("cd {} && bd show ra-1", ra.display()),
+            "a duplicate roster entry must not force command copy through the hub"
+        );
     }
 
     #[test]
