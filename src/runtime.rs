@@ -698,7 +698,7 @@ fn build_copy_with_map(
         let repo = map
             .as_deref()
             .and_then(|prefix_map| prefix_map.repo_for(&row.issue.id))
-            .map(|entry| entry.path.clone());
+            .and_then(|entry| entry.path.is_dir().then(|| entry.path.clone()));
         context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id)
     };
     let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
@@ -1666,6 +1666,36 @@ mod tests {
             build_copy_with_map(&FakeBdClient::new(), &paths, &old_row, false, Some(old_map));
 
         assert_eq!(payload, format!("cd {} && bd show old-1", repo.display()));
+    }
+
+    #[test]
+    fn copied_row_falls_back_to_hub_after_source_disappears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "old");
+        let config = roster(&[&repo]);
+        let state = RuntimeRefreshState::default();
+        let bd = FakeBdClient::new()
+            .with_issue_prefix(repo.clone(), "old")
+            .with_ready(vec![issue("old-1", 1, "old")])
+            .with_export_content(&repo, b"{\"id\":\"old-1\"}\n".to_vec());
+        let row = gather_snapshot_with_state(&bd, &config, &paths, &state)
+            .0
+            .unwrap()
+            .rows
+            .remove(0);
+        let map = state
+            .map_for(row.attribution_generation.unwrap())
+            .expect("visible generation retained");
+        fs::remove_dir_all(&repo).unwrap();
+
+        let (payload, _) =
+            build_copy_with_map(&FakeBdClient::new(), &paths, &row, false, Some(map));
+
+        assert_eq!(
+            payload,
+            format!("bd -C {} show old-1", hub_dir(&paths).display())
+        );
     }
 
     #[test]

@@ -575,6 +575,7 @@ fn run_source_job(
             }
             Ok(
                 ExportPrefixEvidence::Empty
+                | ExportPrefixEvidence::NonEmptyDescendantMatch
                 | ExportPrefixEvidence::Mismatch
                 | ExportPrefixEvidence::Malformed,
             ) => {}
@@ -594,7 +595,10 @@ fn run_source_job(
                 .then(|| exported_prefix_evidence(&canonical, &prefix))
                 .transpose();
             match evidence {
-                Ok(Some(ExportPrefixEvidence::NonEmptyAllMatch)) => {
+                Ok(Some(
+                    ExportPrefixEvidence::NonEmptyAllMatch
+                    | ExportPrefixEvidence::NonEmptyDescendantMatch,
+                )) => {
                     let verified_prefix = fresh_export_available.then_some(VerifiedRepoPrefix {
                         normalized_path,
                         prefix: prefix.clone(),
@@ -706,7 +710,11 @@ fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportPrefixEvidence {
+    /// Every id has exactly one `-` delimiter after the candidate prefix.
     NonEmptyAllMatch,
+    /// Every id starts with the candidate prefix, but at least one has another
+    /// `-` in its suffix, so the candidate may only be an ancestor prefix.
+    NonEmptyDescendantMatch,
     Empty,
     Mismatch,
     Malformed,
@@ -720,6 +728,7 @@ struct ExportedId {
 fn exported_prefix_evidence(export: &Path, prefix: &str) -> std::io::Result<ExportPrefixEvidence> {
     let reader = BufReader::new(File::open(export)?);
     let mut saw_id = false;
+    let mut saw_descendant = false;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -730,15 +739,20 @@ fn exported_prefix_evidence(export: &Path, prefix: &str) -> std::io::Result<Expo
             Err(_) => return Ok(ExportPrefixEvidence::Malformed),
         };
         saw_id = true;
-        if !exported
+        let Some(suffix) = exported
             .id
             .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('-'))
-        {
+            .and_then(|rest| rest.strip_prefix('-'))
+        else {
             return Ok(ExportPrefixEvidence::Mismatch);
+        };
+        if suffix.contains('-') {
+            saw_descendant = true;
         }
     }
-    Ok(if saw_id {
+    Ok(if saw_descendant {
+        ExportPrefixEvidence::NonEmptyDescendantMatch
+    } else if saw_id {
         ExportPrefixEvidence::NonEmptyAllMatch
     } else {
         ExportPrefixEvidence::Empty
@@ -1614,6 +1628,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&renamed],
             "the changed export invalidates only its own cached prefix"
+        );
+    }
+
+    #[test]
+    fn descendant_prefix_rename_rereads_metadata_and_reports_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let renamed = seed_repo(tmp.path(), "renamed", "foo");
+        let existing = seed_repo(tmp.path(), "existing", "foo-bar");
+        let first_bd = FakeBdClient::new()
+            .with_issue_prefix(renamed.clone(), "foo")
+            .with_issue_prefix(existing.clone(), "foo-bar")
+            .with_export_content(&renamed, b"{\"id\":\"foo-1\"}\n".to_vec())
+            .with_export_content(&existing, b"{\"id\":\"foo-bar-2\"}\n".to_vec());
+        let first =
+            run_with_state(&first_bd, &roster(&[&renamed, &existing]), &paths, None, 1).unwrap();
+        let verified = first.candidate().clone();
+        let _ = first.into_outcome();
+
+        let second_bd = FakeBdClient::new()
+            .with_issue_prefix(renamed.clone(), "foo-bar")
+            .with_issue_prefix(existing.clone(), "foo-bar")
+            .with_export_content(&renamed, b"{\"id\":\"foo-bar-1\"}\n".to_vec())
+            .with_export_content(&existing, b"{\"id\":\"foo-bar-2\"}\n".to_vec());
+        let second = run_with_state(
+            &second_bd,
+            &roster(&[&renamed, &existing]),
+            &paths,
+            Some(&verified),
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            second.outcome().prefix_map.repo_for("foo-bar-1").is_none(),
+            "the renamed repo must collide with the existing foo-bar owner"
+        );
+        assert!(
+            second_bd
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::IssuePrefix(path) if path == &renamed)),
+            "foo-bar-1 cannot prove that cached ancestor prefix foo is still exact"
         );
     }
 

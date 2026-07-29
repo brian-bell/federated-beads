@@ -145,47 +145,47 @@ pub fn run_snapshot(
     }
 
     let hub = hub_dir(paths);
-    let synced = match refresh::run_with_state(bd, roster, paths, None, 4) {
+    let fallback_map = PrefixMap::default();
+    let (snapshot, refresh_warnings) = match refresh::run_with_state(bd, roster, paths, None, 4) {
         Ok(synced) => {
             // Per-repo failures and prefix collisions are surfaced but never fatal
             // — the hub still synced whatever exported cleanly.
-            for repo_error in &synced.outcome().errors {
-                writeln!(err, "warning: {}", sanitize(&repo_error.to_string()))?;
-            }
+            let mut warnings = synced
+                .outcome()
+                .errors
+                .iter()
+                .map(|repo_error| sanitize(&repo_error.to_string()))
+                .collect::<Vec<_>>();
             for collision in synced.outcome().prefix_map.collisions() {
-                writeln!(
-                    err,
-                    "warning: id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+                warnings.push(format!(
+                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
                     sanitize(&collision.prefix),
                     collision.repos.len(),
                     snapshot::UNKNOWN_REPO,
-                )?;
+                ));
             }
             refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
-            Some(synced)
+            let snapshot = snapshot::fetch(
+                bd,
+                &hub,
+                &synced.outcome().prefix_map,
+                synced.outcome().synced_at,
+            )?;
+            drop(synced);
+            (snapshot, warnings)
         }
         // Degraded, not fatal: another fbd holds the lock, so print the last
         // synced data (attribution unavailable → every row falls to `unknown`).
-        Err(RefreshError::AlreadyRefreshing) => {
-            writeln!(
-                err,
-                "warning: another fbd is refreshing this hub; showing the last synced data",
-            )?;
-            None
-        }
+        Err(RefreshError::AlreadyRefreshing) => (
+            snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now())?,
+            vec!["another fbd is refreshing this hub; showing the last synced data".to_string()],
+        ),
         Err(fatal) => return Err(fatal.into()),
     };
 
-    let fallback_map = PrefixMap::default();
-    let snapshot = match synced.as_ref() {
-        Some(synced) => snapshot::fetch(
-            bd,
-            &hub,
-            &synced.outcome().prefix_map,
-            synced.outcome().synced_at,
-        )?,
-        None => snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now())?,
-    };
+    for warning in refresh_warnings {
+        writeln!(err, "warning: {warning}")?;
+    }
 
     if json {
         serde_json::to_writer_pretty(&mut *out, &snapshot)
@@ -694,6 +694,44 @@ mod tests {
         assert!(
             stdout.contains("[ra] P1 ra-2hc Ready task one"),
             "human row present: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_releases_hub_lock_before_writing_output() {
+        struct LockCheckingWriter {
+            hub: PathBuf,
+            lock_was_available: bool,
+        }
+
+        impl Write for LockCheckingWriter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.lock_was_available |= HubLock::try_acquire(&self.hub)
+                    .expect("lock check")
+                    .is_some();
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-2hc", 1, "Ready task one")]);
+        let mut out = LockCheckingWriter {
+            hub: hub_dir(&paths),
+            lock_was_available: false,
+        };
+        let mut err = Vec::new();
+
+        run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+
+        assert!(
+            out.lock_was_available,
+            "snapshot output must not retain the completed refresh lock"
         );
     }
 

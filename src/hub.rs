@@ -35,8 +35,16 @@ pub struct HubStatus {
 /// part of the identity so a path becoming present invalidates retained state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DesiredRepo {
-    Missing { absolute_lexical_path: PathBuf },
-    Reachable { canonical_path: PathBuf },
+    Missing {
+        absolute_lexical_path: PathBuf,
+    },
+    Unavailable {
+        absolute_lexical_path: PathBuf,
+        detail: String,
+    },
+    Reachable {
+        canonical_path: PathBuf,
+    },
 }
 
 /// Cheap desired/actual hub state used to decide whether a TUI refresh may
@@ -55,7 +63,7 @@ impl ReconcileWitness {
     pub fn is_satisfied(&self) -> bool {
         self.hub_initialized
             && self.desired.iter().all(|desired| match desired {
-                DesiredRepo::Missing { .. } => true,
+                DesiredRepo::Missing { .. } | DesiredRepo::Unavailable { .. } => true,
                 DesiredRepo::Reachable { canonical_path } => {
                     self.actual_repos.contains(canonical_path)
                 }
@@ -70,6 +78,13 @@ impl ReconcileWitness {
                     absolute_lexical_path,
                 } => Some(format!(
                     "roster path does not exist: {}",
+                    absolute_lexical_path.display()
+                )),
+                DesiredRepo::Unavailable {
+                    absolute_lexical_path,
+                    detail,
+                } => Some(format!(
+                    "roster path is unavailable: {}: {detail}",
                     absolute_lexical_path.display()
                 )),
                 DesiredRepo::Reachable { .. } => None,
@@ -117,12 +132,10 @@ pub fn reconcile_witness(paths: &Paths, roster: &Config) -> Result<ReconcileWitn
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesiredRepo::Missing {
                 absolute_lexical_path: resolved_path,
             },
-            Err(source) => {
-                return Err(HubError::Io {
-                    path: resolved_path,
-                    source,
-                });
-            }
+            Err(source) => DesiredRepo::Unavailable {
+                absolute_lexical_path: resolved_path,
+                detail: source.to_string(),
+            },
         };
         if seen.insert(observed.clone()) {
             desired.push(observed);
@@ -131,10 +144,14 @@ pub fn reconcile_witness(paths: &Paths, roster: &Config) -> Result<ReconcileWitn
 
     let hub = hub_dir(paths);
     let hub_initialized = is_initialized(&hub);
-    let mut actual_repos = read_hub_roster(&hub)?
-        .into_iter()
-        .map(|path| normalize(&resolve_against(&hub, &path)))
-        .collect::<Vec<_>>();
+    let mut actual_repos = if hub_initialized {
+        read_hub_roster(&hub)?
+            .into_iter()
+            .map(|path| normalize(&resolve_against(&hub, &path)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     actual_repos.sort();
     actual_repos.dedup();
     Ok(ReconcileWitness {
@@ -649,6 +666,40 @@ mod tests {
                     .join("later"),
             }]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_witness_keeps_unavailable_roster_paths_nonfatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        seed_hub_config(&hub_dir(&paths), &[]);
+        let repo = tmp.path().join("loop");
+        std::os::unix::fs::symlink(&repo, &repo).unwrap();
+        let roster = roster(&[&repo]);
+
+        let witness = reconcile_witness(&paths, &roster).expect("unavailable repo is degraded");
+
+        assert!(witness.is_satisfied());
+        assert!(
+            witness.warnings()[0].contains("unavailable"),
+            "the reachability failure is surfaced as a warning"
+        );
+    }
+
+    #[test]
+    fn reconcile_witness_ignores_malformed_roster_for_partial_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let beads = hub_dir(&paths).join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("config.yaml"), "repos: [not valid").unwrap();
+
+        let witness =
+            reconcile_witness(&paths, &Config::default()).expect("partial hub remains repairable");
+
+        assert!(!witness.hub_initialized);
+        assert!(witness.actual_repos.is_empty());
     }
 
     #[test]
