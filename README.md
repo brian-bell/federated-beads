@@ -120,10 +120,14 @@ Source repos            fbd                              Hub (bd workspace)
 - **Repo attribution**: `bd`'s JSON does not expose a source repo, so fbd maps
   each issue id to its repo by **longest id prefix** (read from each repo's
   effective `bd` prefix), detecting and flagging prefix collisions.
-- **Refresh**: TUI-owned and async. Launch and the `r` key run exports + one
-  sync on a worker thread; the stale list stays browsable and the status bar
-  shows the last-refreshed age. A process-level advisory lock serializes
-  refreshes across concurrent fbd instances.
+- **Refresh**: TUI-owned and async. Launch and the `r` key run content-stable
+  exports with at most four source repositories in parallel, then one hub sync.
+  Unchanged exports retain their canonical inode and mtime; changed exports are
+  atomically replaced while preserving the platform's standard permission
+  object. Ownership, ACLs, xattrs, labels, file flags, and inode identity are
+  not part of the changed-export metadata contract. The stale list stays
+  browsable, and a process-level advisory lock serializes concurrent fbd
+  instances.
 - **State core**: the whole TUI is a pure `reduce(&mut App, Msg) -> Vec<Effect>`
   state machine (no I/O, no clock, no threads inside), so it is exhaustively
   unit-tested; the runtime performs the effects. The last confirmed repository
@@ -152,13 +156,21 @@ cargo test --test bd_integration               # gated e2e (skips cleanly withou
 The integration suite builds real fixture repos with `bd` in tempdirs; each test
 skips with an explicit `SKIP` line when `bd` is not installed.
 
+The ignored, machine-dependent refresh matrix is available separately:
+
+```bash
+cargo test refresh_performance_matrix -- --ignored --nocapture
+```
+
+Recorded phase timings for the refresh-performance epic live in
+`docs/performance/federated-beads-9dt.md`.
+
 ## Not in v1 (planned)
 
 - A blocked-issues view (v1 shows only ready work).
 - Any write path from the TUI (create/update/close/comment) — the copy-context
   key is the bridge to acting in a terminal.
 - A background daemon / file watcher; refresh is user-triggered.
-- Parallel per-repo exports (v1 exports sequentially).
 
 See `plans/fbd-v1-implementation-plan.md` for the full design and the per-slice
 TDD plan; `plans/slices/` for individual slices.

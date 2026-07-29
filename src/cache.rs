@@ -203,6 +203,7 @@ mod tests {
                 },
                 repo_id: Some("ra".into()),
                 repo_name: "repo-a".into(),
+                attribution_generation: None,
             }],
             fetched_at,
         }

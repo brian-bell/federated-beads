@@ -145,14 +145,14 @@ pub fn run_snapshot(
     }
 
     let hub = hub_dir(paths);
-    let (prefix_map, fetched_at) = match refresh::run(bd, roster, paths) {
-        Ok(outcome) => {
+    let synced = match refresh::run_with_state(bd, roster, paths, None, 4) {
+        Ok(synced) => {
             // Per-repo failures and prefix collisions are surfaced but never fatal
             // — the hub still synced whatever exported cleanly.
-            for repo_error in &outcome.errors {
+            for repo_error in &synced.outcome().errors {
                 writeln!(err, "warning: {}", sanitize(&repo_error.to_string()))?;
             }
-            for collision in outcome.prefix_map.collisions() {
+            for collision in synced.outcome().prefix_map.collisions() {
                 writeln!(
                     err,
                     "warning: id prefix `{}` is claimed by {} repos; its issues show as `{}`",
@@ -161,7 +161,8 @@ pub fn run_snapshot(
                     snapshot::UNKNOWN_REPO,
                 )?;
             }
-            (outcome.prefix_map, outcome.synced_at)
+            refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
+            Some(synced)
         }
         // Degraded, not fatal: another fbd holds the lock, so print the last
         // synced data (attribution unavailable → every row falls to `unknown`).
@@ -170,12 +171,21 @@ pub fn run_snapshot(
                 err,
                 "warning: another fbd is refreshing this hub; showing the last synced data",
             )?;
-            (PrefixMap::default(), SystemTime::now())
+            None
         }
         Err(fatal) => return Err(fatal.into()),
     };
 
-    let snapshot = snapshot::fetch(bd, &hub, &prefix_map, fetched_at)?;
+    let fallback_map = PrefixMap::default();
+    let snapshot = match synced.as_ref() {
+        Some(synced) => snapshot::fetch(
+            bd,
+            &hub,
+            &synced.outcome().prefix_map,
+            synced.outcome().synced_at,
+        )?,
+        None => snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now())?,
+    };
 
     if json {
         serde_json::to_writer_pretty(&mut *out, &snapshot)
@@ -598,6 +608,7 @@ mod tests {
             issue: issue(id, priority, title),
             repo_id: None,
             repo_name: repo_name.to_string(),
+            attribution_generation: None,
         }
     }
 

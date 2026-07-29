@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{BdClient, BdError, BdVersion, Issue, RepoSyncReport};
+
+type CallHook = dyn Fn(&Call) + Send + Sync;
 
 /// One recorded invocation, so tests can assert call ordering/count (e.g.
 /// "export A, export B, then sync once").
@@ -43,9 +45,10 @@ pub enum Call {
 /// rest succeed. Every call is recorded and retrievable via
 /// [`FakeBdClient::calls`].
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FakeBdClient {
     calls: Mutex<Vec<Call>>,
+    call_hook: Option<Arc<CallHook>>,
     version: Option<Result<BdVersion, BdError>>,
     init: Option<Result<(), BdError>>,
     repo_add: Option<Result<(), BdError>>,
@@ -58,6 +61,15 @@ pub struct FakeBdClient {
     export_errs: HashMap<PathBuf, BdError>,
     export_contents: HashMap<PathBuf, Vec<u8>>,
     issue_prefixes: HashMap<PathBuf, String>,
+}
+
+impl std::fmt::Debug for FakeBdClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FakeBdClient")
+            .field("calls", &self.calls())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FakeBdClient {
@@ -171,13 +183,26 @@ impl FakeBdClient {
         self
     }
 
+    /// Run a thread-safe observer after each call is recorded. Tests use this
+    /// for barriers, bounds, and panic injection without wall-clock sleeps.
+    pub fn with_call_hook(mut self, hook: impl Fn(&Call) + Send + Sync + 'static) -> Self {
+        self.call_hook = Some(Arc::new(hook));
+        self
+    }
+
     /// The invocations recorded so far, in order.
     pub fn calls(&self) -> Vec<Call> {
         self.calls.lock().expect("calls mutex poisoned").clone()
     }
 
     fn record(&self, call: Call) {
-        self.calls.lock().expect("calls mutex poisoned").push(call);
+        self.calls
+            .lock()
+            .expect("calls mutex poisoned")
+            .push(call.clone());
+        if let Some(hook) = &self.call_hook {
+            hook(&call);
+        }
     }
 }
 

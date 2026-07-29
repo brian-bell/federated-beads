@@ -9,7 +9,7 @@ mod helpers;
 
 use std::time::SystemTime;
 
-use fbd::bd::{BdCli, BdClient};
+use fbd::bd::{BdCli, BdClient, RepoSyncReport};
 use fbd::cli::run_snapshot;
 use fbd::config::{Config, Paths, RepoEntry};
 use fbd::hub::{ensure_hub, hub_dir, read_hub_roster};
@@ -203,6 +203,43 @@ fn refresh_two_repos() {
 }
 
 #[test]
+fn unchanged_refresh_preserves_export_mtime_and_uses_sync_cache() {
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    build_ready_fixture_repo_with_prefix(&repo, "ra");
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        repos: vec![RepoEntry { path: repo.clone() }],
+    };
+    ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure hub");
+
+    refresh::run(&BdCli::new(), &roster, &paths).expect("initial refresh");
+    let canonical = repo.join(".beads").join("issues.jsonl");
+    let before = std::fs::metadata(&canonical)
+        .expect("canonical metadata")
+        .modified()
+        .expect("canonical mtime");
+
+    let warm = refresh::run(&BdCli::new(), &roster, &paths).expect("warm refresh");
+
+    assert_eq!(
+        std::fs::metadata(&canonical)
+            .expect("canonical metadata after warm refresh")
+            .modified()
+            .expect("canonical mtime after warm refresh"),
+        before,
+        "byte-identical exports preserve the canonical inode mtime"
+    );
+    assert_eq!(warm.sync_report, RepoSyncReport::UpToDate);
+}
+
+#[test]
 fn refresh_attributes_hyphenated_repo() {
     // Regression for dxh.17: a repo whose real id prefix contains a hyphen
     // (`ready-fix`) is stored by bd with an underscore-sanitized dolt_database
@@ -332,11 +369,11 @@ fn search_end_to_end() {
 
     // Hydrate the hub from both repos.
     ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
-    refresh::run(&BdCli::new(), &roster, &paths).expect("refresh runs");
+    let refreshed = refresh::run(&BdCli::new(), &roster, &paths).expect("refresh runs");
     let hub = hub_dir(&paths);
 
-    // The search-worker path: `bd search --json`, then the same attribution
-    // (`refresh::attribution_map` + `snapshot::attribute`) as ready rows.
+    // The search-worker path: `bd search --json`, then the exact immutable map
+    // produced by the refresh that hydrated this hub generation.
     let issues = BdCli::new()
         .search(&hub, "task")
         .expect("bd search --json parses");
@@ -344,12 +381,7 @@ fn search_end_to_end() {
         !issues.is_empty(),
         "the fixture titles all contain 'task', so search finds them"
     );
-    let (map, errors) = refresh::attribution_map(&BdCli::new(), &roster);
-    assert!(
-        errors.is_empty(),
-        "both repos are healthy, so attribution has no errors: {errors:?}"
-    );
-    let snap = snapshot::attribute(issues, &map, SystemTime::now());
+    let snap = snapshot::attribute(issues, &refreshed.prefix_map, SystemTime::now());
 
     assert!(
         snap.rows.iter().any(|r| r.repo_name == "ra"),
