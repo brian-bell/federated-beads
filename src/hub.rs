@@ -111,14 +111,15 @@ pub fn reconcile_witness(paths: &Paths, roster: &Config) -> Result<ReconcileWitn
     let mut desired = Vec::new();
     let mut seen = HashSet::new();
     for entry in &roster.repos {
-        let observed = match fs::canonicalize(&entry.path) {
+        let resolved_path = paths.resolve_roster_path(&entry.path);
+        let observed = match fs::canonicalize(&resolved_path) {
             Ok(canonical_path) => DesiredRepo::Reachable { canonical_path },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesiredRepo::Missing {
-                absolute_lexical_path: absolute_lexical(&entry.path)?,
+                absolute_lexical_path: resolved_path,
             },
             Err(source) => {
                 return Err(HubError::Io {
-                    path: entry.path.clone(),
+                    path: resolved_path,
                     source,
                 });
             }
@@ -141,18 +142,6 @@ pub fn reconcile_witness(paths: &Paths, roster: &Config) -> Result<ReconcileWitn
         hub_initialized,
         actual_repos,
     })
-}
-
-fn absolute_lexical(path: &Path) -> Result<PathBuf, HubError> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(path))
-        .map_err(|source| HubError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 /// Ensure the hub exists and tracks every reachable roster repo.
@@ -186,14 +175,15 @@ pub fn ensure_hub(
 
     let mut warnings = Vec::new();
     for entry in &roster.repos {
-        if !entry.path.exists() {
+        let resolved_path = paths.resolve_roster_path(&entry.path);
+        if !resolved_path.exists() {
             warnings.push(format!(
                 "roster path does not exist: {}",
-                entry.path.display()
+                resolved_path.display()
             ));
             continue;
         }
-        let canonical = normalize(&entry.path);
+        let canonical = normalize(&resolved_path);
         // Skip repos the hub already tracks — including ones added earlier in
         // this same run, so duplicate/aliased roster entries add exactly once.
         if !existing.insert(canonical.clone()) {
@@ -635,6 +625,58 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = tmp.path().join("hub");
         assert_eq!(read_hub_roster(&hub).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn reconcile_witness_resolves_relative_roster_paths_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let roster = Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("later"),
+            }],
+        };
+
+        let witness = reconcile_witness(&paths, &roster).unwrap();
+
+        assert_eq!(
+            witness.desired,
+            vec![DesiredRepo::Missing {
+                absolute_lexical_path: paths
+                    .config_file()
+                    .parent()
+                    .expect("config file has a parent")
+                    .join("later"),
+            }]
+        );
+    }
+
+    #[test]
+    fn ensure_hub_resolves_relative_roster_paths_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        seed_hub_config(&hub_dir(&paths), &[]);
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = make_repo(config_dir, "repo");
+        let roster = Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("repo"),
+            }],
+        };
+        let fake = FakeBdClient::new();
+
+        let status = ensure_hub(&fake, &paths, &roster).unwrap();
+
+        assert!(status.warnings.is_empty());
+        let canonical_repo = fs::canonicalize(repo).unwrap();
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| matches!(call, Call::RepoAdd(_, actual) if actual == &canonical_repo))
+        );
     }
 
     #[test]

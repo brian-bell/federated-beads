@@ -268,7 +268,9 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
 /// Load the roster from `<config>/config.toml`, treating an absent file as an
 /// empty roster (first run) while surfacing a present-but-invalid file as an
 /// error. Shared by `main`'s snapshot path (where a bad config is fatal) and
-/// `run_doctor` (where it is reported, not fatal).
+/// `run_doctor` (where it is reported, not fatal). Relative entries are
+/// absolutized against the config directory here so every lower-level consumer
+/// operates on the same repository regardless of the process CWD.
 pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
     let config_file = paths.config_file();
     // `Path::exists` collapses "absent" and "present but unreadable" (permission
@@ -278,7 +280,15 @@ pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
     // attempted so a real error surfaces per this function's contract.
     match std::fs::symlink_metadata(config_file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        _ => Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e))),
+        _ => {
+            let mut roster =
+                Config::load(config_file).map_err(|e| CliError::Io(std::io::Error::other(e)))?;
+            for entry in &mut roster.repos {
+                let expanded = expand_tilde(&entry.path);
+                entry.path = store_path(&paths.resolve_roster_path(&expanded));
+            }
+            Ok(roster)
+        }
     }
 }
 
@@ -899,6 +909,37 @@ mod tests {
         assert!(load_roster(&paths).is_err(), "invalid config must error");
     }
 
+    #[test]
+    fn load_roster_absolutizes_relative_entries_at_the_config_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = seed_repo(config_dir, "repo", "repo");
+        let launch_dir = tmp.path().join("elsewhere");
+        fs::create_dir_all(&launch_dir).unwrap();
+        Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("repo"),
+            }],
+        }
+        .save(paths.config_file())
+        .unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(launch_dir).unwrap();
+        let loaded = load_roster(&paths);
+        std::env::set_current_dir(previous_dir).unwrap();
+
+        assert_eq!(
+            loaded.unwrap().repos[0].path,
+            fs::canonicalize(repo).unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_roster_dangling_symlink_errors_not_empty() {
@@ -1261,8 +1302,14 @@ mod tests {
         // by its canonical absolute path must dedupe against it, not duplicate.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
-        let repo = seed_repo(tmp.path(), "r", "r");
-        // Persist a roster whose entry is the *relative* name, resolvable from tmp.
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = seed_repo(config_dir, "r", "r");
+        let launch_dir = tmp.path().join("elsewhere");
+        fs::create_dir_all(&launch_dir).unwrap();
+        // Persist a roster whose entry is relative to the config directory.
         Config {
             repos: vec![RepoEntry {
                 path: PathBuf::from("r"),
@@ -1273,7 +1320,7 @@ mod tests {
 
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        std::env::set_current_dir(launch_dir).unwrap();
         let mut out = Vec::new();
         // Add by the canonical absolute path.
         let result = run_repos_add(&paths, &repo.canonicalize().unwrap(), &mut out);
@@ -1300,8 +1347,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let (root, x, _y) = discovery_tree(tmp.path());
-        // Hand-edited roster: x stored relative to tmp.
-        let rel_x = x.strip_prefix(tmp.path()).unwrap().to_path_buf();
+        // Hand-edited roster: x stored relative to the config directory, which
+        // is one level below the injected base.
+        let rel_x = PathBuf::from("..").join(x.strip_prefix(tmp.path()).expect("x is under base"));
         Config {
             repos: vec![RepoEntry { path: rel_x }],
         }

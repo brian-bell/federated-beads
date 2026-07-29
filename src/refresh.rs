@@ -398,7 +398,7 @@ pub(crate) fn run_with_state(
         .flat_map(|candidate| candidate.repos.iter())
         .map(|repo| (repo.normalized_path.clone(), repo.prefix.clone()))
         .collect();
-    let jobs = normalized_jobs(roster);
+    let jobs = normalized_jobs(roster, paths);
     let roster_paths = jobs
         .iter()
         .map(|job| normalize_path(&job.entry.path))
@@ -473,16 +473,21 @@ struct SourceOutcome {
     errors: Vec<RepoError>,
 }
 
-fn normalized_jobs(roster: &Config) -> Vec<SourceJob> {
+fn normalized_jobs(roster: &Config, paths: &Paths) -> Vec<SourceJob> {
     let mut seen = HashSet::new();
     roster
         .repos
         .iter()
         .enumerate()
-        .filter(|(_, entry)| seen.insert(normalize_path(&entry.path)))
-        .map(|(roster_index, entry)| SourceJob {
-            roster_index,
-            entry: entry.clone(),
+        .filter_map(|(roster_index, entry)| {
+            let resolved_path = paths.resolve_roster_path(&entry.path);
+            seen.insert(normalize_path(&resolved_path))
+                .then_some(SourceJob {
+                    roster_index,
+                    entry: RepoEntry {
+                        path: resolved_path,
+                    },
+                })
         })
         .collect()
 }
@@ -953,6 +958,31 @@ mod tests {
                     .any(|call| matches!(call, Call::IssuePrefix(actual) if actual == repo))
             );
         }
+    }
+
+    #[test]
+    fn refresh_resolves_relative_roster_paths_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let config_dir = paths
+            .config_file()
+            .parent()
+            .expect("config file has a parent");
+        let repo = seed_repo(config_dir, "repo", "repo");
+        let config = Config {
+            repos: vec![RepoEntry {
+                path: PathBuf::from("repo"),
+            }],
+        };
+        let fake = FakeBdClient::new();
+
+        run(&fake, &config, &paths).unwrap();
+
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| matches!(call, Call::Export(actual, _) if actual == &repo))
+        );
     }
 
     #[test]
