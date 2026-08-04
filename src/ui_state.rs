@@ -101,6 +101,28 @@ pub fn load(path: &Path) -> RepoFilter {
     }
 }
 
+/// Validate a legacy UI-state artifact before the migration layer publishes
+/// its bytes at the canonical Hank path. Unlike [`load`], this distinguishes a
+/// malformed/unsupported file from a legitimate All-repositories preference.
+pub(crate) fn validate(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("reading UI state {}", path.display()))?;
+    let header: UiStateVersion = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing UI state header {}", path.display()))?;
+    match header.version {
+        1 => {
+            serde_json::from_slice::<LegacyUiStateFile>(&bytes)
+                .with_context(|| format!("parsing version 1 UI state {}", path.display()))?;
+        }
+        VERSION => {
+            serde_json::from_slice::<UiStateFile>(&bytes).with_context(|| {
+                format!("parsing version {VERSION} UI state {}", path.display())
+            })?;
+        }
+        version => anyhow::bail!("unsupported UI state version {version}"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

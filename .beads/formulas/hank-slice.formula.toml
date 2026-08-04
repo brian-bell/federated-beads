@@ -1,5 +1,5 @@
-formula = "fbd-slice"
-description = "Per-slice implementation workflow for the federated-beads epic: plan, TDD implementation, autoreview, local merge."
+formula = "hank-slice"
+description = "Per-slice implementation workflow for Hank: plan, TDD implementation, autoreview, local merge."
 version = 1
 type = "workflow"
 
