@@ -165,6 +165,20 @@ cargo test refresh_performance_matrix -- --ignored --nocapture
 Recorded phase timings for the refresh-performance epic live in
 `docs/performance/federated-beads-9dt.md`.
 
+The central-Dolt topology spike has a separate, machine-dependent black-box
+matrix. It requires pinned real `bd` and `dolt` executables and is not part of
+ordinary `cargo test`:
+
+```bash
+BD_BIN=/path/to/bd DOLT_BIN=/path/to/dolt make test-central-dolt
+BD_BIN=/path/to/bd DOLT_BIN=/path/to/dolt EXPECT=compatible \
+  make test-central-dolt-version
+```
+
+Its selected per-project-authority contract, evidence matrix, and deferred
+deployment gates are documented in
+`docs/architecture/central-dolt-compatibility.md`.
+
 ## Not in v1 (planned)
 
 - A blocked-issues view (v1 shows only ready work).
