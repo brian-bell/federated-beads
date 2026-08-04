@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,6 +18,17 @@ pub struct RepoEntry {
 pub struct Config {
     #[serde(default)]
     pub repos: Vec<RepoEntry>,
+}
+
+#[derive(Deserialize)]
+struct SpannedConfig {
+    #[serde(default)]
+    repos: Vec<SpannedRepoEntry>,
+}
+
+#[derive(Deserialize)]
+struct SpannedRepoEntry {
+    path: toml::Spanned<String>,
 }
 
 impl Config {
@@ -144,7 +155,7 @@ impl Paths {
             ui_state_file: data_root.join(APP_DIR).join(UI_STATE_FILE_NAME),
             legacy_config_file: config_root.join(LEGACY_APP_DIR).join(CONFIG_FILE_NAME),
             legacy_ui_state_file: data_root.join(LEGACY_APP_DIR).join(UI_STATE_FILE_NAME),
-            migration_lock_file: data_root.join(MIGRATION_LOCK_FILE_NAME),
+            migration_lock_file: data_root.join(APP_DIR).join(MIGRATION_LOCK_FILE_NAME),
         }
     }
 
@@ -264,14 +275,17 @@ pub fn migrate_legacy_state(paths: &Paths) -> MigrationReport {
         &paths.legacy_config_file,
         &paths.config_file,
         MigrationArtifact::Config,
-        |path| Config::load(path).map(|_| ()),
+        |bytes| migrated_config_bytes(&paths.legacy_config_file, bytes),
         &mut report,
     );
     migrate_file(
         &paths.legacy_ui_state_file,
         &paths.ui_state_file,
         MigrationArtifact::UiState,
-        crate::ui_state::validate,
+        |bytes| {
+            crate::ui_state::validate_bytes(bytes)?;
+            Ok(bytes.to_vec())
+        },
         &mut report,
     );
     report
@@ -281,7 +295,7 @@ fn migrate_file(
     legacy: &Path,
     canonical: &Path,
     artifact: MigrationArtifact,
-    validate: impl FnOnce(&Path) -> Result<()>,
+    validate_and_transform: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
     report: &mut MigrationReport,
 ) {
     match fs::symlink_metadata(canonical) {
@@ -312,18 +326,8 @@ fn migrate_file(
             return;
         }
     }
-    if let Err(error) = validate(legacy) {
-        report.problems.push(MigrationProblem {
-            artifact,
-            message: format!(
-                "legacy state {} is invalid and was not migrated: {error}",
-                legacy.display()
-            ),
-        });
-        return;
-    }
-    let bytes = match fs::read(legacy) {
-        Ok(bytes) => bytes,
+    let mut source = match File::open(legacy) {
+        Ok(source) => source,
         Err(error) => {
             report.problems.push(MigrationProblem {
                 artifact,
@@ -332,7 +336,38 @@ fn migrate_file(
             return;
         }
     };
-    match publish_no_clobber(canonical, &bytes) {
+    let permissions = match source.metadata() {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => {
+            report.problems.push(MigrationProblem {
+                artifact,
+                message: format!("reading legacy metadata {}: {error}", legacy.display()),
+            });
+            return;
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = source.read_to_end(&mut bytes) {
+        report.problems.push(MigrationProblem {
+            artifact,
+            message: format!("reading legacy state {}: {error}", legacy.display()),
+        });
+        return;
+    }
+    let bytes = match validate_and_transform(&bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            report.problems.push(MigrationProblem {
+                artifact,
+                message: format!(
+                    "legacy state {} is invalid and was not migrated: {error}",
+                    legacy.display()
+                ),
+            });
+            return;
+        }
+    };
+    match publish_no_clobber(canonical, &bytes, permissions) {
         Ok(PublishOutcome::Published) => report.migrated.push(canonical.to_path_buf()),
         Ok(PublishOutcome::CanonicalWon) => {}
         Err(error) => report.problems.push(MigrationProblem {
@@ -346,13 +381,60 @@ fn migrate_file(
     }
 }
 
+fn migrated_config_bytes(legacy: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).context("config file is not UTF-8")?;
+    let _: Config = toml::from_str(text).context("parsing config TOML")?;
+    let spanned: SpannedConfig =
+        toml::from_str(text).context("locating repository paths in config TOML")?;
+    let legacy_dir = legacy
+        .parent()
+        .context("legacy config path has no parent directory")?;
+    let mut replacements = Vec::new();
+    for repo in spanned.repos {
+        let original = PathBuf::from(repo.path.get_ref());
+        if original.is_relative() && original.strip_prefix("~").is_err() {
+            let rebased = legacy_dir.join(original);
+            let rebased = rebased
+                .to_str()
+                .context("migrated repository path is not valid UTF-8")?;
+            replacements.push((
+                repo.path.span(),
+                toml::Value::String(rebased.to_string()).to_string(),
+            ));
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    replacements.sort_by_key(|(span, _)| span.start);
+    let mut migrated = text.to_string();
+    for (span, replacement) in replacements.into_iter().rev() {
+        migrated.replace_range(span, &replacement);
+    }
+    let _: Config = toml::from_str(&migrated).context("validating migrated config TOML")?;
+    Ok(migrated.into_bytes())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishOutcome {
     Published,
     CanonicalWon,
 }
 
-fn publish_no_clobber(destination: &Path, bytes: &[u8]) -> io::Result<PublishOutcome> {
+fn publish_no_clobber(
+    destination: &Path,
+    bytes: &[u8],
+    permissions: fs::Permissions,
+) -> io::Result<PublishOutcome> {
+    publish_no_clobber_with_counter(destination, bytes, permissions, &MIGRATION_TEMP_COUNTER)
+}
+
+fn publish_no_clobber_with_counter(
+    destination: &Path,
+    bytes: &[u8],
+    permissions: fs::Permissions,
+    counter: &AtomicU64,
+) -> io::Result<PublishOutcome> {
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -362,17 +444,10 @@ fn publish_no_clobber(destination: &Path, bytes: &[u8]) -> io::Result<PublishOut
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no name"))?
         .to_string_lossy();
-    let temp = parent.join(format!(
-        ".{file_name}.hank-migrate.{}.{}.tmp",
-        std::process::id(),
-        MIGRATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let (mut file, temp) = reserve_migration_temp(parent, &file_name, counter)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
         file.write_all(bytes)?;
+        file.set_permissions(permissions)?;
         file.sync_all()?;
         match fs::hard_link(&temp, destination) {
             Ok(()) => {
@@ -390,6 +465,25 @@ fn publish_no_clobber(destination: &Path, bytes: &[u8]) -> io::Result<PublishOut
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) if error.kind() != io::ErrorKind::NotFound => Err(error),
         (Ok(outcome), _) => Ok(outcome),
+    }
+}
+
+fn reserve_migration_temp(
+    parent: &Path,
+    file_name: &str,
+    counter: &AtomicU64,
+) -> io::Result<(File, PathBuf)> {
+    loop {
+        let temp = parent.join(format!(
+            ".{file_name}.hank-migrate.{}.{}.tmp",
+            std::process::id(),
+            counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((file, temp)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -457,6 +551,10 @@ mod tests {
             paths.ui_state_file(),
             base.join("hank").join("ui_state.json")
         );
+        assert_eq!(
+            paths.migration_lock_file,
+            base.join("hank").join(".hank-migration.lock")
+        );
     }
 
     #[test]
@@ -476,6 +574,76 @@ mod tests {
         assert!(report.fatal_problem().is_none(), "{report:?}");
         assert_eq!(Config::load(paths.config_file()).unwrap(), expected);
         assert_eq!(Config::load(&legacy).unwrap(), expected);
+    }
+
+    #[test]
+    fn migrated_relative_repo_paths_keep_their_legacy_config_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        let legacy_dir = dir.path().join("federated-beads");
+        let repo = legacy_dir.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            legacy_dir.join("config.toml"),
+            "# preserved comment\nextra = \"preserved\"\nrepos = [{ path = \"repo\", note = \"keep\" }]\n",
+        )
+        .unwrap();
+
+        let report = migrate_legacy_state(&paths);
+        let loaded = crate::cli::load_roster(&paths).unwrap();
+
+        assert!(report.fatal_problem().is_none(), "{report:?}");
+        assert_eq!(loaded.repos[0].path, fs::canonicalize(repo).unwrap());
+        let migrated = fs::read_to_string(paths.config_file()).unwrap();
+        assert!(migrated.contains("# preserved comment"), "{migrated}");
+        assert!(migrated.contains("extra = \"preserved\""), "{migrated}");
+        assert!(migrated.contains("note = \"keep\""), "{migrated}");
+    }
+
+    #[test]
+    fn absolute_only_config_is_published_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        let legacy = dir.path().join("federated-beads/config.toml");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let original = b"# keep formatting and unknown keys\nextra = 'preserved'\nrepos = [ { path = '/absolute/repo', note = 'keep' } ]\n";
+        fs::write(&legacy, original).unwrap();
+
+        let report = migrate_legacy_state(&paths);
+
+        assert!(report.fatal_problem().is_none(), "{report:?}");
+        assert_eq!(fs::read(paths.config_file()).unwrap(), original);
+    }
+
+    #[test]
+    fn tilde_paths_keep_legacy_expansion_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        let legacy = dir.path().join("federated-beads/config.toml");
+        Config {
+            repos: vec![
+                RepoEntry { path: "~".into() },
+                RepoEntry {
+                    path: "~/repo".into(),
+                },
+                RepoEntry {
+                    path: "~user/repo".into(),
+                },
+            ],
+        }
+        .save(&legacy)
+        .unwrap();
+
+        let report = migrate_legacy_state(&paths);
+        let migrated = Config::load(paths.config_file()).unwrap();
+
+        assert!(report.fatal_problem().is_none(), "{report:?}");
+        assert_eq!(migrated.repos[0].path, PathBuf::from("~"));
+        assert_eq!(migrated.repos[1].path, PathBuf::from("~/repo"));
+        assert_eq!(
+            migrated.repos[2].path,
+            legacy.parent().unwrap().join("~user/repo")
+        );
     }
 
     #[test]
@@ -596,11 +764,64 @@ mod tests {
 
         let problem = report.fatal_problem().expect("blocked target is fatal");
         assert!(
-            problem.contains(&paths.config_file().display().to_string()),
+            problem.contains(&paths.data_dir().display().to_string()),
             "{problem}"
         );
         assert!(!paths.config_file().exists());
         assert_eq!(Config::load(&legacy).unwrap(), Config::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_preserves_restrictive_legacy_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        let legacy = dir.path().join("federated-beads/config.toml");
+        Config::default().save(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let report = migrate_legacy_state(&paths);
+
+        assert!(report.fatal_problem().is_none(), "{report:?}");
+        assert_eq!(
+            fs::metadata(paths.config_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn migration_temp_collision_is_preserved_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("config.toml");
+        let counter = AtomicU64::new(0);
+        let collision = dir.path().join(format!(
+            ".config.toml.hank-migrate.{}.0.tmp",
+            std::process::id()
+        ));
+        fs::write(&collision, "not ours").unwrap();
+        let permissions = fs::metadata(&collision).unwrap().permissions();
+
+        let outcome =
+            publish_no_clobber_with_counter(&destination, b"repos = []\n", permissions, &counter)
+                .unwrap();
+
+        assert_eq!(outcome, PublishOutcome::Published);
+        assert_eq!(fs::read_to_string(destination).unwrap(), "repos = []\n");
+        assert_eq!(fs::read_to_string(collision).unwrap(), "not ours");
+        assert!(
+            !dir.path()
+                .join(format!(
+                    ".config.toml.hank-migrate.{}.1.tmp",
+                    std::process::id()
+                ))
+                .exists()
+        );
     }
 
     #[test]

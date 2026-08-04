@@ -1017,6 +1017,27 @@ mod tests {
         }
     }
 
+    /// macOS can briefly retain an advisory flock after the refresh owner has
+    /// returned. Production correctly asks the user to retry; tests that need
+    /// the post-refresh state wait a bounded interval and still fail on a real
+    /// lock leak.
+    fn search_after_completed_refresh(
+        bd: &impl BdClient,
+        paths: &Paths,
+        query: &str,
+        state: &RuntimeRefreshState,
+    ) -> Result<(Vec<Row>, VerifiedAttribution), String> {
+        for _ in 0..100 {
+            match gather_search_with_state(bd, paths, query, state) {
+                Err(error) if error.contains("another hank is refreshing") => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+        Err("completed refresh lock remained held for 100 ms".to_string())
+    }
+
     fn issue(id: &str, priority: i64, title: &str) -> Issue {
         Issue {
             id: id.to_string(),
@@ -1585,7 +1606,7 @@ mod tests {
                 .0
                 .is_some()
         );
-        let rows = gather_search_with_state(&bd, &paths, "found", &state)
+        let rows = search_after_completed_refresh(&bd, &paths, "found", &state)
             .expect("search succeeds")
             .0;
 
@@ -1618,7 +1639,7 @@ mod tests {
             .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(_)))
             .count();
 
-        let rows = gather_search_with_state(&bd, &paths, "found", &state)
+        let rows = search_after_completed_refresh(&bd, &paths, "found", &state)
             .unwrap()
             .0;
 
@@ -1716,7 +1737,7 @@ mod tests {
         );
         fs::write(hub_dir(&paths).join(".hank-generation"), "external").unwrap();
 
-        let error = gather_search_with_state(&bd, &paths, "found", &state)
+        let error = search_after_completed_refresh(&bd, &paths, "found", &state)
             .expect_err("a stale local map must fail closed");
 
         assert!(error.contains("refresh required"), "{error}");
@@ -1746,7 +1767,7 @@ mod tests {
         );
 
         refresh::run(&bd, &config, &paths).expect("another hank refresh");
-        let error = gather_search_with_state(&bd, &paths, "found", &state)
+        let error = search_after_completed_refresh(&bd, &paths, "found", &state)
             .expect_err("the stateless refresh must advance the marker");
 
         assert!(error.contains("refresh required"), "{error}");
@@ -1787,7 +1808,7 @@ mod tests {
 
         assert_ne!(current_generation, old_generation);
         assert!(state.map_for(old_generation).is_some());
-        let rows = gather_search_with_state(&second_bd, &paths, "found", &state)
+        let rows = search_after_completed_refresh(&second_bd, &paths, "found", &state)
             .unwrap()
             .0;
         assert_eq!(rows[0].attribution_generation, Some(current_generation));

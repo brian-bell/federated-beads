@@ -97,7 +97,7 @@ fn run() -> Result<(), CliError> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
 
-    if !matches!(cli.command, Some(Command::Doctor)) {
+    if !matches!(&cli.command, Some(Command::Doctor | Command::Reset)) {
         cli::prepare_legacy_state(&paths, &mut stderr)?;
     }
 

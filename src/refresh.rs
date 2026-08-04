@@ -310,18 +310,38 @@ pub(crate) fn publish_hub_generation(
     paths: &Paths,
     token: &HubGenerationToken,
 ) -> Result<(), RefreshError> {
+    publish_hub_generation_with_counter(paths, token, &GENERATION_COUNTER)
+}
+
+fn publish_hub_generation_with_counter(
+    paths: &Paths,
+    token: &HubGenerationToken,
+    counter: &AtomicU64,
+) -> Result<(), RefreshError> {
     let hub = hub_dir(paths);
     let marker = hub.join(GENERATION_FILE);
-    let temp = hub.join(format!(
-        ".hank-generation.{}.{}.tmp",
-        std::process::id(),
-        GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
+    let (mut file, temp) = loop {
+        let candidate = hub.join(format!(
+            ".hank-generation.{}.{}.tmp",
+            std::process::id(),
+            counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp)?;
+            .open(&candidate)
+        {
+            Ok(file) => break (file, candidate),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(RefreshError::Generation {
+                    path: marker,
+                    source,
+                });
+            }
+        }
+    };
+    let result = (|| {
         file.write_all(token.0.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temp, &marker)
@@ -1947,5 +1967,26 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp")
         }));
+    }
+
+    #[test]
+    fn hub_generation_temp_collision_is_preserved_and_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        let counter = AtomicU64::new(0);
+        let collision = hub.join(format!(".hank-generation.{}.0.tmp", std::process::id()));
+        fs::write(&collision, "not ours").unwrap();
+        let token = HubGenerationToken::new("next-generation");
+
+        publish_hub_generation_with_counter(&paths, &token, &counter).unwrap();
+
+        assert_eq!(read_hub_generation(&paths).unwrap(), Some(token));
+        assert_eq!(fs::read_to_string(collision).unwrap(), "not ours");
+        assert!(
+            !hub.join(format!(".hank-generation.{}.1.tmp", std::process::id()))
+                .exists()
+        );
     }
 }
