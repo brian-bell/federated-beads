@@ -4,7 +4,7 @@ version = 1
 type = "workflow"
 
 [vars.slice_id]
-description = "Bead id of the slice task this molecule implements (e.g. federated-beads-dxh.1)"
+description = "Bead id of the slice task this molecule implements (e.g. hank-a38ce90d)"
 required = true
 
 [vars.slice_num]
