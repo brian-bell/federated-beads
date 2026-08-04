@@ -3,7 +3,8 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release run snapshot test test-integration test-all \
+.PHONY: help build release run snapshot test test-integration test-central-dolt \
+        test-central-dolt-version test-all \
         fmt fmt-check clippy check install clean
 
 help: ## Show this help
@@ -26,6 +27,12 @@ test: ## Unit + render tests (green without bd)
 
 test-integration: ## Gated e2e suite (skips per-test without bd)
 	cargo test --test bd_integration
+
+test-central-dolt: ## Gated external bd/Dolt topology, auth, TLS, and recovery probe
+	tests/central_dolt_compat.sh
+
+test-central-dolt-version: ## Probe BD_BIN against one DOLT_BIN server version
+	tests/central_dolt_version_probe.sh
 
 test-all: test test-integration ## All tests
 
