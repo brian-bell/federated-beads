@@ -228,6 +228,11 @@ impl MigrationReport {
 /// non-cooperating process always wins.
 pub fn migrate_legacy_state(paths: &Paths) -> MigrationReport {
     let mut report = MigrationReport::default();
+    if !legacy_artifact_may_need_migration(&paths.legacy_config_file, &paths.config_file)
+        && !legacy_artifact_may_need_migration(&paths.legacy_ui_state_file, &paths.ui_state_file)
+    {
+        return report;
+    }
     let lock_parent = paths
         .migration_lock_file
         .parent()
@@ -289,6 +294,20 @@ pub fn migrate_legacy_state(paths: &Paths) -> MigrationReport {
         &mut report,
     );
     report
+}
+
+/// Cheap no-write preflight used to avoid requiring a writable data root when
+/// there is no legacy user state to migrate. Any inspection error is treated as
+/// a candidate so the locked migration path can surface an actionable problem.
+fn legacy_artifact_may_need_migration(legacy: &Path, canonical: &Path) -> bool {
+    match fs::symlink_metadata(canonical) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => !matches!(
+            fs::symlink_metadata(legacy),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ),
+        Err(_) => true,
+    }
 }
 
 fn migrate_file(
@@ -677,6 +696,10 @@ mod tests {
         assert!(report.migrated().is_empty());
         assert!(!paths.config_file().exists());
         assert!(!paths.ui_state_file().exists());
+        assert!(
+            !paths.data_dir().exists(),
+            "checking an install with no legacy state must not require or create the data root"
+        );
     }
 
     #[test]
